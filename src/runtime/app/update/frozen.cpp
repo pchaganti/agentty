@@ -31,6 +31,7 @@
 #include <utility>
 
 #include <maya/dsl.hpp>
+#include <maya/render/cache_id.hpp>
 #include <maya/widget/conversation.hpp>
 #include <maya/widget/turn.hpp>
 
@@ -126,24 +127,44 @@ void freeze_range(Model& m, std::size_t from, std::size_t to) {
 
         if (run_end > i + 1) {
             // Merged run: head message + appended tool_calls from the
-            // continuation tail. Build directly via Turn::build() so
-            // the result is a RAW Element value (no shared_ptr /
-            // ComponentElement indirection). Mirrors agent_session's
-            // discipline — `m.frozen.push_back(actions_panel(...))`
-            // pushes the widget's build() return verbatim.
-            Message merged = msg;
+            // continuation tail. We pass `msg` through unchanged and
+            // hand turn_config a borrowed span of the union via the
+            // tool_calls_override path — no Message-sized deep copy,
+            // no per-frame ToolUse churn beyond the one allocation
+            // for the merged vector. The originals live in
+            // `m.d.current.messages[*]` and the span borrows from
+            // them; the vector outlives the turn_config / Turn::build
+            // call.
+            std::vector<ToolUse> merged_tools;
             std::size_t reserve_n = msg.tool_calls.size();
             for (std::size_t j = i + 1; j < run_end; ++j)
                 reserve_n += m.d.current.messages[j].tool_calls.size();
-            merged.tool_calls.reserve(reserve_n);
+            merged_tools.reserve(reserve_n);
+            merged_tools.insert(merged_tools.end(),
+                                msg.tool_calls.begin(), msg.tool_calls.end());
             for (std::size_t j = i + 1; j < run_end; ++j) {
                 const auto& src = m.d.current.messages[j].tool_calls;
-                merged.tool_calls.insert(merged.tool_calls.end(),
-                                         src.begin(), src.end());
+                merged_tools.insert(merged_tools.end(),
+                                    src.begin(), src.end());
             }
             int turn_num = m.ui.frozen_turn + 1;
-            auto cfg = ui::turn_config(merged, i, turn_num, m,
-                                       continuation, /*synthetic=*/true);
+            auto cfg = ui::turn_config(msg, i, turn_num, m,
+                                       continuation, /*synthetic=*/true,
+                                       /*meta_override=*/{},
+                                       /*tool_calls_override=*/merged_tools);
+            // Hash key: settled merged turn. The merge inputs (head
+            // msg.id + every tail msg.id + tail count) all fold in so
+            // a different run produces a different key. Once frozen,
+            // the message bytes never change — the key is stable for
+            // the lifetime of this entry, and maya's hash-keyed
+            // ComponentCache reuses the painted cells every frame.
+            maya::CacheIdBuilder kb;
+            kb.add(std::string_view{"agentty.turn.merged"})
+              .add(std::string_view{msg.id.value})
+              .add(static_cast<std::uint64_t>(run_end - i));
+            for (std::size_t j = i; j < run_end; ++j)
+                kb.add(std::string_view{m.d.current.messages[j].id.value});
+            cfg.hash_id = kb.build();
             m.ui.frozen.push_back(maya::Turn{std::move(cfg)}.build());
             if (msg.role == Role::Assistant && !continuation)
                 ++m.ui.frozen_turn;
@@ -158,6 +179,17 @@ void freeze_range(Model& m, std::size_t from, std::size_t to) {
         // shape to agent_session's `m.frozen.push_back(widget.build())`.
         auto cfg = ui::turn_config(msg, i, turn_num, m, continuation,
                                    /*synthetic=*/true);
+        // Hash key: settled single-message turn. msg.id is unique
+        // per Message and stable across reloads; compute_render_key()
+        // folds every visible field (text, tool_calls, error, etc.)
+        // so even a retroactive mutation that bumps it invalidates
+        // the cache. For frozen turns the key is effectively stable
+        // for the lifetime of the entry.
+        cfg.hash_id = maya::CacheIdBuilder{}
+            .add(std::string_view{"agentty.turn"})
+            .add(std::string_view{msg.id.value})
+            .add(msg.compute_render_key())
+            .build();
         m.ui.frozen.push_back(maya::Turn{std::move(cfg)}.build());
         if (msg.role == Role::Assistant && !continuation)
             ++m.ui.frozen_turn;

@@ -1,5 +1,6 @@
 #pragma once
 #include <cstddef>
+#include <span>
 #include <string_view>
 #include <maya/widget/conversation.hpp>
 #include <maya/widget/turn.hpp>
@@ -20,12 +21,19 @@ namespace agentty::ui {
 // Those messages carry a fresh `MessageId` each frame, so caching
 // them would only fill the LRU with garbage entries; the flag short-
 // circuits the cache write path.
+//
+// `tool_calls_override` lets the tool-batch merge in freeze_range /
+// build_live_tail synthesise a single panel from multiple disjoint
+// Messages' tool_calls without deep-copying `msg`. When non-empty the
+// AgentTimeline + permission scan uses this span instead of
+// `msg.tool_calls`; when empty `msg.tool_calls` is used as before.
 [[nodiscard]] maya::Turn::Config turn_config(const Message& msg,
                                              std::size_t msg_idx,
                                              int turn_num,
                                              const Model& m,
                                              bool continuation = false,
                                              bool synthetic    = false,
-                                             std::string_view meta_override = {});
+                                             std::string_view meta_override = {},
+                                             std::span<const ToolUse> tool_calls_override = {});
 
 } // namespace agentty::ui

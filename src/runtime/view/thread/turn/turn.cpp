@@ -222,7 +222,8 @@ std::optional<float> assistant_elapsed(const Message& msg, const Model& m) {
 maya::Turn::Config turn_config(const Message& msg, std::size_t msg_idx,
                                int turn_num, const Model& m,
                                bool continuation, bool synthetic,
-                               std::string_view meta_override) {
+                               std::string_view meta_override,
+                               std::span<const ToolUse> tool_calls_override) {
     // agent_session pattern: build a fresh Config every call. Settled
     // turns get their Element snapshotted into m.ui.frozen at freeze
     // time and rendered from there; the live tail rebuilds each frame
@@ -231,6 +232,15 @@ maya::Turn::Config turn_config(const Message& msg, std::size_t msg_idx,
     // skip the agent_timeline panel-freeze cache for queued previews.
     (void)msg_idx;
     const std::string& model_id_ref = m.d.model_id.value;
+
+    // Tool-batch merge plumbing: when the caller passes an override
+    // span, treat it as the effective tool_calls for this turn. Saves
+    // an O(N) deep-copy of `msg` every frame on the live tail's merged
+    // path — the originals stay in `m.d.current.messages[*]` and we
+    // borrow them through the span.
+    std::span<const ToolUse> tool_calls = tool_calls_override.empty()
+        ? std::span<const ToolUse>{msg.tool_calls}
+        : tool_calls_override;
 
     auto style = speaker_style_for(msg.role, m);
 
@@ -310,7 +320,7 @@ maya::Turn::Config turn_config(const Message& msg, std::size_t msg_idx,
             // Element variant of BodySlot.
             cfg.body.emplace_back(cached_markdown_for(msg, m));
         }
-        if (!msg.tool_calls.empty()) {
+        if (!tool_calls.empty()) {
             // agent_session-mirroring fast path: once every tool in the
             // batch is terminal AND no pending permission still targets
             // one of them, the panel's bytes are immutable for the rest
@@ -339,7 +349,7 @@ maya::Turn::Config turn_config(const Message& msg, std::size_t msg_idx,
             // what stays in viewport.
             bool all_terminal = true;
             bool any_pending_perm = false;
-            for (const auto& tc : msg.tool_calls) {
+            for (const auto& tc : tool_calls) {
                 if (!tc.is_terminal()) { all_terminal = false; break; }
                 if (m.d.pending_permission
                     && m.d.pending_permission->id == tc.id) {
@@ -360,8 +370,8 @@ maya::Turn::Config turn_config(const Message& msg, std::size_t msg_idx,
                 auto mix = [&](std::uint64_t v) {
                     panel_key = (panel_key ^ v) * 1099511628211ULL;
                 };
-                mix(msg.tool_calls.size());
-                for (const auto& tc : msg.tool_calls)
+                mix(tool_calls.size());
+                for (const auto& tc : tool_calls)
                     mix(tc.compute_render_key());
                 // style.color is baked into the panel border via
                 // agent_timeline_config's rail_color argument; mix it
@@ -386,7 +396,7 @@ maya::Turn::Config turn_config(const Message& msg, std::size_t msg_idx,
                     || slot.agent_timeline_key != panel_key
                     || slot.agent_timeline_model_id != model_id_ref) {
                     auto built = maya::AgentTimeline{
-                        agent_timeline_config(msg, /*spinner_frame=*/0,
+                        agent_timeline_config(tool_calls, /*spinner_frame=*/0,
                                               style.color)}.build();
                     slot.agent_timeline =
                         std::make_shared<maya::Element>(std::move(built));
@@ -397,10 +407,10 @@ maya::Turn::Config turn_config(const Message& msg, std::size_t msg_idx,
             } else {
                 cfg.body.emplace_back(
                     maya::AgentTimeline{agent_timeline_config(
-                        msg, m.s.spinner.frame_index(), style.color)}.build());
+                        tool_calls, m.s.spinner.frame_index(), style.color)}.build());
             }
             // In-flight permission card under the timeline.
-            for (const auto& tc : msg.tool_calls) {
+            for (const auto& tc : tool_calls) {
                 if (m.d.pending_permission && m.d.pending_permission->id == tc.id) {
                     cfg.body.emplace_back(inline_permission_config(
                         *m.d.pending_permission, tc));

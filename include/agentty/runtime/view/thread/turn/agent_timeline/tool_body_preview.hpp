@@ -1,5 +1,6 @@
 #pragma once
 #include <set>
+#include <span>
 #include <string>
 #include <unordered_map>
 
@@ -8,17 +9,17 @@
 
 namespace agentty::ui {
 
-// Cross-tool semantic index built once per Message's tool_calls list:
+// Cross-tool semantic index built once per turn's tool_calls list:
 // path → {line numbers Grep flagged}. A subsequent FileRead on the same
 // path inherits these as `highlight_lines`, mirroring agent_session.cpp's
 // grep_hits → FileRead wiring so the timeline body anchors the user's
 // eye on lines the assistant flagged earlier in the same turn.
 using GrepHits = std::unordered_map<std::string, std::set<int>>;
 
-// Walk `msg.tool_calls`, parse each completed Grep tool's markdown-
+// Walk a tool_calls span, parse each completed Grep tool's markdown-
 // structured output (`## Matches in <path>` headers + `### L<start>-<end>`
 // blocks), and accumulate (path → start lines) into the returned map.
-[[nodiscard]] GrepHits collect_grep_hits(const Message& msg);
+[[nodiscard]] GrepHits collect_grep_hits(std::span<const ToolUse> tool_calls);
 
 // ToolUse → ToolBodyPreview::Config. Picks the discriminated body kind
 // (BashOutput / FileRead / FileWrite / Json / EditDiff / GitDiff /

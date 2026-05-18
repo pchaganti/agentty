@@ -12,10 +12,10 @@
 
 namespace agentty::ui {
 
-maya::AgentTimeline::Config agent_timeline_config(const Message& msg,
+maya::AgentTimeline::Config agent_timeline_config(std::span<const ToolUse> tool_calls,
                                                   int spinner_frame,
                                                   maya::Color rail_color) {
-    int total = static_cast<int>(msg.tool_calls.size());
+    int total = static_cast<int>(tool_calls.size());
     int done  = 0;
     float total_elapsed = 0.0f;
     int running_idx = -1;
@@ -26,8 +26,8 @@ maya::AgentTimeline::Config agent_timeline_config(const Message& msg,
         cat_counts.emplace_back(cat, 1);
     };
 
-    for (std::size_t i = 0; i < msg.tool_calls.size(); ++i) {
-        const auto& tc = msg.tool_calls[i];
+    for (std::size_t i = 0; i < tool_calls.size(); ++i) {
+        const auto& tc = tool_calls[i];
         if (tc.is_terminal()) {
             ++done;
             total_elapsed += tool_elapsed(tc);
@@ -43,7 +43,7 @@ maya::AgentTimeline::Config agent_timeline_config(const Message& msg,
     // `highlight_lines`, anchoring the user's eye on lines the assistant
     // flagged earlier in the same turn instead of forcing a re-scan.
     // Mirrors agent_session.cpp's grep_hits → FileRead wiring in maya.
-    const GrepHits grep_hits = collect_grep_hits(msg);
+    const GrepHits grep_hits = collect_grep_hits(tool_calls);
 
     maya::AgentTimeline::Config cfg;
     cfg.frame = spinner_frame;
@@ -60,8 +60,8 @@ maya::AgentTimeline::Config agent_timeline_config(const Message& msg,
     }
 
     // ── Events.
-    cfg.events.reserve(msg.tool_calls.size());
-    for (const auto& tc : msg.tool_calls) {
+    cfg.events.reserve(tool_calls.size());
+    for (const auto& tc : tool_calls) {
         std::string detail = tool_timeline_detail(tc);
         if (detail.empty()) {
             detail = tc.is_running()  ? std::string{"running\xe2\x80\xa6"}
@@ -111,7 +111,7 @@ maya::AgentTimeline::Config agent_timeline_config(const Message& msg,
     //    rewrite the rows that scrolled off.
     if (total > 0) {
         int failed = 0, rejected = 0;
-        for (const auto& tc : msg.tool_calls) {
+        for (const auto& tc : tool_calls) {
             if (tc.is_failed())   ++failed;
             if (tc.is_rejected()) ++rejected;
         }
@@ -146,7 +146,7 @@ maya::AgentTimeline::Config agent_timeline_config(const Message& msg,
                       + std::to_string(done) + "/" + std::to_string(total);
     if (running_idx >= 0) {
         title += "  \xc2\xb7  " + tool_display_name(
-            msg.tool_calls[static_cast<std::size_t>(running_idx)].name.value);
+            tool_calls[static_cast<std::size_t>(running_idx)].name.value);
     } else if (done == total && total > 0) {
         title += "  \xc2\xb7  " + format_duration_compact(total_elapsed);
     }

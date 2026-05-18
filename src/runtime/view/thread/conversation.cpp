@@ -66,13 +66,17 @@ bool is_tool_only_assistant(const Message& mm) {
 //     of the run's. Without this the live tail stacks N ACTIONS
 //     panels back-to-back with no separator (continuation suppresses
 //     the gap), which is the bug the screenshot captures.
-std::vector<maya::Element> build_live_tail(const Model& m, int& running_turn) {
-    std::vector<maya::Element> rows;
+//
+// Appends directly into `out` so the caller's destination vector
+// (cfg.live_tail) receives each Element via push_back/std::move with
+// no intermediate copy or staging vector.
+void build_live_tail(const Model& m, int& running_turn,
+                     std::vector<maya::Element>& out) {
     const std::size_t total = m.d.current.messages.size();
     const std::size_t start = std::min(m.ui.frozen_through, total);
-    if (start >= total) return rows;
+    if (start >= total) return;
 
-    rows.reserve((total - start) * 2);
+    out.reserve(out.size() + (total - start) * 2);
 
     bool first_in_tail = true;
     for (std::size_t i = start; i < total; ++i) {
@@ -96,9 +100,9 @@ std::vector<maya::Element> build_live_tail(const Model& m, int& running_turn) {
             // so the rule isn't crushed against the previous Turn's
             // bottom chrome or lost to a w==0 first frame. Subsequent
             // intra-tail seams use the plain one-row divider.
-            rows.push_back(first_in_tail && !m.ui.frozen.empty()
-                               ? leading_seam_row()
-                               : gap_row());
+            out.push_back(first_in_tail && !m.ui.frozen.empty()
+                              ? leading_seam_row()
+                              : gap_row());
         }
         first_in_tail = false;
 
@@ -116,19 +120,29 @@ std::vector<maya::Element> build_live_tail(const Model& m, int& running_turn) {
         int turn_num = running_turn;
 
         if (run_end > i + 1) {
-            Message merged = msg;
+            // Tool-batch merge for the live tail: build a borrowed-span
+            // union of the run's tool_calls and pass it to turn_config
+            // via the override. No per-frame Message deep copy — the
+            // head Message's `text`, `streaming_text`, `attachments`
+            // etc. stay borrowed in place; only the (necessarily
+            // copied) ToolUse elements land in a fresh local vector.
+            std::vector<ToolUse> merged_tools;
             std::size_t reserve_n = msg.tool_calls.size();
             for (std::size_t j = i + 1; j < run_end; ++j)
                 reserve_n += m.d.current.messages[j].tool_calls.size();
-            merged.tool_calls.reserve(reserve_n);
+            merged_tools.reserve(reserve_n);
+            merged_tools.insert(merged_tools.end(),
+                                msg.tool_calls.begin(), msg.tool_calls.end());
             for (std::size_t j = i + 1; j < run_end; ++j) {
                 const auto& src = m.d.current.messages[j].tool_calls;
-                merged.tool_calls.insert(merged.tool_calls.end(),
-                                         src.begin(), src.end());
+                merged_tools.insert(merged_tools.end(),
+                                    src.begin(), src.end());
             }
-            auto cfg = turn_config(merged, i, turn_num, m, continuation,
-                                   /*synthetic=*/true);
-            rows.push_back(maya::Turn{std::move(cfg)}.build());
+            auto cfg = turn_config(msg, i, turn_num, m, continuation,
+                                   /*synthetic=*/true,
+                                   /*meta_override=*/{},
+                                   /*tool_calls_override=*/merged_tools);
+            out.push_back(maya::Turn{std::move(cfg)}.build());
             if (msg.role == Role::Assistant && !continuation) ++running_turn;
             i = run_end - 1;   // for-loop ++ lands on run_end
             continue;
@@ -151,10 +165,9 @@ std::vector<maya::Element> build_live_tail(const Model& m, int& running_turn) {
             cfg.body.emplace_back(
                 maya::ActivityIndicator{std::move(ind)}.build());
         }
-        rows.push_back(maya::Turn{std::move(cfg)}.build());
+        out.push_back(maya::Turn{std::move(cfg)}.build());
         if (msg.role == Role::Assistant && !continuation) ++running_turn;
     }
-    return rows;
 }
 
 // Build the queued-message preview rows: visible at the tail of the
@@ -162,10 +175,10 @@ std::vector<maya::Element> build_live_tail(const Model& m, int& running_turn) {
 // Code's appearance at offset 80106500 — visually identical to real
 // user turns; the "queued not sent" cue is absence-of-assistant +
 // the composer's `❚ N queued` chip.
-std::vector<maya::Element> build_queued_previews(const Model& m, int& running_turn) {
-    std::vector<maya::Element> rows;
-    if (m.ui.composer.queued.empty()) return rows;
-    rows.reserve(m.ui.composer.queued.size() * 2);
+void build_queued_previews(const Model& m, int& running_turn,
+                           std::vector<maya::Element>& out) {
+    if (m.ui.composer.queued.empty()) return;
+    out.reserve(out.size() + m.ui.composer.queued.size() * 2);
     auto now = std::chrono::system_clock::now();
     const std::size_t base_idx = m.d.current.messages.size();
     for (std::size_t qi = 0; qi < m.ui.composer.queued.size(); ++qi) {
@@ -178,15 +191,14 @@ std::vector<maya::Element> build_queued_previews(const Model& m, int& running_tu
                          + " / "     + std::to_string(m.ui.composer.queued.size());
         if (static_cast<int>(qi) == m.ui.composer.queue_peek_idx)
             meta = "\xe2\x9c\x8e editing \xe2\x80\x94 " + meta;   // ✎
-        rows.push_back(gap_row());
+        out.push_back(gap_row());
         auto cfg = turn_config(synthetic, base_idx + qi, running_turn, m,
                                /*continuation=*/false,
                                /*synthetic=*/true,
                                /*meta_override=*/meta);
-        rows.push_back(maya::Turn{std::move(cfg)}.build());
+        out.push_back(maya::Turn{std::move(cfg)}.build());
         ++running_turn;
     }
-    return rows;
 }
 
 } // namespace
@@ -205,11 +217,8 @@ maya::Conversation::Config conversation_config(const Model& m) {
     // agent turn (one User + possibly several Assistant continuations)
     // plus any queued-message previews.
     int running_turn = m.ui.frozen_turn + 1;
-    auto live = build_live_tail(m, running_turn);
-    auto queued = build_queued_previews(m, running_turn);
-    cfg.live_tail.reserve(live.size() + queued.size());
-    for (auto& e : live)   cfg.live_tail.push_back(std::move(e));
-    for (auto& e : queued) cfg.live_tail.push_back(std::move(e));
+    build_live_tail(m, running_turn, cfg.live_tail);
+    build_queued_previews(m, running_turn, cfg.live_tail);
 
     // No separate in_flight indicator — the empty-placeholder
     // assistant Turn carries its own "thinking…" body slot during

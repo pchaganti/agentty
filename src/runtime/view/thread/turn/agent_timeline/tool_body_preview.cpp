@@ -67,9 +67,9 @@ void accumulate_grep_hits(const std::string& output, GrepHits& out) {
 
 } // namespace
 
-GrepHits collect_grep_hits(const Message& msg) {
+GrepHits collect_grep_hits(std::span<const ToolUse> tool_calls) {
     GrepHits out;
-    for (const auto& tc : msg.tool_calls) {
+    for (const auto& tc : tool_calls) {
         if (tc.name.value != "grep") continue;
         const auto& body = tc.output();
         if (body.empty()) continue;
