@@ -171,6 +171,202 @@ using Phase = std::variant<phase::Idle, phase::Streaming,
     }, p);
 }
 
+// ── Typed phase transitions ───────────────────────────────────────
+// Each function below names a SPECIFIC legal transition between two
+// phases. The signature consumes the source by value-move and returns
+// the destination; illegal transitions (Idle → ExecutingTool, etc.)
+// simply don't have a function defined, so any reducer site that uses
+// the typed API can't call an illegal one — the function lookup fails
+// to compile.
+//
+// The legal transition graph (see phase::PhaseKind below for the
+// closed set):
+//
+//                  start()                land_perm()         exec_tool()
+//   Idle   ───────────▶ Streaming ─────────▶ AwaitingPermission ─────────▶ ExecutingTool
+//   ▲                       │                       │                              │
+//   │ finish()              │                       │ reject()                     │ done_tool()
+//   │                       │                       ▼                              ▼
+//   └──────────────────────────────────── Idle ←────────────────────────────────────
+//                                                                                  │
+//                  resume_stream() (after tool done)                                │
+//   Streaming  ◀────────────────────────────────────────────────────────────────────────┘
+//
+// abort() is special — collapses ANY active phase back to Idle. Used by
+// Esc / cancel / terminal error handlers.
+namespace phase {
+
+// Closed set of phase identities. Pairs 1:1 with the Phase variant
+// alternatives; the legality matrix below is indexed on this enum.
+enum class PhaseKind : std::uint8_t {
+    Idle,
+    Streaming,
+    AwaitingPermission,
+    ExecutingTool,
+};
+
+[[nodiscard]] constexpr PhaseKind kind_of(const Phase& p) noexcept {
+    return std::visit([](const auto& v) -> PhaseKind {
+        using T = std::decay_t<decltype(v)>;
+        if      constexpr (std::same_as<T, Idle>)               return PhaseKind::Idle;
+        else if constexpr (std::same_as<T, Streaming>)          return PhaseKind::Streaming;
+        else if constexpr (std::same_as<T, AwaitingPermission>) return PhaseKind::AwaitingPermission;
+        else                                                    return PhaseKind::ExecutingTool;
+    }, p);
+}
+
+// True iff a (from, to) transition is part of the legal graph above.
+// abort() is encoded as "any → Idle" (every from-phase can reach Idle).
+[[nodiscard]] constexpr bool is_legal_transition(PhaseKind from, PhaseKind to) noexcept {
+    using K = PhaseKind;
+    // Every phase can be aborted to Idle.
+    if (to == K::Idle) return true;
+    // Idle → Streaming: start a new turn.
+    if (from == K::Idle               && to == K::Streaming)          return true;
+    // Streaming → AwaitingPermission: model emitted tool_use, awaiting user.
+    if (from == K::Streaming          && to == K::AwaitingPermission) return true;
+    // AwaitingPermission → ExecutingTool: user approved.
+    if (from == K::AwaitingPermission && to == K::ExecutingTool)      return true;
+    // ExecutingTool → Streaming: tool done, resume the open stream.
+    if (from == K::ExecutingTool      && to == K::Streaming)          return true;
+    return false;
+}
+
+// ── Transition functions (one per legal edge) ───────────────────────
+// Each takes the source by value-move and returns the destination.
+// Adopting these incrementally at reducer sites means an illegal
+// transition (e.g. Idle → ExecutingTool) is a compile error — no
+// function with that signature exists.
+
+// Idle → Streaming: brand-new turn, fresh Active context.
+[[nodiscard]] inline Streaming start(Idle&&, Active a) noexcept {
+    return Streaming{std::move(a)};
+}
+
+// Streaming → AwaitingPermission: tool_use arrived, ask the user.
+// Ctx flows unchanged (cancel, retry, timestamps preserve).
+[[nodiscard]] inline AwaitingPermission land_perm(Streaming&& s) noexcept {
+    return AwaitingPermission{std::move(s.ctx)};
+}
+
+// AwaitingPermission → ExecutingTool: user approved.
+[[nodiscard]] inline ExecutingTool exec_tool(AwaitingPermission&& p) noexcept {
+    return ExecutingTool{std::move(p.ctx)};
+}
+
+// ExecutingTool → Streaming: tool finished, resume the open stream.
+[[nodiscard]] inline Streaming resume_stream(ExecutingTool&& e) noexcept {
+    return Streaming{std::move(e.ctx)};
+}
+
+// Streaming → Idle: natural finish (StreamFinished) or terminal error.
+[[nodiscard]] inline Idle finish(Streaming&&) noexcept { return Idle{}; }
+
+// AwaitingPermission → Idle: user rejected the tool prompt.
+[[nodiscard]] inline Idle reject(AwaitingPermission&&) noexcept { return Idle{}; }
+
+// ExecutingTool → Idle: tool failed terminally and no resumption is
+// possible (very rare — the reducer prefers reject → Streaming → Idle
+// so the model gets a tool_result with is_error=true). Provided for
+// completeness so the abort path has the right name.
+[[nodiscard]] inline Idle done_tool(ExecutingTool&&) noexcept { return Idle{}; }
+
+// abort — collapses any active phase back to Idle. Used by Esc /
+// CancelStream / terminal-error handlers that don't care which phase
+// they're aborting from.
+[[nodiscard]] inline Idle abort(Streaming&&)          noexcept { return Idle{}; }
+[[nodiscard]] inline Idle abort(AwaitingPermission&&) noexcept { return Idle{}; }
+[[nodiscard]] inline Idle abort(ExecutingTool&&)      noexcept { return Idle{}; }
+
+// ── Compile-time proofs of the transition graph ────────────────────
+namespace proofs {
+
+// Every transition function above has the right signature: source by
+// value-move (rvalue ref), destination by value. This is the contract
+// that makes the typestate enforcement work — without an rvalue source,
+// the old phase value sticks around and the typestate "erases" the
+// pre-transition state only by convention.
+static_assert(std::is_same_v<decltype(start(std::declval<Idle&&>(),
+                                            std::declval<Active>())),
+                             Streaming>);
+static_assert(std::is_same_v<decltype(land_perm(std::declval<Streaming&&>())),
+                             AwaitingPermission>);
+static_assert(std::is_same_v<decltype(exec_tool(std::declval<AwaitingPermission&&>())),
+                             ExecutingTool>);
+static_assert(std::is_same_v<decltype(resume_stream(std::declval<ExecutingTool&&>())),
+                             Streaming>);
+static_assert(std::is_same_v<decltype(finish(std::declval<Streaming&&>())),
+                             Idle>);
+static_assert(std::is_same_v<decltype(reject(std::declval<AwaitingPermission&&>())),
+                             Idle>);
+static_assert(std::is_same_v<decltype(done_tool(std::declval<ExecutingTool&&>())),
+                             Idle>);
+
+// Exhaustive sweep: for every (from, to) pair, the legality matrix
+// is_legal_transition() agrees with the existence of a transition
+// function. The matrix is the spec; the functions are the
+// implementation. Drift between them = bug.
+//
+// We can't directly ask "does a function exist from X to Y" via SFINAE
+// without naming each one, so the proof is a parallel re-statement of
+// the legal edges and a static_assert that it equals the matrix on
+// every cell. Adding a new phase requires updating BOTH this proof
+// and is_legal_transition, mirroring the spec::policy proof in
+// tool/policy.hpp.
+consteval bool transition_graph_matches_spec() {
+    using K = PhaseKind;
+    constexpr K kAll[] = {K::Idle, K::Streaming, K::AwaitingPermission, K::ExecutingTool};
+
+    // Hand-rolled spec: the same edges encoded in the transition
+    // functions above. Listed positively (legal) — every other cell
+    // is illegal except for the universal "X → Idle" abort edges.
+    auto spec = [](K f, K t) {
+        if (t == K::Idle) return true;
+        if (f == K::Idle               && t == K::Streaming)          return true;
+        if (f == K::Streaming          && t == K::AwaitingPermission) return true;
+        if (f == K::AwaitingPermission && t == K::ExecutingTool)      return true;
+        if (f == K::ExecutingTool      && t == K::Streaming)          return true;
+        return false;
+    };
+
+    for (auto f : kAll)
+        for (auto t : kAll)
+            if (is_legal_transition(f, t) != spec(f, t)) return false;
+    return true;
+}
+static_assert(transition_graph_matches_spec(),
+              "is_legal_transition disagrees with the transition-function "
+              "graph above — update both together when changing phases");
+
+// Pin the closed-set size so adding a phase requires updating every
+// cell-by-cell proof site below.
+static_assert(std::variant_size_v<Phase> == 4,
+              "Phase variant size changed — update PhaseKind, the "
+              "transition functions, and is_legal_transition together");
+
+// Named-edge spot checks: read better than the loop above and pin the
+// human-meaningful invariants in case the matrix ever loses its mind.
+static_assert( is_legal_transition(PhaseKind::Idle, PhaseKind::Streaming));
+static_assert(!is_legal_transition(PhaseKind::Idle, PhaseKind::ExecutingTool),
+              "Idle → ExecutingTool must skip through Streaming; the user "
+              "hasn't sent a turn yet");
+static_assert(!is_legal_transition(PhaseKind::Idle, PhaseKind::AwaitingPermission),
+              "Idle → AwaitingPermission is impossible — there's no tool "
+              "to authorise without a model turn first");
+static_assert( is_legal_transition(PhaseKind::Streaming, PhaseKind::AwaitingPermission));
+static_assert( is_legal_transition(PhaseKind::AwaitingPermission, PhaseKind::ExecutingTool));
+static_assert( is_legal_transition(PhaseKind::ExecutingTool, PhaseKind::Streaming));
+static_assert(!is_legal_transition(PhaseKind::ExecutingTool, PhaseKind::AwaitingPermission),
+              "ExecutingTool → AwaitingPermission is impossible — a tool "
+              "that needs a follow-up permission goes through Streaming first");
+static_assert( is_legal_transition(PhaseKind::Streaming,          PhaseKind::Idle));
+static_assert( is_legal_transition(PhaseKind::AwaitingPermission, PhaseKind::Idle));
+static_assert( is_legal_transition(PhaseKind::ExecutingTool,      PhaseKind::Idle));
+
+} // namespace proofs
+
+} // namespace phase
+
 struct StreamState {
     Phase phase = phase::Idle{};
     std::chrono::steady_clock::time_point last_tick{};
