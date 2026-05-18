@@ -1342,6 +1342,23 @@ Step stream_update(Model m, msg::StreamMsg sm) {
                     }
                     std::string{}.swap(last->streaming_text);
                 }
+                // Pre-settle StreamingMarkdown so the message's rendered
+                // height is locked in BEFORE the next view() runs.
+                // Mirrors the finalize_turn fix: lazy finish() during
+                // view shifts assistant height by 1+ rows when the
+                // closing ``` of a code block commits the tail into a
+                // prefix block. On the error path the seam disturbance
+                // is even worse because we also force_redraw below; the
+                // pre-settle gets the canvas right BEFORE the redraw
+                // hashes the cells.
+                if (!last->text.empty()) {
+                    auto& cache = m.ui.view_cache.message_md(
+                        m.d.current.id, last->id);
+                    if (!cache.streaming)
+                        cache.streaming = std::make_shared<maya::StreamingMarkdown>();
+                    cache.streaming->set_content(last->text);
+                    cache.streaming->finish();
+                }
             }
 
             // Classify and decide retry vs terminal.
@@ -1596,6 +1613,17 @@ Step stream_update(Model m, msg::StreamMsg sm) {
                     if (last.text.empty()) last.text = std::move(last.streaming_text);
                     else                   last.text += std::move(last.streaming_text);
                     std::string{}.swap(last.streaming_text);
+                }
+                // Pre-settle StreamingMarkdown to lock the message's
+                // height before the next view() runs. See finalize_turn
+                // and StreamError for the full rationale.
+                if (!last.text.empty()) {
+                    auto& cache = m.ui.view_cache.message_md(
+                        m.d.current.id, last.id);
+                    if (!cache.streaming)
+                        cache.streaming = std::make_shared<maya::StreamingMarkdown>();
+                    cache.streaming->set_content(last.text);
+                    cache.streaming->finish();
                 }
                 for (auto& tc : last.tool_calls) {
                     if (!tc.is_terminal()) {
