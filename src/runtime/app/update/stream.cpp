@@ -22,6 +22,7 @@
 #include "agentty/runtime/mem.hpp"
 #include "agentty/runtime/view/cache.hpp"
 #include "agentty/tool/spec.hpp"
+#include <maya/widget/markdown.hpp>
 #include "agentty/tool/util/partial_json.hpp"
 
 namespace agentty::app::detail {
@@ -617,6 +618,25 @@ maya::Cmd<Msg> finalize_turn(Model& m, StopReason stop_reason) {
             if (last.text.empty()) last.text = std::move(last.streaming_text);
             else                   last.text += std::move(last.streaming_text);
             std::string{}.swap(last.streaming_text);
+        }
+
+        // Pre-settle StreamingMarkdown so the message's rendered height
+        // is locked in BEFORE the next view() runs. Lazy finish() during
+        // view shifts the assistant message height by 1+ rows when the
+        // closing ``` of a code block (or a trailing block boundary)
+        // commits the tail into a prefix block — maya's diff sees that
+        // shrink and emits the shrink path, but rows already overflowed
+        // into native scrollback retain the pre-shrink layout, leaving
+        // border fragments at the scrollback↔viewport seam.
+        // Settling here matches agent_session's `m.md.finish() + push to
+        // frozen` discipline: one coherent transition per update step.
+        if (last.role == Role::Assistant && !last.text.empty()) {
+            auto& cache = m.ui.view_cache.message_md(
+                m.d.current.id, last.id);
+            if (!cache.streaming)
+                cache.streaming = std::make_shared<maya::StreamingMarkdown>();
+            cache.streaming->set_content(last.text);
+            cache.streaming->finish();
         }
         // Flush any tool_calls whose StreamToolUseEnd never fired — Anthropic
         // normally sends content_block_stop per tool block, but proxies /
