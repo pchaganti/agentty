@@ -133,6 +133,26 @@ struct TurnConfigCache {
     // resulting label / rail color into the Config and Element. A
     // mid-session model switch must therefore invalidate the slot.
     std::string                               cached_model_id;
+
+    // Frozen agent_timeline panel Element. Snapshotted the FIRST
+    // frame on which every tool_call is terminal and no pending
+    // permission targets one of them. From that frame onward the
+    // live agent_timeline_config / AgentTimeline::build chain is
+    // bypassed and this Element is reused verbatim, even while the
+    // rest of the turn is still alive (markdown body streaming).
+    //
+    // Why this is separate from `element` above: the full-turn
+    // cache requires the entire message resolved. The Anthropic
+    // pattern of streaming text AFTER tools complete keeps
+    // streaming_text non-empty for the whole post-tool window, so
+    // the full-turn cache stays cold and agent_timeline_config
+    // rebuilds every frame. Footer add, body grow, color flip from
+    // status transition all re-emit rows whose canvas Y maps to
+    // terminal rows already in native scrollback — the corruption
+    // vector. Freezing the panel at terminal-state locks every byte.
+    std::shared_ptr<maya::Element>            agent_timeline;
+    std::uint64_t                             agent_timeline_key = 0;
+    std::string                               agent_timeline_model_id;
 };
 
 // LRU-bounded render cache. Both the markdown render and the turn-config

@@ -6,6 +6,7 @@
 #include <string>
 #include <utility>
 
+#include <maya/widget/agent_timeline.hpp>
 #include <maya/widget/markdown.hpp>
 
 #include "agentty/domain/catalog.hpp"
@@ -393,8 +394,86 @@ maya::Turn::Config turn_config(const Message& msg, std::size_t msg_idx,
             cfg.body.emplace_back(cached_markdown_for(msg, m));
         }
         if (!msg.tool_calls.empty()) {
-            cfg.body.emplace_back(
-                agent_timeline_config(msg, m.s.spinner.frame_index(), style.color));
+            // agent_session-mirroring fast path: once every tool in the
+            // batch is terminal AND no pending permission still targets
+            // one of them, the panel's bytes are immutable for the rest
+            // of this message's life. Snapshot it to an Element on the
+            // FIRST such frame and serve the snapshot verbatim on every
+            // subsequent frame — even while streaming_text continues to
+            // grow below the panel.
+            //
+            // This matters because Anthropic's common shape is
+            // tool_use_block_stop → content_block_delta (more text)
+            // → message_stop. During the post-tool text window
+            // `streaming_text` is non-empty so the full-turn cache stays
+            // cold and `agent_timeline_config` rebuilds every frame:
+            // the running-state status flips to terminal status, the
+            // footer text mutates, the spinner frame index changes (the
+            // border can flip from rail-cyan to muted). Each frame's
+            // canvas mapping at a given row Y captures a slightly
+            // different snapshot of "the panel right now", and any rows
+            // that scroll off into native scrollback during this window
+            // commit different bytes than the panel will eventually
+            // render — visible as fragments / overlap at the seam.
+            //
+            // Freezing the panel at first-terminal-frame stops the
+            // drift cold: the same Element is reused, so the same
+            // bytes get painted, so what commits to scrollback matches
+            // what stays in viewport.
+            bool all_terminal = true;
+            bool any_pending_perm = false;
+            for (const auto& tc : msg.tool_calls) {
+                if (!tc.is_terminal()) { all_terminal = false; break; }
+                if (m.d.pending_permission
+                    && m.d.pending_permission->id == tc.id) {
+                    any_pending_perm = true;
+                    break;
+                }
+            }
+            const bool can_freeze_panel =
+                !synthetic && all_terminal && !any_pending_perm;
+
+            // Key the freeze on the SAME hash that the message's
+            // render_key derives from its tool_calls. If a post-terminal
+            // mutation lands (expand toggle, late re-execute output),
+            // the key bumps and we re-snapshot.
+            std::uint64_t panel_key = 0;
+            if (can_freeze_panel) {
+                panel_key = 1469598103934665603ULL;
+                auto mix = [&](std::uint64_t v) {
+                    panel_key = (panel_key ^ v) * 1099511628211ULL;
+                };
+                mix(msg.tool_calls.size());
+                for (const auto& tc : msg.tool_calls)
+                    mix(tc.compute_render_key());
+                // style.color is baked into the panel border via
+                // agent_timeline_config's rail_color argument; mix it
+                // so a model-id switch (rail color follows model
+                // family) invalidates the snapshot.
+                mix(static_cast<std::uint64_t>(style.color.r()));
+                mix(static_cast<std::uint64_t>(style.color.g()));
+                mix(static_cast<std::uint64_t>(style.color.b()));
+            }
+
+            if (can_freeze_panel) {
+                auto& slot = m.ui.view_cache.turn_config(
+                    m.d.current.id, msg.id);
+                if (!slot.agent_timeline
+                    || slot.agent_timeline_key != panel_key
+                    || slot.agent_timeline_model_id != model_id_ref) {
+                    auto built = maya::AgentTimeline{
+                        agent_timeline_config(msg, /*spinner_frame=*/0,
+                                              style.color)}.build();
+                    slot.agent_timeline =
+                        std::make_shared<maya::Element>(std::move(built));
+                    slot.agent_timeline_key      = panel_key;
+                    slot.agent_timeline_model_id = model_id_ref;
+                }
+                cfg.body.emplace_back(*slot.agent_timeline);
+            } else {
+                cfg.body.emplace_back(
+                    agent_timeline_config(msg, m.s.spinner.frame_index(), style.color));
+            }
             // In-flight permission card under the timeline.
             for (const auto& tc : msg.tool_calls) {
                 if (m.d.pending_permission && m.d.pending_permission->id == tc.id) {
