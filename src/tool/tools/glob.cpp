@@ -4,8 +4,10 @@
 #include "agentty/tool/util/fs_helpers.hpp"
 #include "agentty/tool/util/glob.hpp"
 #include "agentty/tool/util/tool_args.hpp"
+#include "agentty/domain/refined.hpp"
 
 #include <filesystem>
+#include <format>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -20,9 +22,12 @@ namespace fs = std::filesystem;
 namespace {
 
 struct GlobArgs {
-    std::string pattern;
-    std::string root;
-    std::string display_description;
+    // pattern: non-blank by construction. A whitespace-only or empty
+    // glob would either match nothing or match everything depending on
+    // the substring fallback — either way useless.
+    domain::NonBlank<std::string> pattern;
+    std::string                   root;
+    std::string                   display_description;
 };
 
 std::expected<GlobArgs, ToolError> parse_glob_args(const json& j) {
@@ -30,8 +35,13 @@ std::expected<GlobArgs, ToolError> parse_glob_args(const json& j) {
     auto pat_opt = ar.require_str("pattern");
     if (!pat_opt)
         return std::unexpected(ToolError::invalid_args("pattern required"));
+    auto refined_pat = domain::NonBlank<std::string>::try_make(*std::move(pat_opt));
+    if (!refined_pat)
+        return std::unexpected(ToolError::invalid_args(std::format(
+            "pattern {} (received only whitespace)",
+            refined_pat.error().what)));
     return GlobArgs{
-        *std::move(pat_opt),
+        *std::move(refined_pat),
         ar.str("path", "."),
         ar.str("display_description", ""),
     };
@@ -41,13 +51,14 @@ ExecResult run_glob(const GlobArgs& a) {
     // Workspace boundary check — even with default ".", canonicalising
     // it ensures glob can't be tricked into walking up via "../.."
     // tricks the model might try.
-    auto wp = util::make_workspace_path(a.root, "glob");
+    auto wp = util::make_workspace_path_checked(a.root, "glob");
     if (!wp) return std::unexpected(std::move(wp.error()));
 
     // If the pattern has no glob metacharacters, fall back to substring
     // matching. The model often types `foo.cpp` intending "find anything
     // named that"; forcing it to write `*foo.cpp*` would be annoying.
-    bool has_glob = a.pattern.find_first_of("*?[") != std::string::npos;
+    const auto& pat = a.pattern.value();
+    bool has_glob = pat.find_first_of("*?[") != std::string::npos;
 
     std::ostringstream out;
     int n = 0;
@@ -62,8 +73,8 @@ ExecResult run_glob(const GlobArgs& a) {
             continue;
         }
         if (!it->is_regular_file(ec)) continue;
-        bool hit = has_glob ? util::glob_match(a.pattern, fn)
-                            : fn.find(a.pattern) != std::string::npos;
+        bool hit = has_glob ? util::glob_match(pat, fn)
+                            : fn.find(pat) != std::string::npos;
         if (hit) {
             out << it->path().string() << "\n";
             if (++n > 500) { out << "[>500, truncated]\n"; break; }

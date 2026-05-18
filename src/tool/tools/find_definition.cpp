@@ -73,7 +73,7 @@ ExecResult run_find_definition(const FindDefinitionArgs& a) {
         return std::unexpected(ToolError::invalid_regex("invalid symbol name for regex"));
     }
 
-    auto wp = util::make_workspace_path(a.root, "find_definition");
+    auto wp = util::make_workspace_path_checked(a.root, "find_definition");
     if (!wp) return std::unexpected(std::move(wp.error()));
 
     std::ostringstream out;

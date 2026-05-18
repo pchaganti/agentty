@@ -155,7 +155,7 @@ std::expected<BashArgs, ToolError> parse_bash_args(const json& j) {
         // absolute paths; that's why bash has Exec effects and prompts
         // under Ask. The cd arg is the explicit, declared one we *can*
         // gate cleanly.
-        if (auto wp = util::make_workspace_path(cd, "bash"); !wp)
+        if (auto wp = util::make_workspace_path_checked(cd, "bash"); !wp)
             return std::unexpected(std::move(wp.error()));
     }
     return BashArgs{

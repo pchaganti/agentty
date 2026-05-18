@@ -6,6 +6,7 @@
 #include "agentty/tool/util/subprocess.hpp"
 #include "agentty/tool/util/tool_args.hpp"
 #include "agentty/tool/util/utf8.hpp"
+#include "agentty/domain/refined.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -55,12 +56,18 @@ constexpr unsigned    kMaxWorkers   = 8;
 // ── Args ─────────────────────────────────────────────────────────────────
 
 struct GrepArgs {
-    std::string pattern;
-    std::string root;
-    std::string file_glob;
-    bool        case_sensitive;
-    int         offset;
-    std::string display_description;
+    // pattern carries a type-level proof it's non-blank — a whitespace-
+    // only pattern would scan every line for nothing useful. Parser
+    // rejects blanks before constructing, so the field type is the
+    // guarantee that no scanner ever sees a degenerate input.
+    domain::NonBlank<std::string> pattern;
+    std::string                   root;
+    std::string                   file_glob;
+    bool                          case_sensitive;
+    // offset ≥ 0; the parser coerces negatives to 0 before construction
+    // so try_make is infallible.
+    domain::NonNegative<int>      offset;
+    std::string                   display_description;
 };
 
 std::expected<GrepArgs, ToolError> parse_grep_args(const json& j) {
@@ -68,14 +75,22 @@ std::expected<GrepArgs, ToolError> parse_grep_args(const json& j) {
     auto pat_opt = ar.require_str("pattern");
     if (!pat_opt)
         return std::unexpected(ToolError::invalid_args("pattern required"));
+    // Blank-pattern refusal flows through the refinement machinery: the
+    // smart constructor's typed error is wrapped as ToolError so the
+    // model sees a real, actionable message.
+    auto refined_pat = domain::NonBlank<std::string>::try_make(*std::move(pat_opt));
+    if (!refined_pat)
+        return std::unexpected(ToolError::invalid_args(std::format(
+            "pattern {} (received only whitespace)",
+            refined_pat.error().what)));
     int offset = ar.integer("offset", 0);
     if (offset < 0) offset = 0;
     return GrepArgs{
-        *std::move(pat_opt),
+        *std::move(refined_pat),
         ar.str("path", "."),
         ar.str("glob", ""),
         ar.boolean("case_sensitive", false),
-        offset,
+        *domain::NonNegative<int>::try_make(offset),
         ar.str("display_description", ""),
     };
 }
@@ -384,10 +399,10 @@ ExecResult run_builtin(const GrepArgs& a) {
         // we're about to apply the same regex to hundreds of files.
         auto flags = std::regex::ECMAScript | std::regex::optimize;
         if (!a.case_sensitive) flags = flags | std::regex::icase;
-        try { re = std::regex(a.pattern, flags); }
+        try { re = std::regex(a.pattern.value(), flags); }
         catch (const std::regex_error& e) {
             return std::unexpected(ToolError::invalid_regex(
-                std::string{"invalid regex '"} + a.pattern + "': " + e.what()));
+                std::string{"invalid regex '"} + a.pattern.value() + "': " + e.what()));
         }
     }
 
@@ -598,7 +613,7 @@ ExecResult run_grep(const GrepArgs& a) {
     // path before either backend (ripgrep CLI / builtin walker) consumes
     // the root. Both branches use `a.root` directly so we hand them an
     // updated copy rather than threading a separate argument through.
-    auto wp = util::make_workspace_path(a.root, "grep");
+    auto wp = util::make_workspace_path_checked(a.root, "grep");
     if (!wp) return std::unexpected(std::move(wp.error()));
     GrepArgs gated = a;
     gated.root = wp->string();

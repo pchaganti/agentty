@@ -47,7 +47,7 @@ ExecResult run_list_dir(const ListDirArgs& a) {
     // default "." root canonicalises against the active cwd at the
     // moment of the call, not at args-construction. Same behaviour
     // applies to grep/glob/find_definition.
-    auto wp = util::make_workspace_path(a.root, "list_dir");
+    auto wp = util::make_workspace_path_checked(a.root, "list_dir");
     if (!wp) return std::unexpected(std::move(wp.error()));
     std::error_code ec;
     if (!fs::exists(wp->path(), ec))

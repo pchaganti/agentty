@@ -60,6 +60,20 @@ public:
     [[nodiscard]] constexpr const T& value() const noexcept { return value_; }
     [[nodiscard]] constexpr operator const T&() const noexcept { return value_; }
 
+    // Transparent conversion to std::string_view when T is string-like.
+    // C++ permits at most one user-defined conversion in an implicit
+    // chain, so the `operator const T&` above doesn't compose into a
+    // string_view at call sites that take it directly (regex ctor,
+    // string_view-typed parameters). Providing this overload bypasses
+    // the chain limit — calls like `is_literal_pattern(refined_string)`
+    // work without an explicit `.value()`. Constrained on `T` being
+    // convertible to `string_view` so this is a no-op for integral or
+    // container-typed refineds.
+    [[nodiscard]] constexpr operator std::string_view() const noexcept
+        requires std::convertible_to<const T&, std::string_view> {
+        return std::string_view{value_};
+    }
+
     // Validating factory. Returns the typed reason on failure so callers
     // can build their own typed error (e.g. ToolError::invalid_args(...)).
     struct Error {
@@ -144,6 +158,60 @@ struct PositivePred {
 };
 template <std::integral T> using Positive = Refined<T, PositivePred<T>>;
 
+// `NonNegative<T>` — ≥ 0. The other half of the integral sign space; useful
+// for offsets that legitimately allow 0 ("skip nothing") where `Positive`
+// would be too strict.
+template <std::integral T>
+struct NonNegativePred {
+    [[nodiscard]] static constexpr bool check(T v) noexcept { return v >= 0; }
+    [[nodiscard]] static constexpr std::string_view what() noexcept {
+        return "must be ≥ 0";
+    }
+};
+template <std::integral T> using NonNegative = Refined<T, NonNegativePred<T>>;
+
+// `NonBlank` — non-empty AND contains at least one non-whitespace byte.
+// Stricter than `NonEmpty`: a string that's all spaces is rejected. Use
+// for user/model-supplied tokens (search patterns, glob expressions,
+// commit messages) where "   " is a UI-survivable-but-semantically-empty
+// input that would do something useless if accepted.
+struct NonBlankPred {
+    template <class T>
+        requires requires(const T& t) {
+            { t.begin() } -> std::input_iterator;
+            { t.end()   } -> std::input_iterator;
+        }
+    [[nodiscard]] static constexpr bool check(const T& v) noexcept {
+        for (auto c : v) {
+            if (c != ' ' && c != '\t' && c != '\n' && c != '\r' && c != '\f' && c != '\v')
+                return true;
+        }
+        return false;
+    }
+    [[nodiscard]] static constexpr std::string_view what() noexcept {
+        return "must contain at least one non-whitespace character";
+    }
+};
+template <class T> using NonBlank = Refined<T, NonBlankPred>;
+
+// `MaxLen<N>` — size() ≤ N. The other side of NonEmpty: keeps a wire-or-
+// model-supplied blob from blowing past a sane ceiling. The bound N is a
+// non-type template parameter so `MaxLen<std::string, 1024>` and
+// `MaxLen<std::string, 65536>` are different types.
+template <std::size_t N>
+struct MaxLenPred {
+    template <class T>
+        requires requires(const T& t) { { t.size() } -> std::convertible_to<std::size_t>; }
+    [[nodiscard]] static constexpr bool check(const T& v) noexcept {
+        return v.size() <= N;
+    }
+    [[nodiscard]] static constexpr std::string_view what() noexcept {
+        return "exceeds maximum length";
+    }
+};
+template <class T, std::size_t N>
+using MaxLen = Refined<T, MaxLenPred<N>>;
+
 // ── Compile-time tests of the refinement machinery ───────────────────────
 namespace tests {
 static_assert(NonEmpty<std::string>::try_make(std::string{"x"}).has_value());
@@ -153,6 +221,15 @@ static_assert(!Bounded<int, 0, 10>::try_make(11).has_value());
 static_assert(!Bounded<int, 0, 10>::try_make(-1).has_value());
 static_assert(Positive<int>::try_make(1).has_value());
 static_assert(!Positive<int>::try_make(0).has_value());
+static_assert(NonNegative<int>::try_make(0).has_value());
+static_assert(NonNegative<int>::try_make(5).has_value());
+static_assert(!NonNegative<int>::try_make(-1).has_value());
+static_assert(NonBlank<std::string>::try_make(std::string{"x"}).has_value());
+static_assert(NonBlank<std::string>::try_make(std::string{" x "}).has_value());
+static_assert(!NonBlank<std::string>::try_make(std::string{"   "}).has_value());
+static_assert(!NonBlank<std::string>::try_make(std::string{"\t\n"}).has_value());
+static_assert(MaxLen<std::string, 4>::try_make(std::string{"abcd"}).has_value());
+static_assert(!MaxLen<std::string, 4>::try_make(std::string{"abcde"}).has_value());
 } // namespace tests
 
 } // namespace agentty::domain

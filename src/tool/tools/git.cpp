@@ -102,7 +102,7 @@ std::expected<GitStatusArgs, ToolError> parse_git_status_args(const json& j) {
 }
 
 ExecResult run_git_status(const GitStatusArgs& a) {
-    auto wp = util::make_workspace_path(a.root, "git_status");
+    auto wp = util::make_workspace_path_checked(a.root, "git_status");
     if (!wp) return std::unexpected(std::move(wp.error()));
     auto out = run_git({"git", "-C", wp->string(), "status",
                         "--porcelain=v2", "--branch"}, "git_status");
@@ -162,7 +162,7 @@ ExecResult run_git_diff(const GitDiffArgs& a) {
     if (a.staged) argv.push_back("--cached");
     if (!a.ref.empty()) argv.push_back(a.ref);
     if (!a.path.empty()) {
-        auto wp = util::make_workspace_path(a.path, "git_diff");
+        auto wp = util::make_workspace_path_checked(a.path, "git_diff");
         if (!wp) return std::unexpected(std::move(wp.error()));
         argv.push_back("--");
         argv.push_back(wp->string());
@@ -242,7 +242,7 @@ ExecResult run_git_log(const GitLogArgs& a) {
     argv.push_back("-" + std::to_string(n));
     argv.push_back(a.ref.empty() ? std::string{"HEAD"} : a.ref);
     if (!a.path.empty()) {
-        auto wp = util::make_workspace_path(a.path, "git_log");
+        auto wp = util::make_workspace_path_checked(a.path, "git_log");
         if (!wp) return std::unexpected(std::move(wp.error()));
         argv.push_back("--");
         argv.push_back(wp->string());
@@ -348,7 +348,7 @@ ExecResult run_git_commit(const GitCommitArgs& a) {
             return std::unexpected(std::move(r.error()));
     }
     for (const auto& f : a.files) {
-        auto wp = util::make_workspace_path(f, "git_commit");
+        auto wp = util::make_workspace_path_checked(f, "git_commit");
         if (!wp) return std::unexpected(std::move(wp.error()));
         if (auto r = run_git({"git", "add", "--", wp->string()},
                              "git_commit (add)"); !r)
