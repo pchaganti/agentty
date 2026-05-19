@@ -524,12 +524,26 @@ maya::Cmd<Msg> finalize_turn(Model& m, StopReason stop_reason) {
         m.d.current.compactions.push_back(std::move(rec));
         m.d.current.updated_at = std::chrono::system_clock::now();
 
-        // A compaction divider must surface in the frozen prefix at
-        // the boundary index. Cheapest correct approach: rebuild
-        // frozen from scratch — compaction is rare (every dozens of
-        // turns) and rebuilding walks at most messages.size() entries,
-        // bounded by the same caps the live transcript uses.
-        rehydrate_frozen(m);
+        // Do NOT rehydrate frozen. The currently-frozen prefix is
+        // unchanged by compaction (the transcript is immutable — only
+        // the wire payload swaps the prefix for a summary). Rebuilding
+        // it from scratch trashes every Element identity in the
+        // m.ui.frozen vector, which torpedoes maya's pointer-keyed
+        // component cache for the inner ComponentElements (markdown
+        // body, tool cards) that don't carry their own hash_id. The
+        // visible symptom on the user side is a one-frame ghost / full
+        // re-layout of the entire scrollback the moment compaction
+        // completes.
+        //
+        // The compaction divider doesn't need to be inserted here:
+        // `needs_compaction_divider(i)` in freeze_range consults
+        // m.d.current.compactions on every freeze pass. The next
+        // freeze_through call (next user turn → freeze_through fires
+        // in submit_message via the freeze-prior-prefix path) will
+        // hit `i == up_to_index` and push the divider naturally,
+        // immediately before the user's next message. The frozen
+        // prefix that's already painted stays byte-identical across
+        // the transition.
 
         // Rapid-refill breaker bookkeeping. If this compact landed
         // within `kRapidRefillTurns` assistant turns of the previous
