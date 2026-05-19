@@ -132,6 +132,28 @@ std::string timestamp_hh_mm(std::chrono::system_clock::time_point tp) {
     return buf;
 }
 
+std::string timestamp_full(std::chrono::system_clock::time_point tp) {
+    auto tt = std::chrono::system_clock::to_time_t(tp);
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &tt);
+#else
+    localtime_r(&tt, &tm);
+#endif
+    // "Jan 14 09:15" — 12 visible cols, fixed-width on all locales
+    // because we hand-format the month from a small table instead of
+    // strftime %b (which is locale-dependent and can produce 3- or
+    // 4-character abbreviations in some locales).
+    static constexpr const char* kMonth[12] = {
+        "Jan","Feb","Mar","Apr","May","Jun",
+        "Jul","Aug","Sep","Oct","Nov","Dec"};
+    const int m = (tm.tm_mon >= 0 && tm.tm_mon < 12) ? tm.tm_mon : 0;
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%s %2d %02d:%02d",
+                  kMonth[m], tm.tm_mday, tm.tm_hour, tm.tm_min);
+    return buf;
+}
+
 std::string utf8_encode(char32_t cp) {
     std::string out;
     auto u = static_cast<uint32_t>(cp);

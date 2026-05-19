@@ -85,10 +85,13 @@ Element model_picker(const Model& m) {
             auto prefix = sel ? text("› ", fg_bold(accent)) : text("  ");
             auto star   = mi.favorite ? text("★ ", fg_of(warn)) : text("  ");
             auto active_mark = active ? text(" ✓", fg_of(success)) : text("");
-            cfg.items.push_back(h(prefix, star,
-                text(mi.display_name,
-                     sel ? fg_bold(fg) : fg_of(muted)) | clip,
-                active_mark).build());
+            cfg.items.push_back(hstack()
+                .width(Dimension::percent(100))
+                (prefix, star,
+                 text(mi.display_name,
+                      sel ? fg_bold(fg) : fg_of(muted)) | clip,
+                 spacer(),
+                 active_mark));
             ++i;
         }
     }
@@ -127,19 +130,20 @@ Element thread_list(const Model& m) {
         for (const auto& t : m.d.threads) {
             bool sel = i == picker->index;
             auto prefix = sel ? text("› ", fg_bold(info)) : text("  ");
-            // Title takes leftover width via grow(1.0f) so the
-            // timestamp lands flush against the right edge of the
-            // row; without that the title's natural width swallows
-            // the row and the timestamp glues to the title text. The
-            // explicit `text("  ")` gutter guarantees at least two
-            // columns between truncated-title-end and timestamp on
-            // narrow terminals where the title clips.
-            cfg.items.push_back(h(prefix,
-                text(t.title.empty() ? "(untitled)" : t.title,
-                     sel ? fg_of(fg) : fg_of(muted)) | clip | grow(1.0f),
-                text("  "),
-                text(timestamp_hh_mm(t.updated_at), fg_dim(muted))
-            ).build());
+            // Each row uses hstack().width(100%) so the row genuinely
+            // spans the picker's full cross-axis width — without that,
+            // a plain h(...).build() sizes to its content's natural
+            // width and spacer() has no leftover to grow into (see
+            // messenger.cpp build_header() comment). With explicit
+            // 100% width, spacer() absorbs everything between title
+            // and timestamp, pushing the timestamp flush right.
+            cfg.items.push_back(hstack()
+                .width(Dimension::percent(100))
+                (prefix,
+                 text(t.title.empty() ? "(untitled)" : t.title,
+                      sel ? fg_of(fg) : fg_of(muted)) | clip,
+                 spacer(),
+                 text(timestamp_full(t.updated_at), fg_dim(muted))));
             ++i;
         }
     }
@@ -183,12 +187,13 @@ Element command_palette(const Model& m) {
             const auto& cmd = *matches[static_cast<std::size_t>(i)];
             bool sel = i == o->index;
             auto prefix = sel ? text("› ", fg_bold(highlight)) : text("  ");
-            cfg.items.push_back(h(prefix,
-                text(std::string{cmd.label},
-                     sel ? fg_bold(fg) : fg_of(muted)) | clip | grow(1.0f),
-                text("  "),
-                text(std::string{cmd.description}, fg_dim(muted)) | clip
-            ).build());
+            cfg.items.push_back(hstack()
+                .width(Dimension::percent(100))
+                (prefix,
+                 text(std::string{cmd.label},
+                      sel ? fg_bold(fg) : fg_of(muted)) | clip,
+                 spacer(),
+                 text(std::string{cmd.description}, fg_dim(muted)) | clip));
         }
     }
 
@@ -226,12 +231,13 @@ Element mention_palette(const Model& m) {
             auto [name, dir] = split_name_dir(path);
             bool sel = i == o->index;
             auto prefix = sel ? text("› ", fg_bold(info)) : text("  ");
-            cfg.items.push_back(h(prefix,
-                text(std::string{name},
-                     sel ? fg_bold(fg) : fg_of(fg)) | clip | grow(1.0f),
-                text("  "),
-                text(parent_segment(dir), fg_dim(muted)) | clip
-            ).build());
+            cfg.items.push_back(hstack()
+                .width(Dimension::percent(100))
+                (prefix,
+                 text(std::string{name},
+                      sel ? fg_bold(fg) : fg_of(fg)) | clip,
+                 spacer(),
+                 text(parent_segment(dir), fg_dim(muted)) | clip));
         }
     }
 
@@ -280,13 +286,14 @@ Element symbol_palette(const Model& m) {
             auto prefix = sel ? text("› ", fg_bold(highlight)) : text("  ");
             std::string locus = std::string{fname} + ":"
                               + std::to_string(sym.line_number);
-            cfg.items.push_back(h(prefix,
-                text(sym.name, sel ? fg_bold(fg) : fg_of(fg)) | clip,
-                text("  "),
-                text(locus, fg_dim(muted)) | clip | grow(1.0f),
-                text("  "),
-                text(parent_segment(dir), fg_dim(muted)) | clip
-            ).build());
+            cfg.items.push_back(hstack()
+                .width(Dimension::percent(100))
+                (prefix,
+                 text(sym.name, sel ? fg_bold(fg) : fg_of(fg)) | clip,
+                 text("  "),
+                 text(locus, fg_dim(muted)) | clip,
+                 spacer(),
+                 text(parent_segment(dir), fg_dim(muted)) | clip));
         }
     }
 

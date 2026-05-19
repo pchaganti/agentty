@@ -24,6 +24,12 @@ namespace agentty::ui {
 
 [[nodiscard]] std::string timestamp_hh_mm(std::chrono::system_clock::time_point tp);
 
+// Full timestamp — "Mon DD HH:MM" (e.g. "Jan 14 09:15") for picker rows.
+// Year is omitted on the assumption every visible row is from this year;
+// add it via `%Y %b %d %H:%M` if/when threads exceed a year-long history
+// becomes a real concern.
+[[nodiscard]] std::string timestamp_full(std::chrono::system_clock::time_point tp);
+
 // ── Typographic primitives ────────────────────────────────────────────────
 // Letter-spaced uppercase ("S E C T I O N") — the typographic shorthand
 // for "this is a section header" in CLI tools that lack real small-caps.
