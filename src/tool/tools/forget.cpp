@@ -32,6 +32,7 @@ namespace {
 struct ForgetArgs {
     std::string id;          // empty if not provided
     std::string substring;   // empty if not provided
+    bool dry_run = false;
 };
 
 std::expected<ForgetArgs, ToolError> parse_forget_args(const json& j) {
@@ -39,6 +40,7 @@ std::expected<ForgetArgs, ToolError> parse_forget_args(const json& j) {
     ForgetArgs out;
     out.id        = ar.str("id", "");
     out.substring = ar.str("substring", "");
+    out.dry_run   = ar.boolean("dry_run", false);
     if (out.id.empty() && out.substring.empty()) {
         return std::unexpected(ToolError::invalid_args(
             "forget: provide either `id` (8-char hex from a <learned-memory> "
@@ -48,6 +50,30 @@ std::expected<ForgetArgs, ToolError> parse_forget_args(const json& j) {
 }
 
 ExecResult run_forget(const ForgetArgs& a) {
+    if (a.dry_run && a.id.empty()) {
+        // Dry-run mode is only meaningful for substring matches — the
+        // id path is point-removal of one record, no preview needed.
+        auto matches = memory::preview_forget_by_substring(a.substring);
+        if (matches.empty()) {
+            return ToolOutput{
+                std::format("dry_run: no records match substring=\"{}\".", a.substring),
+                std::nullopt};
+        }
+        std::string msg = std::format(
+            "dry_run: {} record(s) would be forgotten (substring=\"{}\"). "
+            "Re-run without dry_run to commit:\n", matches.size(), a.substring);
+        for (const auto& r : matches) {
+            msg += "  - [";
+            msg += r.id;
+            msg += "] (";
+            msg += memory::to_string(r.scope);
+            msg += ") ";
+            msg += r.text;
+            msg += '\n';
+        }
+        return ToolOutput{std::move(msg), std::nullopt};
+    }
+
     std::size_t removed = 0;
     std::string by;
     if (!a.id.empty()) {
@@ -81,6 +107,9 @@ ToolDef tool_forget() {
         "  - `substring` — text contained in the fact. Removes every "
         "record whose stored text contains this substring "
         "(case-sensitive). Use a long enough substring to be specific.\n"
+        "  - `dry_run=true` (with `substring`) — preview the matches "
+        "without removing anything. Returns the list of records that "
+        "would be deleted. Safer when the substring might be too broad.\n"
         "Scans both user and project scopes; if the same fact exists in "
         "both, both are removed. Returns the count removed.";
     t.input_schema = json{
@@ -92,6 +121,10 @@ ToolDef tool_forget() {
             {"substring", {{"type","string"},
                 {"description","Substring of the stored text. "
                                "Case-sensitive. Refused if empty."}}},
+            {"dry_run",   {{"type","boolean"},
+                {"description","Preview matches without removing. Only "
+                               "meaningful with `substring`; ignored when "
+                               "`id` is provided."}}},
         }},
     };
     t.effects = kSpec.effects;

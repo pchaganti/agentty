@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -159,6 +160,21 @@ std::mutex& store_mu() {
         r.scope = *sc;
         r.text = j.value("text", std::string{});
         if (r.id.empty() || r.text.empty()) return std::nullopt;
+        // Optional fields — absent in legacy records, defaulted on read.
+        // Defensive parses: a hand-edited file with the wrong type for
+        // a field falls back to the default rather than dropping the
+        // whole record.
+        if (j.contains("pinned") && j["pinned"].is_boolean())
+            r.pinned = j["pinned"].get<bool>();
+        if (j.contains("hits") && j["hits"].is_number_integer())
+            r.hits = j["hits"].get<std::int32_t>();
+        if (j.contains("tags") && j["tags"].is_array()) {
+            for (const auto& t : j["tags"]) {
+                if (!t.is_string()) continue;
+                auto s2 = t.get<std::string>();
+                if (!s2.empty()) r.tags.push_back(std::move(s2));
+            }
+        }
         return r;
     } catch (...) {
         return std::nullopt;
@@ -171,8 +187,97 @@ std::mutex& store_mu() {
     j["ts"]    = r.ts;
     j["scope"] = to_string(r.scope);
     j["text"]  = r.text;
+    // Only emit optional fields when set — keeps the line short for the
+    // common case (no tags, not pinned, never deduped) and the on-disk
+    // format byte-identical to the legacy shape.
+    if (r.pinned)        j["pinned"] = true;
+    if (r.hits > 0)      j["hits"]   = r.hits;
+    if (!r.tags.empty()) j["tags"]   = r.tags;
     // dump() with no indent: one record per line by construction.
     return j.dump();
+}
+
+// Lower-case ASCII + collapse internal whitespace runs to single space
+// + strip ends. Used by the dedup hash so "Build moha with cmake "
+// matches "build moha with cmake". Does NOT touch UTF-8 multi-byte
+// runs — the model is unlikely to vary case on those between calls and
+// folding them properly would pull in ICU.
+[[nodiscard]] std::string normalise_for_dedup(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    bool in_ws = true;   // skip leading whitespace
+    for (unsigned char c : s) {
+        if (std::isspace(c)) {
+            if (!in_ws) { out.push_back(' '); in_ws = true; }
+            continue;
+        }
+        in_ws = false;
+        if (c >= 'A' && c <= 'Z') c = static_cast<unsigned char>(c + 32);
+        out.push_back(static_cast<char>(c));
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return out;
+}
+
+// Cheap similarity: prefix-bounded Jaro for short strings. Returns a
+// score in [0, 1]; we treat ≥ 0.92 as "same fact, different wording".
+// We don't pull in Jaro-Winkler because the prefix bias would make
+// "build with cmake" and "build with cargo" score >0.95 — they share a
+// common prefix but mean different things. Plain Jaro is enough
+// resolution for the typical model-restatement case.
+[[nodiscard]] double jaro_similarity(std::string_view a, std::string_view b) {
+    if (a.empty() && b.empty()) return 1.0;
+    if (a.empty() || b.empty()) return 0.0;
+    const std::size_t la = a.size();
+    const std::size_t lb = b.size();
+    const std::size_t match_window = la > lb ? la / 2 : lb / 2;
+    std::vector<char> a_matched(la, 0);
+    std::vector<char> b_matched(lb, 0);
+    std::size_t matches = 0;
+    for (std::size_t i = 0; i < la; ++i) {
+        const std::size_t lo = i > match_window ? i - match_window : 0;
+        const std::size_t hi = std::min(i + match_window + 1, lb);
+        for (std::size_t j = lo; j < hi; ++j) {
+            if (b_matched[j]) continue;
+            if (a[i] != b[j])  continue;
+            a_matched[i] = 1;
+            b_matched[j] = 1;
+            ++matches;
+            break;
+        }
+    }
+    if (matches == 0) return 0.0;
+    // Transpositions: count pairs that match but in different order.
+    std::size_t k = 0, t = 0;
+    for (std::size_t i = 0; i < la; ++i) {
+        if (!a_matched[i]) continue;
+        while (!b_matched[k]) ++k;
+        if (a[i] != b[k]) ++t;
+        ++k;
+    }
+    const double m = static_cast<double>(matches);
+    return (m / la + m / lb + (m - t / 2.0) / m) / 3.0;
+}
+
+// Tag normalisation: lower-case ASCII, drop empties, dedup, sort.
+[[nodiscard]] std::vector<std::string> normalise_tags(
+        const std::vector<std::string>& in) {
+    std::vector<std::string> out;
+    out.reserve(in.size());
+    for (auto t : in) {
+        // lowercase ASCII in place
+        for (auto& c : t)
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+        // trim
+        while (!t.empty() && std::isspace(static_cast<unsigned char>(t.front())))
+            t.erase(t.begin());
+        while (!t.empty() && std::isspace(static_cast<unsigned char>(t.back())))
+            t.pop_back();
+        if (!t.empty()) out.push_back(std::move(t));
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
 }
 
 [[nodiscard]] std::vector<Record> read_records(const fs::path& p) {
@@ -320,7 +425,7 @@ fs::path path_for(Scope s) {
     return root / ".agentty" / "memory.jsonl";
 }
 
-AppendResult append(Scope s, std::string_view text) {
+AppendResult append(Scope s, std::string_view text, AppendOptions opts) {
     AppendResult res;
     std::string body = trim(text);
     if (body.empty()) {
@@ -342,11 +447,7 @@ AppendResult append(Scope s, std::string_view text) {
         body.resize(cut);
     }
 
-    Record r;
-    r.id    = make_id();
-    r.ts    = now_unix();
-    r.scope = s;
-    r.text  = std::move(body);
+    auto tags_norm = normalise_tags(opts.tags);
 
     auto p = path_for(s);
     Scope actual_scope = s;
@@ -359,7 +460,6 @@ AppendResult append(Scope s, std::string_view text) {
         if (!fallback.empty()) {
             p = std::move(fallback);
             actual_scope = Scope::User;
-            r.scope = Scope::User;
             std::string add = "project scope unavailable (workspace root '"
                             + util::workspace_root().string()
                             + "' is not writable); stored under user scope instead";
@@ -382,36 +482,158 @@ AppendResult append(Scope s, std::string_view text) {
     }
 
     std::lock_guard lk(store_mu());
-
-    // Cap enforcement: load + tail-cap + append + cap-by-bytes, then
-    // either append-line (fast path, no rollover) or full rewrite.
     auto existing = read_records(p);
+
+    // ── Dedup pass ───────────────────────────────────────────────────
+    // Walk existing records looking for one whose normalised text is
+    // a near-match for the incoming body. On hit: refresh ts, bump
+    // hits, merge pin ("once pinned, stays pinned"), union tags.
+    // No new id is allocated; the existing record's id is returned
+    // and `deduped` flags the dedup for the caller.
+    if (!opts.no_dedup) {
+        const auto needle = normalise_for_dedup(body);
+        for (auto& rec : existing) {
+            if (rec.scope != actual_scope) continue;
+            const auto hay = normalise_for_dedup(rec.text);
+            if (hay == needle
+                || jaro_similarity(hay, needle) >= 0.92) {
+                rec.ts = now_unix();
+                if (rec.hits < std::numeric_limits<std::int32_t>::max())
+                    ++rec.hits;
+                if (opts.pinned) rec.pinned = true;
+                if (!tags_norm.empty()) {
+                    auto merged = rec.tags;
+                    merged.insert(merged.end(),
+                                  tags_norm.begin(), tags_norm.end());
+                    rec.tags = normalise_tags(merged);
+                }
+                // Supersede during dedup: rare but possible (a model
+                // both restates and tries to drop a prior version).
+                // Apply the supersede in the same rewrite below.
+                std::string sup = trim(opts.supersedes_id);
+                std::size_t sup_dropped = 0;
+                if (!sup.empty()) {
+                    auto before = existing.size();
+                    existing.erase(
+                        std::remove_if(existing.begin(), existing.end(),
+                            [&](const Record& r){ return r.id == sup; }),
+                        existing.end());
+                    sup_dropped = before - existing.size();
+                }
+                std::string err = write_records(p, existing);
+                if (!err.empty()) {
+                    res.error = "remember: " + err;
+                    return res;
+                }
+                res.id = rec.id;
+                res.deduped = true;
+                std::string add = "deduped: refreshed existing record (hits="
+                                + std::to_string(rec.hits) + ")";
+                if (!sup.empty()) {
+                    add += sup_dropped
+                        ? "; superseded " + sup
+                        : "; supersede id " + sup + " not found";
+                }
+                if (res.note.empty()) res.note = std::move(add);
+                else { res.note += "; "; res.note += add; }
+                bump_cache(actual_scope);
+                return res;
+            }
+        }
+    }
+
+    // ── Supersede pass ───────────────────────────────────────────────
+    // Drop the named predecessor (in either scope) inside the same
+    // rewrite that adds the new record. A missing id is non-fatal —
+    // we just note it. This is the atomic edit-an-existing-fact path.
+    std::string sup = trim(opts.supersedes_id);
+    bool sup_hit = false;
+    if (!sup.empty()) {
+        auto before = existing.size();
+        existing.erase(
+            std::remove_if(existing.begin(), existing.end(),
+                [&](const Record& r){ return r.id == sup; }),
+            existing.end());
+        sup_hit = (existing.size() != before);
+        if (!sup_hit) {
+            // The id might live in the OTHER scope. Drop it there too
+            // — keeps the supersede semantics consistent regardless of
+            // which scope the model thought it was editing.
+            Scope other = (actual_scope == Scope::User) ? Scope::Project : Scope::User;
+            auto op = path_for(other);
+            if (!op.empty()) {
+                auto other_recs = read_records(op);
+                auto ob = other_recs.size();
+                other_recs.erase(
+                    std::remove_if(other_recs.begin(), other_recs.end(),
+                        [&](const Record& r){ return r.id == sup; }),
+                    other_recs.end());
+                if (other_recs.size() != ob) {
+                    (void)write_records(op, other_recs);
+                    bump_cache(other);
+                    sup_hit = true;
+                }
+            }
+        }
+        std::string add = sup_hit
+            ? "superseded " + sup
+            : "supersede id " + sup + " not found (new record still written)";
+        if (res.note.empty()) res.note = std::move(add);
+        else { res.note += "; "; res.note += add; }
+    }
+
+    // ── Build the new record ─────────────────────────────────────────
+    Record r;
+    r.id     = make_id();
+    r.ts     = now_unix();
+    r.scope  = actual_scope;
+    r.text   = std::move(body);
+    r.pinned = opts.pinned;
+    r.tags   = std::move(tags_norm);
+    r.hits   = 0;
+
+    // ── Cap rollover ─────────────────────────────────────────────────
+    // Pinned records are cap-exempt: walk oldest-first and drop the
+    // first UNPINNED record until we fit. Falling back to dropping
+    // pinned only if everything in the file is pinned and we still
+    // overflow — in that degenerate case the user has more pinned
+    // facts than the cap can hold, and the oldest pinned has to go.
+    auto drop_oldest_unpinned = [](std::vector<Record>& v) -> bool {
+        for (auto it = v.begin(); it != v.end(); ++it) {
+            if (!it->pinned) { v.erase(it); return true; }
+        }
+        return false;
+    };
     bool rollover = false;
-    // Record-count cap.
-    if (existing.size() + 1 > kMaxRecordsPerScope) {
-        std::size_t drop = existing.size() + 1 - kMaxRecordsPerScope;
-        existing.erase(existing.begin(),
-                       existing.begin() + static_cast<std::ptrdiff_t>(drop));
-        res.rolled += drop;
+    while (existing.size() + 1 > kMaxRecordsPerScope) {
+        bool dropped = drop_oldest_unpinned(existing);
+        if (!dropped) {
+            // All-pinned overflow — sacrifice the oldest pinned.
+            existing.erase(existing.begin());
+        }
+        ++res.rolled;
         rollover = true;
     }
     existing.push_back(r);
-    // Byte cap — drop oldest until we fit. Each record's serialised
-    // form is bounded by kMaxTextBytes + ~64 bytes of envelope, so
-    // worst-case we drop a handful.
     auto total_bytes = [](const std::vector<Record>& rs) {
         std::size_t b = 0;
         for (const auto& x : rs) b += serialise_record(x).size() + 1;
         return b;
     };
     while (existing.size() > 1 && total_bytes(existing) > kMaxFileBytes) {
-        existing.erase(existing.begin());
+        if (!drop_oldest_unpinned(existing)) {
+            // All-pinned overflow on byte cap — drop the oldest pinned
+            // that isn't the record we just pushed.
+            if (existing.size() > 1) existing.erase(existing.begin());
+            else break;
+        }
         ++res.rolled;
         rollover = true;
     }
 
     std::string err;
-    if (rollover) {
+    if (rollover || sup_hit) {
+        // Any rewrite-shaped mutation goes through the atomic path.
         err = write_records(p, existing);
     } else {
         err = append_line(p, serialise_record(r));
@@ -483,12 +705,65 @@ std::size_t forget_by_substring(std::string_view needle) {
 
 std::string render_for_prompt(const Record& r) {
     std::string out;
-    out.reserve(r.text.size() + 16);
+    out.reserve(r.text.size() + 32);
     out += '[';
     out += r.id;
     out += "] ";
+    if (r.pinned) out += "\xe2\x98\x85 ";   // ★ — visual cue for pinned
     out += r.text;
+    if (!r.tags.empty()) {
+        out += "  {";
+        for (std::size_t i = 0; i < r.tags.size(); ++i) {
+            if (i) out += ", ";
+            out += r.tags[i];
+        }
+        out += '}';
+    }
     return out;
+}
+
+std::optional<std::pair<Record, Scope>> find_by_id(std::string_view id) {
+    std::string want{id};
+    if (trim(want).empty()) return std::nullopt;
+    std::lock_guard lk(store_mu());
+    for (auto s : {Scope::User, Scope::Project}) {
+        const auto p = path_for(s);
+        if (p.empty()) continue;
+        auto recs = read_records(p);
+        for (auto& r : recs)
+            if (r.id == want) return std::make_pair(std::move(r), s);
+    }
+    return std::nullopt;
+}
+
+std::vector<Record> preview_forget_by_substring(std::string_view needle) {
+    std::vector<Record> out;
+    std::string want = trim(needle);
+    if (want.empty()) return out;
+    std::lock_guard lk(store_mu());
+    for (auto s : {Scope::User, Scope::Project}) {
+        const auto p = path_for(s);
+        if (p.empty()) continue;
+        for (auto& r : read_records(p))
+            if (r.text.find(want) != std::string::npos)
+                out.push_back(std::move(r));
+    }
+    return out;
+}
+
+std::optional<std::size_t> wipe(Scope s) {
+    const auto p = path_for(s);
+    if (p.empty()) return std::nullopt;
+    std::lock_guard lk(store_mu());
+    auto recs = read_records(p);
+    std::size_t n = recs.size();
+    // Truncate (write empty) rather than fs::remove — keeps the path
+    // valid for subsequent append calls without re-running
+    // create_directories. write_records on an empty vector writes a
+    // zero-byte file, which read_records / load_all both handle.
+    (void)write_records(p, {});
+    bump_cache(s);
+    return n;
 }
 
 } // namespace agentty::tools::memory

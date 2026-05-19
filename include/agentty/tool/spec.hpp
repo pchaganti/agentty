@@ -151,6 +151,7 @@ enum class Kind : std::uint8_t {
     GitCommit,
     Remember,
     Forget,
+    Wipe,
 };
 
 inline constexpr std::array kCatalog = {
@@ -178,6 +179,7 @@ inline constexpr std::array kCatalog = {
     // confirmation line, never large.
     ToolSpec{"remember",        Kind::Remember,       {Effect::WriteFs},                    false,   detail::sec{5},    2000,   ToolSpec::TruncStrategy::Head},
     ToolSpec{"forget",          Kind::Forget,         {Effect::WriteFs},                    false,   detail::sec{5},    2000,   ToolSpec::TruncStrategy::Head},
+    ToolSpec{"wipe_memory",     Kind::Wipe,           {Effect::WriteFs},                    false,   detail::sec{5},    2000,   ToolSpec::TruncStrategy::Head},
 };
 
 // Wire-string → Kind. `std::nullopt` for names not in the catalog so the
@@ -257,6 +259,7 @@ consteval bool kinds_bijective() {
         Kind::Diagnostics, Kind::GitStatus, Kind::GitDiff,
         Kind::GitLog, Kind::GitCommit,
         Kind::Remember, Kind::Forget,
+        Kind::Wipe,
     };
     if (std::size(kAll) != kCatalog.size()) return false;
     for (auto k : kAll) {

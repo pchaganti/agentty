@@ -389,6 +389,7 @@ set(AGENTTY_TOOL_SOURCES
     src/tool/tools/git.cpp
     src/tool/tools/remember.cpp
     src/tool/tools/forget.cpp
+    src/tool/tools/wipe.cpp
     src/tool/memory_store.cpp
 )
 

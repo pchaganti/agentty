@@ -110,6 +110,7 @@ std::vector<ToolDef> build_registry() {
     // asked"; ordering here is cosmetic for the wire payload.
     r.push_back(tool_remember());
     r.push_back(tool_forget());
+    r.push_back(tool_wipe_memory());
     return r;
 }
 
