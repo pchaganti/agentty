@@ -156,11 +156,11 @@ maya::Composer::Config composer_config(const Model& m) {
     cfg.profile         = {.label = std::string{profile_label(m.d.profile)},
                            .color = profile_color(m.d.profile)};
     cfg.expanded        = m.ui.composer.expanded;
-    // Pin body floor at 2 rows while a turn is in flight so the composer
-    // stops shape-shifting between empty→one char (and back) — every
-    // height delta forces a repaint of every thread row above. When
-    // idle there's no streaming repaint cost, so collapse to 1 row.
-    cfg.min_body_rows   = (cfg.state == maya::Composer::State::Idle) ? 1 : 2;
+    // Body floor is always 1 row — the composer collapses to a single
+    // line when empty, regardless of stream state. Mid-stream repaint
+    // cost on the empty↔first-char transition is accepted in exchange
+    // for a tighter idle/streaming silhouette.
+    cfg.min_body_rows   = 1;
     return cfg;
 }
 

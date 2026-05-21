@@ -343,6 +343,109 @@ std::optional<float> assistant_elapsed(const Message& msg, const Model& m) {
     return std::nullopt;
 }
 
+// Append one Assistant Message's body slots (markdown + tools panel +
+// inline permission) to `cfg.body`. Pulled out of turn_config so a run
+// of consecutive Assistant Messages can be rendered as ONE Turn (see
+// turn_config_for_assistant_run), matching agent_session's discipline
+// where every internal seam contributes a body slot to one Turn.
+void append_assistant_body_slots(maya::Turn::Config& cfg,
+                                 const Message& msg,
+                                 std::span<const ToolUse> tool_calls,
+                                 const Model& m,
+                                 bool synthetic,
+                                 const SpeakerStyle& style)
+{
+    const std::string& model_id_ref = m.d.model_id.value;
+
+    const bool has_body = !msg.text.empty() || !msg.streaming_text.empty();
+    if (has_body) {
+        cfg.body.emplace_back(cached_markdown_for(msg, m));
+    }
+    if (tool_calls.empty()) return;
+
+    bool all_terminal = true;
+    bool any_pending_perm = false;
+    for (const auto& tc : tool_calls) {
+        if (!tc.is_terminal()) { all_terminal = false; break; }
+        if (m.d.pending_permission
+            && m.d.pending_permission->id == tc.id) {
+            any_pending_perm = true;
+            break;
+        }
+    }
+    const bool can_freeze_panel =
+        !synthetic && all_terminal && !any_pending_perm;
+
+    std::uint64_t panel_key = 0;
+    if (can_freeze_panel) {
+        panel_key = 1469598103934665603ULL;
+        auto mix = [&](std::uint64_t v) {
+            panel_key = (panel_key ^ v) * 1099511628211ULL;
+        };
+        mix(tool_calls.size());
+        for (const auto& tc : tool_calls)
+            mix(tc.compute_render_key());
+        mix(static_cast<std::uint64_t>(style.color.r()));
+        mix(static_cast<std::uint64_t>(style.color.g()));
+        mix(static_cast<std::uint64_t>(style.color.b()));
+    }
+
+    if (can_freeze_panel) {
+        auto& slot = m.ui.view_cache.turn_config(
+            m.d.current.id, msg.id);
+        if (!slot.agent_timeline
+            || slot.agent_timeline_key != panel_key
+            || slot.agent_timeline_model_id != model_id_ref) {
+            auto built = maya::AgentTimeline{
+                agent_timeline_config(tool_calls, /*spinner_frame=*/0,
+                                      style.color)}.build();
+            slot.agent_timeline =
+                std::make_shared<maya::Element>(std::move(built));
+            slot.agent_timeline_key      = panel_key;
+            slot.agent_timeline_model_id = model_id_ref;
+        }
+        cfg.body.emplace_back(*slot.agent_timeline);
+    } else {
+        std::uint64_t live_key = 1469598103934665603ULL;
+        auto mixlive = [&](std::uint64_t v) {
+            live_key = (live_key ^ v) * 1099511628211ULL;
+        };
+        mixlive(tool_calls.size());
+        for (const auto& tc : tool_calls)
+            mixlive(tc.compute_render_key());
+        mixlive(static_cast<std::uint64_t>(style.color.r()));
+        mixlive(static_cast<std::uint64_t>(style.color.g()));
+        mixlive(static_cast<std::uint64_t>(style.color.b()));
+        for (char c : model_id_ref)
+            mixlive(static_cast<std::uint64_t>(
+                static_cast<unsigned char>(c)));
+
+        auto& slot = m.ui.view_cache.turn_config(
+            m.d.current.id, msg.id);
+        if (slot.live_agent_timeline_key != live_key) {
+            for (auto& el : slot.live_agent_timeline) el.reset();
+            slot.live_agent_timeline_key = live_key;
+        }
+        const int frame = m.s.spinner.frame_index();
+        const std::size_t bucket = static_cast<std::size_t>(
+            ((frame % 10) + 10) % 10);
+        if (!slot.live_agent_timeline[bucket]) {
+            auto built = maya::AgentTimeline{agent_timeline_config(
+                tool_calls, frame, style.color)}.build();
+            slot.live_agent_timeline[bucket] =
+                std::make_shared<maya::Element>(std::move(built));
+        }
+        cfg.body.emplace_back(*slot.live_agent_timeline[bucket]);
+    }
+    // In-flight permission card under the timeline.
+    for (const auto& tc : tool_calls) {
+        if (m.d.pending_permission && m.d.pending_permission->id == tc.id) {
+            cfg.body.emplace_back(inline_permission_config(
+                *m.d.pending_permission, tc));
+        }
+    }
+}
+
 } // namespace
 
 maya::Turn::Config turn_config(const Message& msg, std::size_t msg_idx,
@@ -357,7 +460,6 @@ maya::Turn::Config turn_config(const Message& msg, std::size_t msg_idx,
     // memoization here. `synthetic` is still consulted further down to
     // skip the agent_timeline panel-freeze cache for queued previews.
     (void)msg_idx;
-    const std::string& model_id_ref = m.d.model_id.value;
 
     // Tool-batch merge plumbing: when the caller passes an override
     // span, treat it as the effective tool_calls for this turn. Saves
@@ -439,150 +541,73 @@ maya::Turn::Config turn_config(const Message& msg, std::size_t msg_idx,
         }
         cfg.body.emplace_back(maya::Turn::PlainText{.content = std::move(display), .color = fg});
     } else if (msg.role == Role::Assistant) {
-        const bool has_body = !msg.text.empty() || !msg.streaming_text.empty();
-        if (has_body) {
-            // Cross-frame StreamingMarkdown cache requires holding the
-            // widget instance; feed its built Element via the typed
-            // Element variant of BodySlot.
-            cfg.body.emplace_back(cached_markdown_for(msg, m));
-        }
-        if (!tool_calls.empty()) {
-            // agent_session-mirroring fast path: once every tool in the
-            // batch is terminal AND no pending permission still targets
-            // one of them, the panel's bytes are immutable for the rest
-            // of this message's life. Snapshot it to an Element on the
-            // FIRST such frame and serve the snapshot verbatim on every
-            // subsequent frame — even while streaming_text continues to
-            // grow below the panel.
-            //
-            // This matters because Anthropic's common shape is
-            // tool_use_block_stop → content_block_delta (more text)
-            // → message_stop. During the post-tool text window
-            // `streaming_text` is non-empty so the full-turn cache stays
-            // cold and `agent_timeline_config` rebuilds every frame:
-            // the running-state status flips to terminal status, the
-            // footer text mutates, the spinner frame index changes (the
-            // border can flip from rail-cyan to muted). Each frame's
-            // canvas mapping at a given row Y captures a slightly
-            // different snapshot of "the panel right now", and any rows
-            // that scroll off into native scrollback during this window
-            // commit different bytes than the panel will eventually
-            // render — visible as fragments / overlap at the seam.
-            //
-            // Freezing the panel at first-terminal-frame stops the
-            // drift cold: the same Element is reused, so the same
-            // bytes get painted, so what commits to scrollback matches
-            // what stays in viewport.
-            bool all_terminal = true;
-            bool any_pending_perm = false;
-            for (const auto& tc : tool_calls) {
-                if (!tc.is_terminal()) { all_terminal = false; break; }
-                if (m.d.pending_permission
-                    && m.d.pending_permission->id == tc.id) {
-                    any_pending_perm = true;
-                    break;
-                }
-            }
-            const bool can_freeze_panel =
-                !synthetic && all_terminal && !any_pending_perm;
-
-            // Key the freeze on the SAME hash that the message's
-            // render_key derives from its tool_calls. If a post-terminal
-            // mutation lands (expand toggle, late re-execute output),
-            // the key bumps and we re-snapshot.
-            std::uint64_t panel_key = 0;
-            if (can_freeze_panel) {
-                panel_key = 1469598103934665603ULL;
-                auto mix = [&](std::uint64_t v) {
-                    panel_key = (panel_key ^ v) * 1099511628211ULL;
-                };
-                mix(tool_calls.size());
-                for (const auto& tc : tool_calls)
-                    mix(tc.compute_render_key());
-                // style.color is baked into the panel border via
-                // agent_timeline_config's rail_color argument; mix it
-                // so a model-id switch (rail color follows model
-                // family) invalidates the snapshot.
-                mix(static_cast<std::uint64_t>(style.color.r()));
-                mix(static_cast<std::uint64_t>(style.color.g()));
-                mix(static_cast<std::uint64_t>(style.color.b()));
-            }
-
-            // Always emplace a pre-built Element into the body slot,
-            // never an AgentTimeline::Config. agent_session pushes
-            // `actions_panel(m, false)` which is `AgentTimeline{cfg}
-            // .build()` — i.e. a built Element value. The Config
-            // variant of BodySlot uses a different code path through
-            // Turn::render_slot and was observably leaving the Turn
-            // header invisible when this was the dominant body slot.
-            if (can_freeze_panel) {
-                auto& slot = m.ui.view_cache.turn_config(
-                    m.d.current.id, msg.id);
-                if (!slot.agent_timeline
-                    || slot.agent_timeline_key != panel_key
-                    || slot.agent_timeline_model_id != model_id_ref) {
-                    auto built = maya::AgentTimeline{
-                        agent_timeline_config(tool_calls, /*spinner_frame=*/0,
-                                              style.color)}.build();
-                    slot.agent_timeline =
-                        std::make_shared<maya::Element>(std::move(built));
-                    slot.agent_timeline_key      = panel_key;
-                    slot.agent_timeline_model_id = model_id_ref;
-                }
-                cfg.body.emplace_back(*slot.agent_timeline);
-            } else {
-                // Live (active) panel cache. Compute the SAME content
-                // key shape as the freeze path, then bucket the spinner
-                // frame so cache hits are possible mid-stream when only
-                // the spinner advances.
-                std::uint64_t live_key = 1469598103934665603ULL;
-                auto mixlive = [&](std::uint64_t v) {
-                    live_key = (live_key ^ v) * 1099511628211ULL;
-                };
-                mixlive(tool_calls.size());
-                for (const auto& tc : tool_calls)
-                    mixlive(tc.compute_render_key());
-                mixlive(static_cast<std::uint64_t>(style.color.r()));
-                mixlive(static_cast<std::uint64_t>(style.color.g()));
-                mixlive(static_cast<std::uint64_t>(style.color.b()));
-                // Bake model_id into the key too — the freeze path keeps
-                // it as a separate string compare; here we can fold it
-                // into the FNV mix cheaply.
-                for (char c : model_id_ref)
-                    mixlive(static_cast<std::uint64_t>(
-                        static_cast<unsigned char>(c)));
-
-                auto& slot = m.ui.view_cache.turn_config(
-                    m.d.current.id, msg.id);
-                if (slot.live_agent_timeline_key != live_key) {
-                    // Content changed — every spinner phase's cached
-                    // Element is stale. Drop the ring.
-                    for (auto& el : slot.live_agent_timeline) el.reset();
-                    slot.live_agent_timeline_key = live_key;
-                }
-                const int frame = m.s.spinner.frame_index();
-                const std::size_t bucket = static_cast<std::size_t>(
-                    ((frame % 10) + 10) % 10);
-                if (!slot.live_agent_timeline[bucket]) {
-                    auto built = maya::AgentTimeline{agent_timeline_config(
-                        tool_calls, frame, style.color)}.build();
-                    slot.live_agent_timeline[bucket] =
-                        std::make_shared<maya::Element>(std::move(built));
-                }
-                cfg.body.emplace_back(*slot.live_agent_timeline[bucket]);
-            }
-            // In-flight permission card under the timeline.
-            for (const auto& tc : tool_calls) {
-                if (m.d.pending_permission && m.d.pending_permission->id == tc.id) {
-                    cfg.body.emplace_back(inline_permission_config(
-                        *m.d.pending_permission, tc));
-                }
-            }
-        }
+        append_assistant_body_slots(cfg, msg, tool_calls, m, synthetic, style);
         if (msg.error) cfg.error = *msg.error;
     }
 
     return cfg;
+}
+
+maya::Turn::Config turn_config_for_assistant_run(
+    std::size_t run_first, std::size_t run_end,
+    int turn_num, const Model& m, bool synthetic)
+{
+    const auto& msgs = m.d.current.messages;
+    // Pre-conditions defended at the only two call sites (build_live_tail
+    // / freeze_range), but guard anyway so this function can be reused
+    // without subtle row-shape corruption if the range ever turns out empty.
+    if (run_first >= run_end || run_first >= msgs.size())
+        return {};
+    const std::size_t end = std::min(run_end, msgs.size());
+
+    const Message& head = msgs[run_first];
+    auto style = speaker_style_for(head.role, m);
+
+    maya::Turn::Config cfg;
+    cfg.glyph        = style.glyph;
+    cfg.label        = style.label;
+    cfg.rail_color   = style.color;
+    cfg.continuation = false;   // a run is one logical Turn by construction
+    cfg.meta         = format_turn_meta(head, turn_num,
+                          head.role == Role::Assistant
+                              ? assistant_elapsed(head, m)
+                              : std::nullopt);
+
+    if (head.role != Role::Assistant) {
+        // Defensive: only Assistant runs use the multi-message path.
+        // For a User head this collapses to the single-message build.
+        return turn_config(head, run_first, turn_num, m,
+                           /*continuation=*/false, synthetic);
+    }
+
+    // Walk the run, appending one message's body slots at a time.
+    // The Turn widget gap-spaces consecutive slots, so a
+    // `[text, tools, text, tools]` body renders with breathing room
+    // between each segment automatically.
+    std::string error_accum;
+    for (std::size_t i = run_first; i < end; ++i) {
+        const Message& m_i = msgs[i];
+        if (m_i.role != Role::Assistant) break;   // run boundary
+        std::span<const ToolUse> tool_calls{m_i.tool_calls};
+        append_assistant_body_slots(cfg, m_i, tool_calls, m, synthetic, style);
+        if (m_i.error && error_accum.empty()) error_accum = *m_i.error;
+    }
+    if (!error_accum.empty()) cfg.error = std::move(error_accum);
+
+    return cfg;
+}
+
+std::size_t turn_run_end(const std::vector<Message>& messages,
+                         std::size_t from)
+{
+    if (from >= messages.size()) return from;
+    if (messages[from].role != Role::Assistant) return from + 1;
+    std::size_t end = from + 1;
+    while (end < messages.size()
+           && messages[end].role == Role::Assistant) {
+        ++end;
+    }
+    return end;
 }
 
 } // namespace agentty::ui

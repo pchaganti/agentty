@@ -990,39 +990,15 @@ Step stream_update(Model m, msg::StreamMsg sm) {
                     if (e.text.size() <= room) msg.pending_stream += e.text;
                     else                       msg.pending_stream.append(e.text, 0, room);
                 }
-                // First-byte inline reveal. The Tick pacer is
-                // responsible for the steady fill animation, but its
-                // cadence (33 ms on DEC-2026 terminals, 100 ms on
-                // plain xterm / Apple Terminal / tmux-without-sync)
-                // adds that much latency to the very first paint of
-                // every turn. Reveal a small head slice synchronously
-                // here so time-to-first-paint is bounded by SSE
-                // arrival, not by tick cadence. The pacer takes over
-                // for the rest — this just unblocks the renderer for
-                // the leading edge.
-                //
-                // Gated on streaming_text being empty so we only fire
-                // once per assistant message; subsequent deltas flow
-                // through the pacer unchanged.
-                if (msg.streaming_text.empty() && !msg.pending_stream.empty()) {
-                    constexpr std::size_t kFirstReveal = 256;
-                    std::size_t n = std::min(kFirstReveal, msg.pending_stream.size());
-                    // UTF-8 safety — same rule as the Tick pacer.
-                    // Bound the continuation walk at 3 bytes so a
-                    // malformed buffer can't push us through the
-                    // whole pending_stream.
-                    {
-                        std::size_t walked = 0;
-                        while (n < msg.pending_stream.size()
-                               && walked < 3
-                               && (static_cast<unsigned char>(msg.pending_stream[n]) & 0xC0) == 0x80) {
-                            ++n;
-                            ++walked;
-                        }
-                    }
-                    msg.streaming_text.append(msg.pending_stream, 0, n);
-                    msg.pending_stream.erase(0, n);
-                }
+                // All bytes flow through the Tick pacer in meta.cpp —
+                // no head-reveal special case. The pacer's drip_min
+                // already empties small first-deltas in one tick, so
+                // time-to-first-paint is bounded by the next tick (≤33 ms
+                // on DEC-2026, ≤100 ms elsewhere), not by SSE arrival
+                // racing the pacer cadence. Uniform code path means
+                // every assistant message has identical height-delta
+                // cadence; no risk of byte 256 vs byte 257 landing
+                // through different reveal mechanics.
             }
             return done(std::move(m));
         },

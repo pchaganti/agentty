@@ -571,14 +571,22 @@ Cmd<Msg> kick_pending_tools(Model& m) {
             // request is still open, sub-turn streams over the same
             // SSE), retry counters preserved.
             //
-            // Before pushing the next placeholder, freeze the just-
-            // finished assistant Message (with its tool_calls and
-            // text) into m.ui.frozen. This keeps the live tail
-            // bounded to ONE in-flight assistant Message at any
-            // time — matching agent_session's discipline where the
-            // committed scrollback is everything settled and the
-            // live area is exactly one Turn.
-            detail::freeze_through(m, m.d.current.messages.size());
+            // We push a fresh Assistant placeholder so the wire-layer
+            // tool_use ↔ tool_result pairing stays correct (the
+            // transport synthesises one User-with-tool_results turn
+            // per Assistant Message; collapsing sub-turns into the
+            // same Message would interleave new tool_use blocks
+            // before their tool_results). The VIEW collapses these
+            // sub-turn Messages back into one visual Turn via the
+            // shared `ui::turn_run_end` helper in build_live_tail
+            // (and freeze_range), matching agent_session's
+            // "one agent turn = one Turn" shape.
+            //
+            // No freeze fires here: mid-stream freezing would split
+            // an in-flight assistant run across the frozen / live
+            // boundary, producing two visual Turns where the user
+            // should see one. The single freeze site is in
+            // `finalize_turn` once `phase::Idle` is reached.
             auto ctx = take_active_ctx(std::move(m.s.phase));
             m.s.phase = phase::Streaming{std::move(ctx).value()};
             Message placeholder;

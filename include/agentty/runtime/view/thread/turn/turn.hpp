@@ -36,4 +36,27 @@ namespace agentty::ui {
                                              std::string_view meta_override = {},
                                              std::span<const ToolUse> tool_calls_override = {});
 
+// Build ONE Turn::Config covering a run of consecutive Assistant messages.
+// `run_first` is the index of the head message (Role::Assistant); `run_end`
+// is exclusive — every message in [run_first, run_end) must be Assistant.
+// The body interleaves each message's text (markdown) and tool batch in
+// source order so a `text -> tool -> text -> tool` sequence renders as a
+// single visual Turn with N body slots, matching agent_session's shape.
+//
+// Header (glyph, label, meta) is taken from the head message; meta carries
+// the head's timestamp + (optionally) elapsed since the last user message.
+//
+// `synthetic` flag is forwarded (queue previews skip the panel-freeze cache).
+[[nodiscard]] maya::Turn::Config turn_config_for_assistant_run(
+    std::size_t run_first, std::size_t run_end,
+    int turn_num, const Model& m,
+    bool synthetic = false);
+
+// Decide where the current speaker-run ends. For an Assistant head this
+// walks forward over consecutive Assistant messages; for User / other roles
+// it returns `from + 1`. Used by both the live-tail and frozen builders so
+// they slice the message vector identically.
+[[nodiscard]] std::size_t turn_run_end(const std::vector<Message>& messages,
+                                       std::size_t from);
+
 } // namespace agentty::ui

@@ -60,8 +60,11 @@ maya::Element compaction_divider_row() {
 }
 
 // Sentinel-check: is `mm` an Assistant message whose only content is
-// tool_calls (no prose)? Used by the tool-batch merge in freeze_range.
-bool is_tool_only_assistant(const Message& mm) {
+// tool_calls (no prose)? Retained as documentation of the
+// classification; the actual run-merge policy now lives in
+// `ui::turn_run_end`, called from both `freeze_range` and
+// `build_live_tail`.
+[[maybe_unused]] bool is_tool_only_assistant(const Message& mm) {
     return mm.role == Role::Assistant
         && mm.text.empty()
         && mm.streaming_text.empty()
@@ -69,21 +72,21 @@ bool is_tool_only_assistant(const Message& mm) {
 }
 
 // Freeze messages[from .. to), pushing built Turn Elements (and any
-// leading gap / compaction divider) into m.ui.frozen. Mirrors the
-// tool-batch-merge logic from the legacy view path: a run of
-// consecutive tool-only Assistant continuations collapses into ONE
-// merged Turn whose tool_calls are the union of the run's.
+// leading gap / compaction divider) into m.ui.frozen. One Turn per
+// speaker-run: a User message is its own Turn; a run of consecutive
+// Assistant messages collapses into ONE Turn whose body interleaves
+// each sub-turn's text + tool batch (see
+// `ui::turn_config_for_assistant_run`). The same `ui::turn_run_end`
+// helper drives the boundary in `build_live_tail` so the frozen and
+// live row shapes are identical for the same input.
 //
-// Advances m.ui.frozen_turn on each fresh-speaker assistant turn so
-// the running turn number matches what the live tail will compute
-// next.
+// Advances `m.ui.frozen_turn` once per Assistant run (one logical
+// agent turn equals one display number) so the running turn count
+// the live tail will compute next stays in sync.
 void freeze_range(Model& m, std::size_t from, std::size_t to) {
     const std::size_t total = m.d.current.messages.size();
     if (from >= to || to > total) return;
 
-    // Build a set of message indices that should be PRECEDED by a
-    // compaction divider. up_to_index is "covers messages[0..N)" —
-    // the divider sits immediately before messages[N].
     auto needs_compaction_divider = [&](std::size_t i) {
         for (const auto& rec : m.d.current.compactions) {
             if (rec.up_to_index == i && rec.up_to_index > 0
@@ -92,126 +95,62 @@ void freeze_range(Model& m, std::size_t from, std::size_t to) {
         return false;
     };
 
-    for (std::size_t i = from; i < to; ++i) {
+    std::size_t i = from;
+    while (i < to) {
         if (needs_compaction_divider(i)) {
             m.ui.frozen.push_back(compaction_divider_row());
         }
 
-        const auto& msg = m.d.current.messages[i];
+        // Run boundary — shared with build_live_tail.
+        const std::size_t run_end_global =
+            ui::turn_run_end(m.d.current.messages, i);
+        const std::size_t run_end = std::min(run_end_global, to);
 
-        const bool continuation =
-            (msg.role == Role::Assistant) &&
-            (i > 0) &&
-            (m.d.current.messages[i - 1].role == Role::Assistant);
-
-        // Tool-batch merge: collapse a run of tool-only Assistant
-        // continuations into the head message's panel. See
-        // conversation.cpp's live-tail path for the full rationale —
-        // we replicate it here so the frozen visual matches what the
-        // user saw during the live phase.
-        //
-        // Head eligibility is any non-empty Assistant message (text
-        // OR tool_calls). Without this, a `text reply → tool call`
-        // two-message turn freezes as two Turns where the second
-        // gets continuation=true and loses its header banner.
-        const bool head_mergeable =
-            msg.role == Role::Assistant
-            && (!msg.text.empty() || !msg.streaming_text.empty()
-                || !msg.tool_calls.empty());
-        std::size_t run_end = i + 1;
-        if (head_mergeable) {
-            while (run_end < to
-                   && m.d.current.messages[run_end].role == Role::Assistant
-                   && is_tool_only_assistant(m.d.current.messages[run_end])) {
-                ++run_end;
-            }
-        }
-
-        // Leading gap: one blank row before every fresh-speaker turn
-        // (skip on the very first frozen row to avoid a top-of-thread
-        // gap, and skip before continuations so a same-speaker run
-        // visually flows).
+        // Leading gap: one blank row before every turn except the
+        // very first frozen row (avoid a top-of-thread gap).
         const bool first_overall = m.ui.frozen.empty();
-        if (!first_overall && !continuation) {
+        if (!first_overall) {
             m.ui.frozen.push_back(gap_row());
-        } else if (!first_overall && continuation) {
-            // Continuation: no ─ rule, but a one-row breather so the
-            // previous Turn's bottom chrome (ACTIONS panel border,
-            // settled markdown) doesn't fuse into this Turn's first
-            // body line. Matches conversation.cpp's live-tail policy
-            // so the visual stays stable across the live→frozen
-            // transition.
-            m.ui.frozen.push_back(maya::dsl::blank().build());
         }
 
-        if (run_end > i + 1) {
-            // Merged run: head message + appended tool_calls from the
-            // continuation tail. We pass `msg` through unchanged and
-            // hand turn_config a borrowed span of the union via the
-            // tool_calls_override path — no Message-sized deep copy,
-            // no per-frame ToolUse churn beyond the one allocation
-            // for the merged vector. The originals live in
-            // `m.d.current.messages[*]` and the span borrows from
-            // them; the vector outlives the turn_config / Turn::build
-            // call.
-            std::vector<ToolUse> merged_tools;
-            std::size_t reserve_n = msg.tool_calls.size();
-            for (std::size_t j = i + 1; j < run_end; ++j)
-                reserve_n += m.d.current.messages[j].tool_calls.size();
-            merged_tools.reserve(reserve_n);
-            merged_tools.insert(merged_tools.end(),
-                                msg.tool_calls.begin(), msg.tool_calls.end());
-            for (std::size_t j = i + 1; j < run_end; ++j) {
-                const auto& src = m.d.current.messages[j].tool_calls;
-                merged_tools.insert(merged_tools.end(),
-                                    src.begin(), src.end());
-            }
+        const Message& head = m.d.current.messages[i];
+
+        if (head.role == Role::Assistant) {
             int turn_num = m.ui.frozen_turn + 1;
-            auto cfg = ui::turn_config(msg, i, turn_num, m,
-                                       continuation, /*synthetic=*/true,
-                                       /*meta_override=*/{},
-                                       /*tool_calls_override=*/merged_tools);
-            // Hash key: settled merged turn. The merge inputs (head
-            // msg.id + every tail msg.id + tail count) all fold in so
-            // a different run produces a different key. Once frozen,
-            // the message bytes never change — the key is stable for
-            // the lifetime of this entry, and maya's hash-keyed
+            auto cfg = ui::turn_config_for_assistant_run(
+                i, run_end, turn_num, m, /*synthetic=*/false);
+
+            // Hash key: settled assistant run. The merge inputs (every
+            // run-member msg.id + the run length) all fold in so a
+            // different run produces a different key. Once frozen,
+            // none of the underlying bytes change — the key is stable
+            // for the lifetime of this entry, and maya's hash-keyed
             // ComponentCache reuses the painted cells every frame.
             maya::CacheIdBuilder kb;
-            kb.add(std::string_view{"agentty.turn.merged"})
-              .add(std::string_view{msg.id.value})
+            kb.add(std::string_view{"agentty.turn.assistant_run"})
               .add(static_cast<std::uint64_t>(run_end - i));
-            for (std::size_t j = i; j < run_end; ++j)
+            for (std::size_t j = i; j < run_end; ++j) {
                 kb.add(std::string_view{m.d.current.messages[j].id.value});
+                kb.add(m.d.current.messages[j].compute_render_key());
+            }
             cfg.hash_id = kb.build();
             m.ui.frozen.push_back(maya::Turn{std::move(cfg)}.build());
-            if (msg.role == Role::Assistant && !continuation)
-                ++m.ui.frozen_turn;
-            i = run_end - 1;   // for-loop ++ lands on run_end
-            continue;
+            ++m.ui.frozen_turn;
+        } else {
+            // User / compaction-summary single-message Turn.
+            int turn_num = m.ui.frozen_turn;
+            auto cfg = ui::turn_config(head, i, turn_num, m,
+                                       /*continuation=*/false,
+                                       /*synthetic=*/false);
+            cfg.hash_id = maya::CacheIdBuilder{}
+                .add(std::string_view{"agentty.turn"})
+                .add(std::string_view{head.id.value})
+                .add(head.compute_render_key())
+                .build();
+            m.ui.frozen.push_back(maya::Turn{std::move(cfg)}.build());
         }
 
-        int turn_num = m.ui.frozen_turn
-                     + ((msg.role == Role::Assistant && !continuation) ? 1 : 0);
-        // Build directly — no turn_element / shared_ptr wrapper. The
-        // raw Element goes straight into m.ui.frozen, identical in
-        // shape to agent_session's `m.frozen.push_back(widget.build())`.
-        auto cfg = ui::turn_config(msg, i, turn_num, m, continuation,
-                                   /*synthetic=*/true);
-        // Hash key: settled single-message turn. msg.id is unique
-        // per Message and stable across reloads; compute_render_key()
-        // folds every visible field (text, tool_calls, error, etc.)
-        // so even a retroactive mutation that bumps it invalidates
-        // the cache. For frozen turns the key is effectively stable
-        // for the lifetime of the entry.
-        cfg.hash_id = maya::CacheIdBuilder{}
-            .add(std::string_view{"agentty.turn"})
-            .add(std::string_view{msg.id.value})
-            .add(msg.compute_render_key())
-            .build();
-        m.ui.frozen.push_back(maya::Turn{std::move(cfg)}.build());
-        if (msg.role == Role::Assistant && !continuation)
-            ++m.ui.frozen_turn;
+        i = run_end;
     }
 
     m.ui.frozen_through = to;
