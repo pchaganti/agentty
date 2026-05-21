@@ -114,40 +114,51 @@ Step thread_list_update(Model m, msg::ThreadListMsg tm) {
             p->index = (p->index + e.delta + sz) % sz;
             return done(std::move(m));
         },
-        // ── Silent model swap ─────────────────────────────────────────
+        // ── Model swap: commit overflow before swapping ──────────────
         //
-        // ThreadListSelect and NewThread replace m.d.current wholesale
-        // WITHOUT dispatching Cmd::force_redraw. This is deliberate —
-        // do NOT "defensively" add a force_redraw here. History:
-        // commit 8becb88 did exactly that and reverted in 0b24148.
+        // ThreadListSelect and NewThread replace m.d.current wholesale.
+        // Before the swap we dispatch Cmd::commit_scrollback_overflow()
+        // — NOT force_redraw (see history below).
         //
-        // Why a silent swap is safe:
-        //   Nothing between this reducer and the next render touches
-        //   maya's prev_cells. The shadow hash stays consistent with
-        //   the wire, so the next compose's witness chain succeeds and
-        //   the normal diff path runs. The diff sees old-thread cells
-        //   in prev vs new-thread cells in canvas and emits per-row,
-        //   per-cell-span deltas in place — cursor walks via cursor_up
-        //   / \r within the existing painted region.
+        // Why commit-overflow is required:
+        //   maya's inline diff treats rows [0, prev_rows - term_h) as
+        //   committed scrollback ("updatable_start" in serialize.cpp).
+        //   When the old thread overflowed (prev_rows > term_h) those
+        //   rows are skipped by the diff scan and per-row emit. After
+        //   a wholesale model swap the new thread's canvas rows at
+        //   those Y positions are entirely different content — but
+        //   the diff still considers them "scrollback, untouchable"
+        //   and never emits them. Result: visible seam mid-viewport
+        //   where the wire still holds old-thread bytes against the
+        //   new-thread canvas, manifesting as two unrelated text
+        //   fragments on adjacent rows.
         //
-        // Why force_redraw is WRONG here:
-        //   Cmd::force_redraw demotes Synced → Stale, routing the next
-        //   render through compose case (B). Case (B)'s scroll-to-fit
-        //   branch (scroll_n > 0) emits \n at the viewport bottom
-        //   when the new frame is taller than the old cursor's offset
-        //   from viewport top — each \n there scrolls a row of
-        //   whatever was on screen (old thread tail + host shell
-        //   history above it) up into terminal-owned scrollback,
-        //   permanently. Net effect: visible duplicate / garbage rows
-        //   in scrollback after every thread switch that grows the
-        //   frame.
+        //   commit_scrollback_overflow() calls into maya's
+        //   commit_inline_overflow which advances prev_cells by
+        //   max(0, prev_rows - term_h) rows. After it runs,
+        //   prev_rows ≤ term_h, updatable_start drops to 0, and the
+        //   diff scans the full common range — every visible row
+        //   gets correctly emitted against the new thread.
         //
-        // The diff path doesn't have this hazard: growth past the
-        // previous bottom scrolls as new content (correct streaming
-        // behavior), and in-place rewrite of existing rows never
-        // emits bottom-edge \n.
+        //   The rows that scroll out of prev_cells are bytes the
+        //   terminal already committed to its native scrollback
+        //   anyway (they were emitted via bottom-edge \r\n's during
+        //   streaming). commit just acknowledges that fact — zero
+        //   wire effect.
+        //
+        // Why NOT force_redraw:
+        //   Cmd::force_redraw demotes Synced → Stale, routing the
+        //   next render through compose case (B). Case (B)'s
+        //   scroll-to-fit branch (scroll_n > 0) emits \n at the
+        //   viewport bottom when the new frame is taller than the
+        //   old cursor's offset from viewport top — each \n there
+        //   scrolls a row of whatever was on screen (old thread
+        //   tail + host shell history above it) up into
+        //   terminal-owned scrollback, permanently. History: commit
+        //   8becb88 did exactly that and reverted in 0b24148.
         [&](ThreadListSelect) -> Step {
             auto* p = pick::opened(m.ui.thread_list);
+            Cmd<Msg> cmd = Cmd<Msg>::none();
             if (p && !m.d.threads.empty()) {
                 // Picker entries are metadata-only skeletons (see
                 // load_all_threads); full message bodies are read off
@@ -182,9 +193,12 @@ Step thread_list_update(Model m, msg::ThreadListMsg tm) {
                 // mimalloc is more eager but still benefits from the
                 // explicit collect at this known free-point.
                 release_to_kernel();
+                // Commit the previous thread's overflowed prev_cells
+                // rows. See the block comment above ThreadListSelect.
+                cmd = Cmd<Msg>::commit_scrollback_overflow();
             }
             m.ui.thread_list = pick::Closed{};
-            return done(std::move(m));
+            return {std::move(m), std::move(cmd)};
         },
         [&](NewThread) -> Step {
             if (!m.d.current.messages.empty()) deps().save_thread(m.d.current);
@@ -207,8 +221,8 @@ Step thread_list_update(Model m, msg::ThreadListMsg tm) {
             // abandoned along with the thread).
             m.s.phase = phase::Idle{};
             release_to_kernel();
-            // Silent model swap — see ThreadListSelect comment above.
-            return done(std::move(m));
+            // Model swap — see ThreadListSelect comment above.
+            return {std::move(m), Cmd<Msg>::commit_scrollback_overflow()};
         },
         [&](ThreadsLoaded& e) -> Step {
             m.d.threads = std::move(e.threads);
