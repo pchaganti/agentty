@@ -156,6 +156,10 @@ maya::Composer::Config composer_config(const Model& m) {
     cfg.profile         = {.label = std::string{profile_label(m.d.profile)},
                            .color = profile_color(m.d.profile)};
     cfg.expanded        = m.ui.composer.expanded;
+    // Pin body floor at 2 rows so the composer stops shape-shifting
+    // between empty→one char (and back) during streaming — every
+    // height delta forces a repaint of every thread row above.
+    cfg.min_body_rows   = 2;
     return cfg;
 }
 
