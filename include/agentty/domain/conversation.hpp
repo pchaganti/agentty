@@ -112,6 +112,15 @@ struct ToolUse {
     // we've consumed; the next decode pass resumes there.
     mutable std::string stream_decoded_value;
     std::size_t         stream_decode_through = 0;
+    // Set when StreamToolUseEnd / finalize_turn detected that the
+    // wire ended inside a string value. finalize_turn's retry loop
+    // treats this exactly like a missing-required-field truncation:
+    // pop the in-flight assistant placeholder and silently relaunch
+    // on the same ctx (bounded by kMaxTruncationRetries). Only after
+    // the retry budget is exhausted does the tool surface as Failed.
+    // Streaming-time scratch only — not persisted; default-init on
+    // load is correct.
+    bool           stream_mid_string_truncated = false;
     Status         status   = Pending{};
     bool           expanded = true;
 

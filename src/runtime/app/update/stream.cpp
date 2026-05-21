@@ -696,35 +696,45 @@ maya::Cmd<Msg> finalize_turn(Model& m, StopReason stop_reason) {
                         tc.args = std::move(salvaged);
                         tc.mark_args_dirty();
                     } else {
-                        auto now = std::chrono::steady_clock::now();
                         // Distinguish "never closed" (parse failed AND no
                         // mid-string truncation) from "truncated mid-string"
                         // (salvage_args refused because close_partial_json
                         // would have synthesised a closing quote on a
-                        // half-written value). The model needs the
-                        // mid-string story to know its file body never
-                        // finished arriving, not just "args malformed".
+                        // half-written value). The mid-string case is
+                        // retry-eligible — mark the flag, leave the tool
+                        // Pending, and let the retry block below pop the
+                        // assistant placeholder and re-launch on the same
+                        // ctx. Only on retry-budget exhaustion does the
+                        // tool surface as Failed (handled in the retry
+                        // block's fall-through).
                         const bool mid_string =
                             agentty::tools::util::ended_inside_string(
                                 tc.args_streaming);
-                        tc.status = ToolUse::Failed{
-                            tc.started_at(), now,
-                            mid_string
-                                ? std::string{"tool args truncated "
-                                    "mid-string \u2014 the wire cut off "
-                                    "inside a string value (likely "
-                                    "`content` / `command` / `new_text`), "
-                                    "so the body is incomplete and the "
-                                    "call was refused. Re-emit the tool "
-                                    "with the full payload."}
-                                : std::string{"tool args never closed: "}
+                        if (mid_string) {
+                            tc.stream_mid_string_truncated = true;
+                            // Leave status Pending; the retry block
+                            // below will see any_truncated and re-launch.
+                        } else {
+                            auto now = std::chrono::steady_clock::now();
+                            tc.status = ToolUse::Failed{
+                                tc.started_at(), now,
+                                std::string{"tool args never closed: "}
                                     + ex.what()};
+                        }
                     }
                 }
             }
             std::string{}.swap(tc.args_streaming);
             if (tc.is_pending()) {
                 if (guard_truncated_tool_args(tc)) any_truncated = true;
+                // Mid-string cutoffs also participate in the
+                // transparent-retry loop — the wire died inside a
+                // string value, no salvage is safe, so the only path
+                // to a usable tool call is re-launching the stream.
+                // Tool stays Pending here; the retry block pops the
+                // placeholder. On retry-budget exhaustion the block
+                // below sets Failed with the mid-string message.
+                if (tc.stream_mid_string_truncated) any_truncated = true;
             }
         }
     }
@@ -814,6 +824,30 @@ maya::Cmd<Msg> finalize_turn(Model& m, StopReason stop_reason) {
             m.s.phase = phase::Streaming{std::move(ctx)};
             m.s.status = "retrying (upstream cut off)…";
             return cmd::launch_stream(m);
+        }
+    }
+
+    // Retry budget exhausted (or max_tokens hit, or committed work
+    // blocked the retry) and a tool is still flagged mid-string
+    // truncated. We left it Pending earlier so the retry loop could
+    // see it; now surface the final Failed message so the model gets
+    // a coherent terminal story instead of a still-Pending tool that
+    // kick_pending_tools would dispatch with empty args.
+    if (!m.d.current.messages.empty()
+        && m.d.current.messages.back().role == Role::Assistant) {
+        const auto now_ts = std::chrono::steady_clock::now();
+        for (auto& tc : m.d.current.messages.back().tool_calls) {
+            if (tc.stream_mid_string_truncated && tc.is_pending()) {
+                tc.status = ToolUse::Failed{
+                    tc.started_at(), now_ts,
+                    "tool args truncated mid-string \u2014 the wire cut "
+                    "off inside a string value (likely `content` / "
+                    "`command` / `new_text`), so the body is incomplete "
+                    "and the call was refused. Re-emit the tool with the "
+                    "full payload — prefer `edit` over `write` for long "
+                    "files, or split the change across multiple calls."};
+            }
+            tc.stream_mid_string_truncated = false;
         }
     }
 
@@ -1138,15 +1172,15 @@ Step stream_update(Model m, msg::StreamMsg sm) {
                             tc.mark_args_dirty();
                             std::string{}.swap(tc.args_streaming);
                         } else if (mid_string) {
-                            auto now = std::chrono::steady_clock::now();
-                            tc.status = ToolUse::Failed{
-                                tc.started_at(), now,
-                                "tool args truncated mid-string \u2014 the "
-                                "wire cut off inside a string value (likely "
-                                "`content` / `command` / `new_text`), so "
-                                "the body is incomplete and the call was "
-                                "refused. Re-emit the tool with the full "
-                                "payload."};
+                            // Don't eagerly fail. Mark the truncation
+                            // and leave the tool Pending so
+                            // finalize_turn's retry loop can pop the
+                            // placeholder and silently re-launch on
+                            // the same ctx — a fresh tool-use stream
+                            // is the only thing that can salvage a
+                            // mid-string cutoff. Args_streaming is
+                            // kept until the retry path pops it.
+                            tc.stream_mid_string_truncated = true;
                             std::string{}.swap(tc.args_streaming);
                         } else {
                             auto now = std::chrono::steady_clock::now();

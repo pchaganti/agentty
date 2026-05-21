@@ -22,6 +22,21 @@ Reset on every fresh user submit.  Capped (see `kMaxTruncationRetries`
 in `update.cpp`) so a persistently broken upstream surfaces as a real
 error eventually instead of looping forever.
 
+Two conditions trigger a transparent retry:
+
+1. **Missing required field** — `guard_truncated_tool_args` notices the
+   parsed args object lacks a schema-required key (e.g. `write` without
+   `content`). Implies the wire died before the field arrived.
+2. **Mid-string cutoff** — `ended_inside_string` detects the wire ended
+   inside a JSON string value. `close_partial_json` would synthesise a
+   closing quote on a half-written body, which would corrupt the file.
+   The tool is marked `stream_mid_string_truncated` and left `Pending`;
+   `finalize_turn` treats the flag exactly like (1) for retry purposes.
+   Only on retry-budget exhaustion does the tool surface as `Failed`
+   with the actionable "re-emit the tool with the full payload—prefer
+   `edit` over `write`" message.
+
+
 ## Live tok/s speedometer
 
 Anthropic only emits `message_delta.usage.output_tokens` rarely — often
