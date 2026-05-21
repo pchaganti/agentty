@@ -93,7 +93,13 @@ maya::AgentTimeline::Config agent_timeline_config(std::span<const ToolUse> tool_
         cfg.events.push_back({
             .name            = tool_display_name(tc.name.value),
             .detail          = std::move(detail),
-            .elapsed_seconds = tc.is_terminal() ? tool_elapsed(tc) : 0.0f,
+            // Live elapsed for running/pending too — keeps the row's
+            // right-edge duration cell present from the moment the
+            // event renders, so the row doesn't horizontally snap
+            // when the tool flips to terminal. tool_elapsed() uses
+            // steady_clock::now() when finished_at is unset, which
+            // is exactly the live counter we want.
+            .elapsed_seconds = tool_elapsed(tc),
             .category_color  = tool_category_color(tc.name.value),
             .status          = tool_event_status(tc),
             .body            = tool_body_preview_config(tc, &grep_hits),

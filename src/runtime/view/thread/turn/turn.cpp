@@ -50,15 +50,37 @@ maya::Element cached_markdown_for(const Message& msg, const Model& m) {
     if (!cache.streaming)
         cache.streaming = std::make_shared<maya::StreamingMarkdown>();
 
-    // msg.streaming_text grows during streaming; on StreamFinished
-    // its bytes are std::move'd into msg.text. Feed whichever holds
-    // the content. Byte-equality between the moved-into msg.text and
-    // the widget's accumulated source_ makes set_content's fast-path
-    // a no-op, so the transition costs nothing.
-    const std::string& source =
-        msg.text.empty() ? msg.streaming_text : msg.text;
+    // Pick the source bytes for THIS frame:
+    //   • settled: msg.text holds the final body, streaming_text empty.
+    //   • mid-sub-turn-2: msg.text holds the PRIOR sub-turn's settled
+    //     body and streaming_text holds the in-flight follow-up bytes.
+    //     We need to feed BOTH so the live tail keeps growing — picking
+    //     msg.text alone would freeze rendering at the prior sub-turn's
+    //     size until finalize_turn appended the new bytes in one jump.
+    //   • sub-turn-1 streaming: msg.text empty, streaming_text grows.
+    // The joined buffer is cached on MessageMdCache so the string_view
+    // we hand to set_content_async stays valid across the call.
+    const std::string* source_ptr = &msg.text;
+    if (!msg.streaming_text.empty()) {
+        if (msg.text.empty()) {
+            source_ptr = &msg.streaming_text;
+        } else {
+            cache.combined_source.clear();
+            cache.combined_source.reserve(
+                msg.text.size() + msg.streaming_text.size());
+            cache.combined_source.append(msg.text);
+            cache.combined_source.append(msg.streaming_text);
+            source_ptr = &cache.combined_source;
+        }
+    }
+    const std::string& source = *source_ptr;
 
     const bool settled = !msg.text.empty() && msg.streaming_text.empty();
+    if (settled && !cache.combined_source.empty()) {
+        // Reclaim the scratch buffer the moment streaming_text
+        // drains — next freeze takes the snapshot off msg.text.
+        std::string{}.swap(cache.combined_source);
+    }
 
     // Fast-path: fully settled message whose reveal has completed.
     // Skip all per-frame work (typewriter advance, set_content,

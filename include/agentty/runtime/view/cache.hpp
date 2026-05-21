@@ -110,6 +110,16 @@ struct MessageMdCache {
     // a half-multibyte sequence to the parser.
     std::size_t                               revealed_size = 0;
     std::chrono::steady_clock::time_point     last_reveal_tick{};
+
+    // Scratch buffer for multi-sub-turn rendering. When a single
+    // Assistant message has produced text in a prior sub-turn (now
+    // in `msg.text`) and is now streaming more text in a follow-up
+    // sub-turn (in `msg.streaming_text`), we need to feed the
+    // widget the CONCATENATION of both so the live tail keeps
+    // growing visibly. Holding the joined buffer here gives a
+    // stable backing for the string_view fed into
+    // set_content_async. Cleared on settle.
+    std::string                               combined_source;
 };
 
 struct TurnConfigCache {
