@@ -143,9 +143,17 @@ maya::PhaseChip::Config phase_chip_config(const Model& m) {
         breathing = true;
     }
     // ── 8. Background thread-history load ────────────────────────────
+    // ── 8. Background thread-history load ────────────────
     else if (m.s.threads_loading) {
         glyph     = spinner;
         verb      = "loading…";
+        color     = muted;
+        breathing = true;
+    }
+    // ── 8b. Single-thread swap in flight ─────────────────
+    else if (m.s.thread_loading) {
+        glyph     = spinner;
+        verb      = "opening…";
         color     = muted;
         breathing = true;
     }

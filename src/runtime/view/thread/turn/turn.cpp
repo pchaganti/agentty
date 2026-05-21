@@ -371,20 +371,22 @@ std::optional<float> assistant_elapsed(const Message& msg, const Model& m) {
 // of consecutive Assistant Messages can be rendered as ONE Turn (see
 // turn_config_for_assistant_run), matching agent_session's discipline
 // where every internal seam contributes a body slot to one Turn.
-void append_assistant_body_slots(maya::Turn::Config& cfg,
-                                 const Message& msg,
+//
+// Tool panel emission is split from text emission so a run of
+// consecutive sub-turn Messages (each with one tool, no text) renders
+// as ONE merged panel rather than N stacked single-tool panels. The
+// panel cache key is the `anchor_msg_id` — stable across rebuilds
+// because messages are append-only, and unique per merged group
+// because each group is anchored at the FIRST contributing Message.
+void append_assistant_tool_panel(maya::Turn::Config& cfg,
+                                 const MessageId& anchor_msg_id,
                                  std::span<const ToolUse> tool_calls,
                                  const Model& m,
                                  bool synthetic,
                                  const SpeakerStyle& style)
 {
-    const std::string& model_id_ref = m.d.model_id.value;
-
-    const bool has_body = !msg.text.empty() || !msg.streaming_text.empty();
-    if (has_body) {
-        cfg.body.emplace_back(cached_markdown_for(msg, m));
-    }
     if (tool_calls.empty()) return;
+    const std::string& model_id_ref = m.d.model_id.value;
 
     bool all_terminal = true;
     bool any_pending_perm = false;
@@ -415,7 +417,7 @@ void append_assistant_body_slots(maya::Turn::Config& cfg,
 
     if (can_freeze_panel) {
         auto& slot = m.ui.view_cache.turn_config(
-            m.d.current.id, msg.id);
+            m.d.current.id, anchor_msg_id);
         if (!slot.agent_timeline
             || slot.agent_timeline_key != panel_key
             || slot.agent_timeline_model_id != model_id_ref) {
@@ -434,8 +436,31 @@ void append_assistant_body_slots(maya::Turn::Config& cfg,
             live_key = (live_key ^ v) * 1099511628211ULL;
         };
         mixlive(tool_calls.size());
-        for (const auto& tc : tool_calls)
-            mixlive(tc.compute_render_key());
+        // Bucketed render-key per tool. compute_render_key() mixes
+        // raw byte sizes of output/progress/args_streaming, so a
+        // streaming Write/Edit (args_streaming grows by every SSE
+        // delta) or a Read (output lands in one big chunk) invalidates
+        // the live cache on every byte change. At 30 fps with deltas
+        // arriving every ~30ms, that's a full agent_timeline rebuild
+        // every frame — which deep-copies every tool's output() /
+        // args into a fresh ToolBodyPreview::Config (O(total bytes)).
+        //
+        // Bucket the size fields to 1 KiB granularity for the live
+        // cache only. The settled panel cache still uses the exact
+        // compute_render_key(), so the final settled Element is
+        // byte-accurate; the live preview just updates in 1 KiB
+        // jumps during the stream, which is invisible to humans.
+        constexpr std::uint64_t kLiveByteBucket = 1024;
+        for (const auto& tc : tool_calls) {
+            std::uint64_t k = 1469598103934665603ULL;
+            auto mixk = [&](std::uint64_t v) { k = (k ^ v) * 1099511628211ULL; };
+            mixk(tc.output().size() / kLiveByteBucket);
+            mixk(tc.progress_text().size() / kLiveByteBucket);
+            mixk(tc.args_streaming.size() / kLiveByteBucket);
+            mixk(static_cast<std::uint64_t>(tc.status.index()));
+            mixk(tc.expanded ? 1ULL : 0ULL);
+            mixlive(k);
+        }
         mixlive(static_cast<std::uint64_t>(style.color.r()));
         mixlive(static_cast<std::uint64_t>(style.color.g()));
         mixlive(static_cast<std::uint64_t>(style.color.b()));
@@ -446,19 +471,22 @@ void append_assistant_body_slots(maya::Turn::Config& cfg,
         // duration cell actually ticks. Without this the cached
         // AgentTimeline Element is reused frame-to-frame and the
         // elapsed string is frozen at the value it had on first build.
-        // 100ms buckets keep the displayed value within the user-
-        // perceptible jitter floor while keeping the cache rebuild
-        // rate bounded (≤10/s per running tool).
+        // 500ms buckets keep the displayed value within a perceptibly-
+        // live cadence while bounding the rebuild rate to ≤2/sec per
+        // running tool. Earlier this was 100ms (10/sec) which on long
+        // turns with many settled tool outputs paid O(total_output_bytes)
+        // in count_lines + tool_body deep-copy per rebuild — a 250KB
+        // settled-output panel rebuilding 10×/sec saturated a core.
         for (const auto& tc : tool_calls) {
             if (tc.is_terminal()) continue;
             const auto secs = tool_elapsed(tc);
             const std::uint64_t bucket =
-                static_cast<std::uint64_t>(secs * 10.0f);
+                static_cast<std::uint64_t>(secs * 2.0f);
             mixlive(bucket);
         }
 
         auto& slot = m.ui.view_cache.turn_config(
-            m.d.current.id, msg.id);
+            m.d.current.id, anchor_msg_id);
         if (slot.live_agent_timeline_key != live_key) {
             for (auto& el : slot.live_agent_timeline) el.reset();
             slot.live_agent_timeline_key = live_key;
@@ -481,6 +509,24 @@ void append_assistant_body_slots(maya::Turn::Config& cfg,
                 *m.d.pending_permission, tc));
         }
     }
+}
+
+// Single-message body slot append: text (if any) then this message's
+// tool panel (if any). Used by `turn_config` for non-run-merged
+// renders (User turns delegate to a different branch; this is hit by
+// the single-Message Assistant path that pre-dates the run merge).
+void append_assistant_body_slots(maya::Turn::Config& cfg,
+                                 const Message& msg,
+                                 std::span<const ToolUse> tool_calls,
+                                 const Model& m,
+                                 bool synthetic,
+                                 const SpeakerStyle& style)
+{
+    const bool has_body = !msg.text.empty() || !msg.streaming_text.empty();
+    if (has_body) {
+        cfg.body.emplace_back(cached_markdown_for(msg, m));
+    }
+    append_assistant_tool_panel(cfg, msg.id, tool_calls, m, synthetic, style);
 }
 
 } // namespace
@@ -617,18 +663,68 @@ maya::Turn::Config turn_config_for_assistant_run(
                            /*continuation=*/false, synthetic);
     }
 
-    // Walk the run, appending one message's body slots at a time.
-    // The Turn widget gap-spaces consecutive slots, so a
-    // `[text, tools, text, tools]` body renders with breathing room
-    // between each segment automatically.
+    // Walk the run, accumulating consecutive tool-only sub-turn
+    // Messages into a single merged tool panel. The wire layer pushes
+    // a fresh Assistant placeholder after every tool batch completes
+    // (kick_pending_tools in cmd_factory.cpp) so each post-tool sub-
+    // turn lives on its own Message. Pre-merge the view would render
+    // those as N stacked `ACTIONS · 1/1` panels — one per Message —
+    // even though the user thinks of them as one batch of N actions.
+    // The agent_session promise ("one agent turn = one Turn") really
+    // wants "one contiguous tool group = one panel" too.
+    //
+    // Merge rule: collect ToolUses from consecutive Messages with no
+    // intervening text into a `pending` buffer. Flush as ONE panel
+    // whenever we hit a Message that has text (the text gets its own
+    // markdown slot first, then any tools on that same Message start
+    // a fresh group anchored at this Message). Final flush at run end.
+    //
+    // Anchor (cache key) = id of the FIRST Message contributing to
+    // the group. Stable across rebuilds (Messages are append-only)
+    // and distinct per group (each group starts at a different
+    // Message). Subsequent appends within the group don't perturb
+    // the cache slot — the slot key changes only when the group's
+    // tool_calls set changes, via compute_render_key inside the
+    // panel_key mix.
     std::string error_accum;
+    std::vector<ToolUse> pending;          // owned copies; lifetime spans this fn
+    std::optional<MessageId> pending_anchor;
+
+    auto flush_panel = [&]() {
+        if (!pending_anchor || pending.empty()) {
+            pending.clear();
+            pending_anchor.reset();
+            return;
+        }
+        append_assistant_tool_panel(
+            cfg, *pending_anchor,
+            std::span<const ToolUse>{pending},
+            m, synthetic, style);
+        pending.clear();
+        pending_anchor.reset();
+    };
+
     for (std::size_t i = run_first; i < end; ++i) {
         const Message& m_i = msgs[i];
         if (m_i.role != Role::Assistant) break;   // run boundary
-        std::span<const ToolUse> tool_calls{m_i.tool_calls};
-        append_assistant_body_slots(cfg, m_i, tool_calls, m, synthetic, style);
+
+        const bool has_text = !m_i.text.empty() || !m_i.streaming_text.empty();
+        if (has_text) {
+            // Text emission breaks the merge group. Flush any pending
+            // tools first so they render ABOVE this message's text
+            // (preserving wire order: prior sub-turns' tools came
+            // before this sub-turn's reply text).
+            flush_panel();
+            cfg.body.emplace_back(cached_markdown_for(m_i, m));
+        }
+        if (!m_i.tool_calls.empty()) {
+            if (!pending_anchor) pending_anchor = m_i.id;
+            for (const auto& tc : m_i.tool_calls) pending.push_back(tc);
+        }
         if (m_i.error && error_accum.empty()) error_accum = *m_i.error;
     }
+    flush_panel();
+
     if (!error_accum.empty()) cfg.error = std::move(error_accum);
 
     return cfg;

@@ -913,6 +913,18 @@ maya::Cmd<Msg> finalize_turn(Model& m, StopReason stop_reason) {
             cache.streaming->finish();
         }
         freeze_through(m, m.d.current.messages.size());
+        // Trim frozen at idle, mirroring agent_session's MessageStop
+        // policy. Previously trim only ran on launch_stream (next user
+        // submit), so a long auto-pilot run (tool loop with many
+        // sub-turns) let frozen grow unbounded between user inputs.
+        // On long sessions that's the dominant per-frame cost — the
+        // canvas resizes to fit total transcript height and every
+        // render clears + paints all of it.
+        if (auto trim = trim_frozen_if_oversized(m); !trim.is_none()) {
+            auto rest = std::move(kp);
+            return Cmd<Msg>::batch(std::vector<Cmd<Msg>>{
+                std::move(trim), std::move(rest)});
+        }
     }
 
     // Post-turn idle auto-compaction.

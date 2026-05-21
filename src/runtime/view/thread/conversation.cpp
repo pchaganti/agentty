@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <string_view>
 #include <utility>
 
@@ -190,19 +192,51 @@ void build_queued_previews(const Model& m, int& running_turn,
 maya::Conversation::Config conversation_config(const Model& m) {
     maya::Conversation::Config cfg;
 
-    // ── Borrowed frozen prefix (zero-copy). ─────────────────────────
+    // ── Borrowed frozen prefix (zero-copy). ─────────────
     // maya renders this through list_ref, so growing m.ui.frozen does
     // not increase per-frame cost. Maya's hash_id-keyed cell cache
     // makes already-painted Elements hit on every subsequent frame.
     cfg.frozen = &m.ui.frozen;
 
-    // ── Live tail. ──────────────────────────────────────────────────
+    // ── Live tail. ─────────────────────────────────
     // The only thing rebuilt per frame. Bounded by one in-flight
     // agent turn (one User + possibly several Assistant continuations)
     // plus any queued-message previews.
     int running_turn = m.ui.frozen_turn + 1;
     build_live_tail(m, running_turn, cfg.live_tail);
     build_queued_previews(m, running_turn, cfg.live_tail);
+
+    // Optional shape probe. Set AGENTTY_VIEW_PROF=1 to log every
+    // conversation_config invocation's frozen/live_tail sizes plus
+    // a rough live-tail message-content sketch. One line per call.
+    static const bool view_prof = []{
+        const char* e = std::getenv("AGENTTY_VIEW_PROF");
+        return e && *e && *e != '0';
+    }();
+    if (view_prof) {
+        static std::FILE* out = std::fopen("/tmp/agentty-view-prof.log", "a");
+        if (out) {
+            std::size_t live_msgs = (m.d.current.messages.size()
+                > m.ui.frozen_through)
+                ? (m.d.current.messages.size() - m.ui.frozen_through)
+                : 0;
+            std::size_t live_text_bytes = 0;
+            std::size_t live_tool_count = 0;
+            for (std::size_t i = m.ui.frozen_through;
+                 i < m.d.current.messages.size(); ++i) {
+                const auto& msg = m.d.current.messages[i];
+                live_text_bytes += msg.text.size() + msg.streaming_text.size();
+                live_tool_count += msg.tool_calls.size();
+            }
+            std::fprintf(out,
+                "[view] frozen=%zu live_tail=%zu live_msgs=%zu "
+                "live_text=%zu live_tools=%zu frozen_through=%zu msgs=%zu\n",
+                m.ui.frozen.size(), cfg.live_tail.size(), live_msgs,
+                live_text_bytes, live_tool_count, m.ui.frozen_through,
+                m.d.current.messages.size());
+            std::fflush(out);
+        }
+    }
 
     // No separate in_flight indicator — the empty-placeholder
     // assistant Turn carries its own "thinking…" body slot during

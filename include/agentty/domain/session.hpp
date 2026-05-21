@@ -428,6 +428,13 @@ struct StreamState {
     // to render a "loading…" placeholder instead of an empty list.
     // Cleared by the `ThreadsLoaded` handler.
     bool threads_loading = false;
+    // True while a background single-thread JSON load is in flight
+    // (kicked off by `ThreadListSelect`). The status bar shows a
+    // "loading thread…" chip; the previous thread stays visible
+    // until `ThreadLoaded` lands and swaps `m.d.current`. Suppresses
+    // additional ThreadListSelect dispatches so a mashed Enter can't
+    // queue multiple loads behind each other.
+    bool thread_loading = false;
     std::string status;
     // Optional expiry for `status`. When set, the status bar hides the
     // banner once now() passes this point and the reducer treats the

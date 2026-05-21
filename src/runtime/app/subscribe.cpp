@@ -90,10 +90,14 @@ std::optional<Msg> on_model_picker(const KeyEvent& ev) {
     if (std::holds_alternative<SpecialKey>(ev.key)) {
         auto sk = std::get<SpecialKey>(ev.key);
         switch (sk) {
-            case SpecialKey::Escape: return CloseModelPicker{};
-            case SpecialKey::Enter:  return ModelPickerSelect{};
-            case SpecialKey::Up:     return ModelPickerMove{-1};
-            case SpecialKey::Down:   return ModelPickerMove{+1};
+            case SpecialKey::Escape:   return CloseModelPicker{};
+            case SpecialKey::Enter:    return ModelPickerSelect{};
+            case SpecialKey::Up:       return ModelPickerMove{-1};
+            case SpecialKey::Down:     return ModelPickerMove{+1};
+            case SpecialKey::Home:     return ModelPickerJump{ModelPickerJump::Where::Home};
+            case SpecialKey::End:      return ModelPickerJump{ModelPickerJump::Where::End};
+            case SpecialKey::PageUp:   return ModelPickerJump{ModelPickerJump::Where::PageUp};
+            case SpecialKey::PageDown: return ModelPickerJump{ModelPickerJump::Where::PageDown};
             default: break;
         }
     }
@@ -107,10 +111,14 @@ std::optional<Msg> on_thread_list(const KeyEvent& ev) {
     if (std::holds_alternative<SpecialKey>(ev.key)) {
         auto sk = std::get<SpecialKey>(ev.key);
         switch (sk) {
-            case SpecialKey::Escape: return CloseThreadList{};
-            case SpecialKey::Enter:  return ThreadListSelect{};
-            case SpecialKey::Up:     return ThreadListMove{-1};
-            case SpecialKey::Down:   return ThreadListMove{+1};
+            case SpecialKey::Escape:   return CloseThreadList{};
+            case SpecialKey::Enter:    return ThreadListSelect{};
+            case SpecialKey::Up:       return ThreadListMove{-1};
+            case SpecialKey::Down:     return ThreadListMove{+1};
+            case SpecialKey::Home:     return ThreadListJump{ThreadListJump::Where::Home};
+            case SpecialKey::End:      return ThreadListJump{ThreadListJump::Where::End};
+            case SpecialKey::PageUp:   return ThreadListJump{ThreadListJump::Where::PageUp};
+            case SpecialKey::PageDown: return ThreadListJump{ThreadListJump::Where::PageDown};
             default: break;
         }
     }

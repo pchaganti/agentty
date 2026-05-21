@@ -97,6 +97,7 @@ Element model_picker(const Model& m) {
     cfg.footer.push_back(text(""));
     cfg.footer.push_back(h(
         text("↑↓", fg_of(fg)), text(" move  ", fg_dim(muted)),
+        text("PgUp/PgDn", fg_of(fg)), text(" page  ", fg_dim(muted)),
         text("Enter", fg_of(fg)), text(" select  ", fg_dim(muted)),
         text("F", fg_of(fg)), text(" favorite  ", fg_dim(muted)),
         text("Esc", fg_of(fg)), text(" close", fg_dim(muted))
@@ -140,6 +141,7 @@ Element thread_list(const Model& m) {
     cfg.footer.push_back(text(""));
     cfg.footer.push_back(h(
         text("↑↓", fg_of(fg)), text(" move  ", fg_dim(muted)),
+        text("PgUp/PgDn", fg_of(fg)), text(" page  ", fg_dim(muted)),
         text("Enter", fg_of(fg)), text(" open  ", fg_dim(muted)),
         text("N", fg_of(fg)), text(" new  ", fg_dim(muted)),
         text("Esc", fg_of(fg)), text(" close", fg_dim(muted))

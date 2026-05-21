@@ -202,20 +202,27 @@ void rehydrate_frozen(Model& m) {
     const std::size_t total = msgs.size();
     if (total == 0) return;
 
-    // Bounded rehydrate: only materialise the tail that would survive
-    // the soft cap anyway. Building the whole history on load is the
-    // dominant ThreadListSelect cost: each frozen turn invokes markdown
-    // parse + tool body preview + AgentTimeline layout, so a 400-msg
-    // thread spent that cost on ~320 entries that trim_frozen_if_oversized
-    // (kFrozenMax=240) would discard at the next turn anyway. Skip them
-    // up front; messages stay in m.d.current.messages so wire payload
-    // and reload state are intact, they just never get rendered. Their
-    // absence matches what the user already sees on a long live session
-    // after trim has fired.
+    // Bounded rehydrate. Two costs scale with the rehydrated tail:
     //
-    // kRehydrateTurns leaves headroom below kFrozenMax/2 so a few more
-    // turns can be appended before the next trim.
-    constexpr std::size_t kRehydrateTurns = 60;
+    //   1. Build cost: markdown parse + tool body preview + timeline
+    //      layout, paid once per frozen Element at rehydrate time.
+    //   2. Paint cost on the swap frame: every canvas row gets emitted
+    //      to the wire row-by-row with \r\n between, and each \r\n at
+    //      the viewport bottom edge scrolls the terminal one row. Rows
+    //      that scroll past the top of the viewport during this paint
+    //      are NOT in native scrollback (they were never live in this
+    //      session) — pure wasted bytes that the user sees as the
+    //      "paint from top, fast-scroll to bottom" lag on thread
+    //      resume.
+    //
+    // Keep the cap small enough that the swap-frame canvas is roughly
+    // viewport-sized: the diff path emits a screenful and stops,
+    // instead of streaming hundreds of rows. Older turns live in the
+    // on-disk JSON (m.d.current.messages is intact); they're just
+    // invisible inside agentty until the next live append shifts the
+    // window. Composer history (↑ in the composer) still walks every
+    // prior user prompt, so the recall path is unaffected.
+    constexpr std::size_t kRehydrateTurns = 6;
 
     // Walk backward counting speaker-runs until we hit the budget.
     std::size_t units = 0;
@@ -252,17 +259,24 @@ maya::Cmd<Msg> trim_frozen_if_oversized(Model& m) {
     // Soft cap on the frozen vector. Above this, the oldest entries
     // are dropped — maya's row diff sees a shorter live tree and the
     // already-overflowed rows naturally commit to native scrollback.
-    // The exact value is a trade-off between (a) memory footprint of
-    // the cached Element subtrees + maya's prev_cells mirror, and
-    // (b) how far back Ctrl+L / mouse-wheel can scroll within the
-    // live frame before falling into native scrollback (which is
-    // still visible, just not addressable by the renderer's diff).
     //
-    // 240 entries ≈ 60-80 full turns; 80-entry trim chunk amortises
-    // the per-trim work over many turns. Mirrors agent_session's
-    // FROZEN_MAX=240 / FROZEN_TRIM=80 constants.
-    constexpr std::size_t kFrozenMax  = 240;
-    constexpr std::size_t kFrozenTrim = 80;
+    // Tradeoff: memory + every-frame render_tree cost vs in-app
+    // scroll reach. Render cost dominates on tool-heavy sessions —
+    // every settled turn appends a multi-row Element to frozen and
+    // the canvas auto-resizes to `total_rows + 8`. canvas_.clear()
+    // streaming_fills the entire surface each frame and render_tree
+    // walks every node to position it; 240 entries of write/edit/bash
+    // panels reaches ~5000 rows and pushes per-frame render past
+    // 15 ms, which the user feels as input lag.
+    //
+    // 80 entries ≈ 25-30 full turns of recent work — enough for the
+    // in-flight task to stay visible, small enough that the canvas
+    // never blows past ~2000 rows. Older turns are still in the
+    // terminal's native scrollback (committed there when they
+    // overflowed during the live session). 30-entry trim chunk
+    // amortises the per-trim cost across many appends.
+    constexpr std::size_t kFrozenMax  = 80;
+    constexpr std::size_t kFrozenTrim = 30;
 
     if (m.ui.frozen.size() <= kFrozenMax) return maya::Cmd<Msg>::none();
 

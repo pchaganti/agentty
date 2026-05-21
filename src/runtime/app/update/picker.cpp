@@ -8,6 +8,9 @@
 #include "agentty/runtime/app/update.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <utility>
 
 #include <maya/core/overload.hpp>
@@ -62,6 +65,21 @@ Step model_picker_update(Model m, msg::ModelPickerMsg pm) {
             p->index = (p->index + e.delta + sz) % sz;
             return done(std::move(m));
         },
+        [&](ModelPickerJump& e) -> Step {
+            if (m.d.available_models.empty()) return done(std::move(m));
+            auto* p = pick::opened(m.ui.model_picker);
+            if (!p) return done(std::move(m));
+            int sz = static_cast<int>(m.d.available_models.size());
+            using W = ModelPickerJump::Where;
+            constexpr int kPage = 14;  // matches kViewportH in pickers.cpp
+            switch (e.where) {
+                case W::Home:     p->index = 0; break;
+                case W::End:      p->index = sz - 1; break;
+                case W::PageUp:   p->index = std::max(0, p->index - kPage); break;
+                case W::PageDown: p->index = std::min(sz - 1, p->index + kPage); break;
+            }
+            return done(std::move(m));
+        },
         [&](ModelPickerSelect) -> Step {
             auto* p = pick::opened(m.ui.model_picker);
             if (p && !m.d.available_models.empty()) {
@@ -114,6 +132,21 @@ Step thread_list_update(Model m, msg::ThreadListMsg tm) {
             p->index = (p->index + e.delta + sz) % sz;
             return done(std::move(m));
         },
+        [&](ThreadListJump& e) -> Step {
+            if (m.d.threads.empty()) return done(std::move(m));
+            auto* p = pick::opened(m.ui.thread_list);
+            if (!p) return done(std::move(m));
+            int sz = static_cast<int>(m.d.threads.size());
+            using W = ThreadListJump::Where;
+            constexpr int kPage = 14;  // matches kViewportH in pickers.cpp
+            switch (e.where) {
+                case W::Home:     p->index = 0; break;
+                case W::End:      p->index = sz - 1; break;
+                case W::PageUp:   p->index = std::max(0, p->index - kPage); break;
+                case W::PageDown: p->index = std::min(sz - 1, p->index + kPage); break;
+            }
+            return done(std::move(m));
+        },
         // ── Model swap: commit overflow before swapping ──────────────
         //
         // ThreadListSelect and NewThread replace m.d.current wholesale.
@@ -159,43 +192,17 @@ Step thread_list_update(Model m, msg::ThreadListMsg tm) {
         [&](ThreadListSelect) -> Step {
             auto* p = pick::opened(m.ui.thread_list);
             Cmd<Msg> cmd = Cmd<Msg>::none();
-            if (p && !m.d.threads.empty()) {
-                // Picker entries are metadata-only skeletons (see
-                // load_all_threads); full message bodies are read off
-                // disk now. A failed load (file gone, corrupted) leaves
-                // m.d.current untouched and closes the picker.
+            if (p && !m.d.threads.empty() && !m.s.thread_loading) {
                 const Thread& meta = m.d.threads[p->index];
-                auto loaded = deps().load_thread(meta.id);
-                if (!loaded) {
+                // Same-thread re-select — closing the picker is the
+                // only useful action. No async load: would just
+                // reparse the same bytes and flash.
+                if (meta.id == m.d.current.id) {
                     m.ui.thread_list = pick::Closed{};
                     return done(std::move(m));
                 }
-                // Cache invalidation is implicit: the new thread's
-                // (thread_id, message_id) keys differ from the old
-                // thread's, so view-side cache lookups against the new
-                // thread's messages all miss and rebuild. Old thread's
-                // entries linger until LRU pushes them out — bounded
-                // by cap (32) × per-entry size, so transient memory
-                // overhead is on the order of tens of MiB until the
-                // new thread's accesses reclaim those slots. The
-                // reducer no longer reaches into the view cache; this
-                // arm is purely a Model state transition.
-                m.d.current = std::move(*loaded);
-                // The new thread's messages replaced m.d.current
-                // wholesale. Drop any stale frozen Elements (they
-                // referenced the previous thread's view_cache slots)
-                // and rebuild from the loaded transcript so the
-                // entire history appears as immutable scrollback
-                // beneath a fresh empty composer.
-                rehydrate_frozen(m);
-                // Hand the freed pages back to the kernel. glibc malloc
-                // will otherwise hold the released arenas indefinitely;
-                // mimalloc is more eager but still benefits from the
-                // explicit collect at this known free-point.
-                release_to_kernel();
-                // Commit the previous thread's overflowed prev_cells
-                // rows. See the block comment above ThreadListSelect.
-                cmd = Cmd<Msg>::commit_scrollback_overflow();
+                m.s.thread_loading = true;
+                cmd = cmd::load_thread_async(meta.id);
             }
             m.ui.thread_list = pick::Closed{};
             return {std::move(m), std::move(cmd)};
@@ -228,6 +235,50 @@ Step thread_list_update(Model m, msg::ThreadListMsg tm) {
             m.d.threads = std::move(e.threads);
             m.s.threads_loading = false;
             return done(std::move(m));
+        },
+        [&](ThreadLoaded& e) -> Step {
+            // Result of the async single-thread load kicked off by
+            // ThreadListSelect. Empty Thread (default ThreadId) means
+            // the disk read or parse failed; just clear the spinner
+            // and leave the current thread in place.
+            m.s.thread_loading = false;
+            if (e.thread.id.value.empty()) return done(std::move(m));
+            // Optional timing probe. AGENTTY_LOAD_PROF=1 keeps surfacing
+            // the synchronous portion of the load (rehydrate +
+            // release_to_kernel) that still lives on the UI thread.
+            const bool prof = []{
+                static const bool on = [] {
+                    const char* e = std::getenv("AGENTTY_LOAD_PROF");
+                    return e && *e && *e != '0';
+                }();
+                return on;
+            }();
+            std::FILE* prof_out = nullptr;
+            if (prof) prof_out = std::fopen("/tmp/agentty-load-prof.log", "a");
+            auto stamp = [&](const char* tag, auto t0) {
+                if (!prof_out) return;
+                auto dt = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+                std::fprintf(prof_out, "[load-async] %s: %.2f ms\n", tag, dt);
+                std::fflush(prof_out);
+            };
+            m.d.current = std::move(e.thread);
+            auto t1 = std::chrono::steady_clock::now();
+            rehydrate_frozen(m);
+            stamp("rehydrate_frozen", t1);
+            auto t2 = std::chrono::steady_clock::now();
+            release_to_kernel();
+            stamp("release_to_kernel", t2);
+            if (prof_out) {
+                std::fprintf(prof_out,
+                    "[load-async] msgs=%zu frozen=%zu frozen_through=%zu\n",
+                    m.d.current.messages.size(),
+                    m.ui.frozen.size(),
+                    m.ui.frozen_through);
+                std::fflush(prof_out);
+                std::fclose(prof_out);
+            }
+            return {std::move(m), Cmd<Msg>::commit_scrollback_overflow()};
         },
     }, tm);
 }

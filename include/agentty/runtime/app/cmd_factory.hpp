@@ -73,4 +73,13 @@ namespace agentty::app::cmd {
 // `init()` returns immediately with an empty thread list.
 [[nodiscard]] maya::Cmd<Msg> load_threads_async();
 
+// Parse a single thread's JSON off the UI thread. Dispatched from the
+// thread picker's Enter handler so the synchronous ~30ms-per-thread
+// parse doesn't land between the keypress and the next paint.
+// Dispatches `ThreadLoaded{thread}` on success; on failure (file
+// vanished, parse error) dispatches a `ThreadLoaded` with an empty
+// Thread so the reducer can no-op gracefully without leaving the
+// `thread_loading` flag stuck.
+[[nodiscard]] maya::Cmd<Msg> load_thread_async(ThreadId id);
+
 } // namespace agentty::app::cmd

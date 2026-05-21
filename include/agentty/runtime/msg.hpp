@@ -245,6 +245,10 @@ struct PermissionApproveAlways {};
 struct OpenModelPicker {};
 struct CloseModelPicker {};
 struct ModelPickerMove { int delta; };
+// Absolute-jump nav for long lists. Where::Home/End snap to first/last;
+// PageUp/PageDown step by one viewport (no wrap, clamped at the edges).
+// Saves the user mashing ↑/↓ through hundreds of entries.
+struct ModelPickerJump  { enum class Where { Home, End, PageUp, PageDown }; Where where; };
 struct ModelPickerSelect {};
 struct ModelPickerToggleFavorite {};
 struct ModelsLoaded { std::vector<ModelInfo> models; };
@@ -253,6 +257,8 @@ struct ModelsLoaded { std::vector<ModelInfo> models; };
 struct OpenThreadList {};
 struct CloseThreadList {};
 struct ThreadListMove { int delta; };
+// Absolute-jump nav for long thread histories. See ModelPickerJump.
+struct ThreadListJump  { enum class Where { Home, End, PageUp, PageDown }; Where where; };
 struct ThreadListSelect {};
 struct NewThread {};
 // Result of the background thread-history load kicked off from
@@ -263,6 +269,16 @@ struct NewThread {};
 // `m.d.threads` and a `Cmd::task` that does the directory walk +
 // JSON parse off the UI thread; this Msg lands when it's done.
 struct ThreadsLoaded    { std::vector<Thread> threads; };
+// Result of a background single-thread load kicked off when the user
+// hits Enter on a row in the thread picker. The synchronous load was
+// ~30ms of JSON parse + ~3ms of rehydrate on real threads (786+ msgs)
+// — small individually, but applied directly between the keypress and
+// the next paint it shows up as visible "click and wait". The picker
+// now closes immediately, the old thread stays on screen, and this
+// Msg lands when the new thread's bytes are parsed; the reducer then
+// swaps `m.d.current`, rehydrates the frozen prefix, and commits the
+// scrollback-overflow seam in one go.
+struct ThreadLoaded     { Thread thread; };
 
 // ── Command palette ──────────────────────────────────────────────────────
 struct OpenCommandPalette {};
@@ -413,12 +429,12 @@ using ToolMsg = std::variant<
     PermissionApprove, PermissionReject, PermissionApproveAlways>;
 
 using ModelPickerMsg = std::variant<
-    OpenModelPicker, CloseModelPicker, ModelPickerMove, ModelPickerSelect,
-    ModelPickerToggleFavorite, ModelsLoaded>;
+    OpenModelPicker, CloseModelPicker, ModelPickerMove, ModelPickerJump,
+    ModelPickerSelect, ModelPickerToggleFavorite, ModelsLoaded>;
 
 using ThreadListMsg = std::variant<
-    OpenThreadList, CloseThreadList, ThreadListMove, ThreadListSelect,
-    NewThread, ThreadsLoaded>;
+    OpenThreadList, CloseThreadList, ThreadListMove, ThreadListJump,
+    ThreadListSelect, NewThread, ThreadsLoaded, ThreadLoaded>;
 
 using CommandPaletteMsg = std::variant<
     OpenCommandPalette, CloseCommandPalette, CommandPaletteInput,

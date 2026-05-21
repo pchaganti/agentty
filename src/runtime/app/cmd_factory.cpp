@@ -674,6 +674,31 @@ Cmd<Msg> load_threads_async() {
     });
 }
 
+Cmd<Msg> load_thread_async(ThreadId id) {
+    // task_isolated rather than task: a single big thread (multi-MB,
+    // hundreds of messages) still takes 20-50ms of synchronous parse,
+    // small enough to keep on the worker pool — but isolating matches
+    // the load_threads_async policy and keeps the per-thread parse
+    // off the same pool that tools/stream contend for.
+    return Cmd<Msg>::task_isolated(
+        [id = std::move(id)](std::function<void(Msg)> dispatch) {
+            try {
+                auto loaded = deps().load_thread(id);
+                if (loaded) {
+                    dispatch(ThreadLoaded{std::move(*loaded)});
+                } else {
+                    // Disk read / parse failure: surface an empty
+                    // Thread so the reducer clears `thread_loading`
+                    // and the UI doesn't sit stuck on the spinner.
+                    // Reducer detects empty ThreadId == no swap.
+                    dispatch(ThreadLoaded{Thread{}});
+                }
+            } catch (...) {
+                dispatch(ThreadLoaded{Thread{}});
+            }
+        });
+}
+
 Cmd<Msg> refresh_oauth(std::string refresh_token) {
     return Cmd<Msg>::task(
         [refresh_token = std::move(refresh_token)]
