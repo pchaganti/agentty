@@ -228,9 +228,30 @@ Step submit_message(Model m) {
 
     auto trim = trim_frozen_if_oversized(m);
     auto launch = cmd::launch_stream(m);
-    auto cmd = trim.is_none()
-        ? std::move(launch)
-        : Cmd<Msg>::batch(std::vector<Cmd<Msg>>{std::move(trim), std::move(launch)});
+    // Submit collapses the composer (N rows of typed text → 1 idle
+    // row) AT THE SAME FRAME as the conversation gains the new
+    // User turn + empty Assistant placeholder. On short terminals
+    // the typed-message rows had already overflowed into native
+    // scrollback during streaming-of-typing; after the shrink,
+    // maya's prev_cells still claims those rows as inside the
+    // updatable viewport and the next diff skips them (treating
+    // them as committed scrollback). Result: prior-frame composer
+    // contents stay stranded above the live area with a gap below.
+    //
+    // commit_scrollback_overflow asks maya to advance prev_cells
+    // past whatever has already overflowed (= max(0, prev_rows -
+    // term_h) rows). After it runs, updatable_start drops to 0
+    // and the next diff scans the full common range — every
+    // visible row gets correctly emitted. Non-destructive: the
+    // overflowed rows already live in the terminal's native
+    // scrollback and stay there. Mirrors picker.cpp's thread-swap
+    // discipline (same shape: a wholesale canvas-shape change
+    // that the inline diff can't sweep cleanly on its own).
+    std::vector<Cmd<Msg>> parts;
+    if (!trim.is_none()) parts.push_back(std::move(trim));
+    parts.push_back(Cmd<Msg>::commit_scrollback_overflow());
+    parts.push_back(std::move(launch));
+    auto cmd = Cmd<Msg>::batch(std::move(parts));
     return {std::move(m), std::move(cmd)};
 }
 
