@@ -500,7 +500,17 @@ void append_assistant_tool_panel(maya::Turn::Config& cfg,
             slot.live_agent_timeline[bucket] =
                 std::make_shared<maya::Element>(std::move(built));
         }
-        cfg.body.emplace_back(*slot.live_agent_timeline[bucket]);
+        // Pass the shared_ptr (not a deref'd copy) so maya wraps it in
+        // a ComponentElement keyed on the control block. The renderer's
+        // hash-keyed cell cache then blits the panel as a single rect
+        // every frame instead of walking the whole AgentTimeline
+        // sub-tree (~hundreds to thousands of LayoutNodes per panel
+        // during in-flight runs). The shared_ptr's control block is
+        // stable for as long as live_key is unchanged; when live_key
+        // shifts (1 KiB output bucket, status, spinner bucket, model
+        // id) the slot is reset and the next paint mints a fresh
+        // control block → fresh cache slot → recapture.
+        cfg.body.emplace_back(slot.live_agent_timeline[bucket]);
     }
     // In-flight permission card under the timeline.
     for (const auto& tc : tool_calls) {
