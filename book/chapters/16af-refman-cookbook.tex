@@ -1,0 +1,139 @@
+\chapter{Reference: snippets cookbook}
+\label{ch:refman-cookbook}
+
+\begin{aside}
+Small, copy-pasteable patterns for the situations that come
+up every day. Each is a complete fragment; treat them as
+slot-ins.
+\end{aside}
+
+\section{Conditional border}
+
+\begin{lstlisting}[language=C++]
+auto card = body | pad<1>;
+return active ? card | border_<Heavy> : card | border_<Round>;
+\end{lstlisting}
+
+\section{Build a row from a vector}
+
+\begin{lstlisting}[language=C++]
+std::vector<Element> children;
+for (auto& item : items) children.push_back(text(item));
+return h(children);
+\end{lstlisting}
+
+\section{Dim everything except the focused row}
+
+\begin{lstlisting}[language=C++]
+for (size_t i = 0; i < rows.size(); ++i) {
+    if (static_cast<int>(i) != selected) rows[i] = rows[i] | Dim;
+}
+\end{lstlisting}
+
+\section{Right-justify a value}
+
+\begin{lstlisting}[language=C++]
+h(text(label), spacer_, text(value) | Bold)
+\end{lstlisting}
+
+\section{Centred title above content}
+
+\begin{lstlisting}[language=C++]
+v(
+    center(text(title) | Bold),
+    blank_,
+    content
+)
+\end{lstlisting}
+
+\section{Status bar at the bottom}
+
+\begin{lstlisting}[language=C++]
+return v(
+    body | flex<1>,
+    h(t<"ready">, spacer_, text(time)) | Bg<30, 30, 40>
+);
+\end{lstlisting}
+
+\section{Quit on Escape or Ctrl-C}
+
+\begin{lstlisting}[language=C++]
+return key_map<Msg>({
+    {SpecialKey::Escape, Quit{}},
+    {ctrl('c'),          Quit{}},
+});
+\end{lstlisting}
+
+\section{Toggle a flag with a key}
+
+\begin{lstlisting}[language=C++]
+[&](Toggle) { m.flag = !m.flag; return std::pair{m, Cmd<Msg>{}}; }
+\end{lstlisting}
+
+\section{Auto-clear flash after a delay}
+
+\begin{lstlisting}[language=C++]
+[&](Flash) {
+    m.show = true;
+    return std::pair{m,
+        Cmd<Msg>::after(std::chrono::milliseconds(500),
+                        ClearFlash{})};
+}
+\end{lstlisting}
+
+\section{Two-column responsive layout}
+
+\begin{lstlisting}[language=C++]
+if (width >= 80) {
+    return h(left | flex<1>, right | flex<1>);
+}
+return v(left, right);
+\end{lstlisting}
+
+\section{Show a "loading" placeholder}
+
+\begin{lstlisting}[language=C++]
+when(m.loading,
+    t<"loading..."> | Dim,
+    text(m.data));
+\end{lstlisting}
+
+\section{Number formatting helpers}
+
+\begin{lstlisting}[language=C++]
+auto pct  = std::format("{:>3}\%", static_cast<int>(f * 100));
+auto kb   = std::format("{:>6} KB", bytes / 1024);
+auto time = std::format("{:02}:{:02}", mins, secs);
+\end{lstlisting}
+
+\section{A horizontal rule}
+
+\begin{lstlisting}[language=C++]
+text(std::string(40, '-')) | Dim
+\end{lstlisting}
+
+\section{Notes}
+
+\begin{itemize}[leftmargin=*]
+  \item Snippets above are fragments; drop them into a real
+    \code{Program} skeleton.
+  \item Adapt the literals; the shape is what matters.
+\end{itemize}
+
+\section{Recap}
+
+\begin{recap}
+\begin{itemize}[leftmargin=*]
+  \item A dozen patterns; every day's UI work.
+  \item Copy, paste, adapt.
+\end{itemize}
+\end{recap}
+
+\section*{Workshop}
+
+\begin{enumerate}[leftmargin=*]
+  \item Add three patterns of your own from your last
+    project.
+  \item Wrap each as a function returning \code{Element}.
+  \item Build a "starter kit" header.
+\end{enumerate}

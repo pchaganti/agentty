@@ -1,0 +1,81 @@
+\chapter{Reference: \code{print} (one-shot)}
+\label{ch:refman-print}
+
+\begin{aside}
+\code{maya::print} renders a single element to stdout
+inline. No alt-screen, no raw mode, no event loop. The
+output joins the terminal's normal scrollback and the
+function returns.
+\end{aside}
+
+\section{Signature}
+
+\begin{lstlisting}[language=C++]
+namespace maya {
+    void print(Element e);
+}
+\end{lstlisting}
+
+\section{Working example}
+
+\begin{lstlisting}[language=C++]
+#include <maya/maya.hpp>
+
+using namespace maya;
+using namespace maya::dsl;
+
+int main() {
+    print(
+        v(
+            t<"build complete"> | Bold | Fg<100, 220, 120>,
+            blank_,
+            text("warnings: 0") | Dim,
+            text("errors:   0") | Dim
+        ) | pad<1> | border_<Round>
+    );
+
+    print(t<"goodbye"> | Dim);
+    return 0;
+}
+\end{lstlisting}
+
+\section{When to use it}
+
+\begin{itemize}[leftmargin=*]
+  \item Build tool summaries.
+  \item CLI status reports.
+  \item One-off cards in scripts.
+  \item Anywhere you'd otherwise write a sequence of
+    \code{std::cout} lines.
+\end{itemize}
+
+\section{Notes}
+
+\begin{itemize}[leftmargin=*]
+  \item Each call writes a complete frame and a newline; the
+    next call starts fresh below.
+  \item Style escapes are emitted only if the terminal
+    supports them; piping to a file strips them.
+  \item No state survives between calls.
+\end{itemize}
+
+\section{Recap}
+
+\begin{recap}
+\begin{itemize}[leftmargin=*]
+  \item One element in, one frame out.
+  \item Inline; no alt-screen.
+  \item Perfect for CLI output.
+\end{itemize}
+\end{recap}
+
+\section*{Workshop}
+
+\begin{enumerate}[leftmargin=*]
+  \item Replace a multi-line \code{printf} with \code{print}
+    in an existing tool.
+  \item Build a "summary card" helper that takes a title and
+    a list of pairs.
+  \item Pipe the output to \code{cat} and confirm the
+    escapes are gone.
+\end{enumerate}

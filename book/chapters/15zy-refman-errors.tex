@@ -1,0 +1,124 @@
+\chapter{Reference: errors and recovery}
+\label{ch:refman-errors}
+
+\begin{aside}
+Things will go wrong. Files won't open. Network calls will
+fail. Subprocesses will exit nonzero. Handle every failure
+in \code{update}; show the user something humane.
+\end{aside}
+
+\section{Working example}
+
+\begin{lstlisting}[language=C++]
+#include <maya/maya.hpp>
+#include <fstream>
+#include <sstream>
+
+using namespace maya;
+using namespace maya::dsl;
+
+struct Errors {
+    struct Model {
+        std::string content;
+        std::string error;
+    };
+    struct LoadOk { std::string body; };
+    struct LoadErr { std::string msg; };
+    struct Load {};
+    struct Quit {};
+    using Msg = std::variant<Load, LoadOk, LoadErr, Quit>;
+
+    static Model init() { return {}; }
+
+    static auto update(Model m, Msg msg)
+        -> std::pair<Model, Cmd<Msg>>
+    {
+        return std::visit(overload{
+            [&](Load) {
+                auto task = []() -> std::variant<std::string, std::string> {
+                    std::ifstream f("/etc/hostname");
+                    if (!f) return std::variant<std::string, std::string>{
+                        std::in_place_index<1>,
+                        "could not open /etc/hostname"
+                    };
+                    std::stringstream ss;
+                    ss << f.rdbuf();
+                    return std::variant<std::string, std::string>{
+                        std::in_place_index<0>, ss.str()
+                    };
+                };
+                return std::pair{m, Cmd<Msg>::task(task,
+                    [](auto v) -> Msg {
+                        if (v.index() == 0) return LoadOk{std::get<0>(v)};
+                        return LoadErr{std::get<1>(v)};
+                    })};
+            },
+            [&](LoadOk ok) {
+                m.content = ok.body;
+                m.error.clear();
+                return std::pair{m, Cmd<Msg>{}};
+            },
+            [&](LoadErr e) {
+                m.error = e.msg;
+                return std::pair{m, Cmd<Msg>{}};
+            },
+            [](Quit) {
+                return std::pair{Model{}, Cmd<Msg>::quit()};
+            },
+        }, msg);
+    }
+
+    static Element view(const Model& m) {
+        return v(
+            t<"file viewer"> | Bold,
+            blank_,
+            when(!m.error.empty(),
+                v(
+                    t<"error"> | Bold | Fg<255, 80, 80>,
+                    text(m.error) | Fg<255, 180, 180>
+                ),
+                text(m.content)),
+            blank_,
+            t<"l load, q quit"> | Dim
+        ) | pad<1> | border_<Round>;
+    }
+
+    static auto subscribe(const Model&) -> Sub<Msg> {
+        return key_map<Msg>({
+            {'q', Quit{}},
+            {'l', Load{}},
+        });
+    }
+};
+
+int main() { run<Errors>({.title = "errors"}); }
+\end{lstlisting}
+
+\section{Notes}
+
+\begin{itemize}[leftmargin=*]
+  \item Errors are data; carry them in the Model just like
+    any other field.
+  \item Don't throw across the task boundary; encode failures
+    as variants and dispatch.
+  \item Provide a retry path; a stuck error message is
+    almost as bad as a crash.
+\end{itemize}
+
+\section{Recap}
+
+\begin{recap}
+\begin{itemize}[leftmargin=*]
+  \item Errors are messages.
+  \item Variant of OK / err results from tasks.
+  \item Render the error in the same view; offer retry.
+\end{itemize}
+\end{recap}
+
+\section*{Workshop}
+
+\begin{enumerate}[leftmargin=*]
+  \item Add a retry key when an error is showing.
+  \item Auto-clear errors after five seconds.
+  \item Log errors to a file alongside the UI.
+\end{enumerate}

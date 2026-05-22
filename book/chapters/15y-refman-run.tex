@@ -1,0 +1,118 @@
+\chapter{Reference: \code{run} and \code{RunConfig}}
+\label{ch:refman-run}
+
+\begin{aside}
+\code{run<P>} is the front door. It hands control of stdin,
+stdout, and the terminal modes to \maya{}, executes your
+program, then politely puts everything back.
+\end{aside}
+
+\section{Signature}
+
+\begin{lstlisting}[language=C++]
+template <Program P>
+int run(RunConfig cfg = {});
+\end{lstlisting}
+
+\noindent Returns the process exit code (\code{0} on
+graceful quit).
+
+\section{RunConfig fields}
+
+\begin{itemize}[leftmargin=*]
+  \item \code{title}: window title, where supported.
+  \item \code{alt\_screen}: switch to the alternate screen
+    on start, restore on exit. Default \code{true}.
+  \item \code{mouse}: enable mouse reporting. Default
+    \code{false}.
+  \item \code{fps}: target frame rate. Default \code{60}.
+  \item \code{cursor}: \code{Hidden}, \code{Block}, or
+    \code{Bar}. Default \code{Hidden}.
+\end{itemize}
+
+\section{Working example}
+
+\begin{lstlisting}[language=C++]
+#include <maya/maya.hpp>
+
+using namespace maya;
+using namespace maya::dsl;
+
+struct Demo {
+    struct Model { int frames = 0; };
+    struct Tick {};
+    struct Quit {};
+    using Msg = std::variant<Tick, Quit>;
+
+    static Model init() { return {}; }
+
+    static auto update(Model m, Msg msg)
+        -> std::pair<Model, Cmd<Msg>>
+    {
+        return std::visit(overload{
+            [&](Tick) { m.frames++; return std::pair{m, Cmd<Msg>{}}; },
+            [](Quit)  { return std::pair{Model{}, Cmd<Msg>::quit()}; },
+        }, msg);
+    }
+
+    static Element view(const Model& m) {
+        return v(
+            t<"run() demo"> | Bold,
+            blank_,
+            text(std::format("frames: {}", m.frames)),
+            blank_,
+            t<"q to quit"> | Dim
+        ) | pad<1> | border_<Round>;
+    }
+
+    static auto subscribe(const Model&) -> Sub<Msg> {
+        return Sub<Msg>::batch(
+            key_map<Msg>({ {'q', Quit{}} }),
+            Sub<Msg>::every(std::chrono::milliseconds(16), Tick{})
+        );
+    }
+};
+
+int main() {
+    return run<Demo>({
+        .title      = "demo",
+        .alt_screen = true,
+        .mouse      = false,
+        .fps        = 60,
+    });
+}
+\end{lstlisting}
+
+\section{Notes}
+
+\begin{itemize}[leftmargin=*]
+  \item Returning from \code{main} after \code{run} is fine;
+    the runtime restores the terminal on its own.
+  \item If \code{alt\_screen} is \code{false}, output stays
+    in scrollback. Good for tools whose output you want to
+    \code{grep} later.
+  \item \code{fps} caps the loop, it does not force frames.
+    Idle frames are skipped.
+  \item Setting \code{mouse = true} is necessary before any
+    mouse event will reach your \code{subscribe}.
+\end{itemize}
+
+\section{Recap}
+
+\begin{recap}
+\begin{itemize}[leftmargin=*]
+  \item One function, one config struct.
+  \item Title, alt-screen, mouse, fps, cursor.
+  \item Returns an exit code.
+\end{itemize}
+\end{recap}
+
+\section*{Workshop}
+
+\begin{enumerate}[leftmargin=*]
+  \item Flip \code{alt\_screen} to \code{false}. Watch the
+    UI render in scrollback.
+  \item Lower \code{fps} to \code{5}. Notice the change.
+  \item Enable \code{mouse} and add a mouse handler in
+    \code{subscribe}.
+\end{enumerate}

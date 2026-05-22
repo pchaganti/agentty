@@ -1,0 +1,116 @@
+\chapter{Reference: mouse}
+\label{ch:refman-mouse}
+
+\begin{aside}
+Mouse support is opt-in. Set \code{RunConfig::mouse = true},
+add a mouse handler in \code{subscribe}, and clicks /
+scrolls / drags arrive as messages.
+\end{aside}
+
+\section{Event types}
+
+\begin{itemize}[leftmargin=*]
+  \item \code{MouseButton::Left}, \code{Middle},
+    \code{Right}.
+  \item \code{MouseKind::Press}, \code{Release},
+    \code{Drag}, \code{Move}.
+  \item Wheel: \code{MouseButton::WheelUp},
+    \code{WheelDown}.
+\end{itemize}
+
+\section{Working example}
+
+\begin{lstlisting}[language=C++]
+#include <maya/maya.hpp>
+
+using namespace maya;
+using namespace maya::dsl;
+
+struct MouseDemo {
+    struct Model {
+        int x = 0, y = 0;
+        std::string last = "(none)";
+    };
+    struct MouseEvt { int x; int y; std::string label; };
+    struct Quit {};
+    using Msg = std::variant<MouseEvt, Quit>;
+
+    static Model init() { return {}; }
+
+    static auto update(Model m, Msg msg)
+        -> std::pair<Model, Cmd<Msg>>
+    {
+        return std::visit(overload{
+            [&](MouseEvt e) {
+                m.x = e.x; m.y = e.y; m.last = e.label;
+                return std::pair{m, Cmd<Msg>{}};
+            },
+            [](Quit) {
+                return std::pair{Model{}, Cmd<Msg>::quit()};
+            },
+        }, msg);
+    }
+
+    static Element view(const Model& m) {
+        return v(
+            text(std::format("pos: ({}, {})", m.x, m.y)),
+            text(std::format("evt: {}", m.last)),
+            blank_,
+            t<"click anywhere, q to quit"> | Dim
+        ) | pad<1> | border_<Round>;
+    }
+
+    static auto subscribe(const Model&) -> Sub<Msg> {
+        return Sub<Msg>::batch(
+            key_map<Msg>({ {'q', Quit{}} }),
+            mouse_map<Msg>([](MouseEvent e) -> Msg {
+                std::string lbl;
+                switch (e.kind) {
+                    case MouseKind::Press:   lbl = "press"; break;
+                    case MouseKind::Release: lbl = "release"; break;
+                    case MouseKind::Drag:    lbl = "drag"; break;
+                    case MouseKind::Move:    lbl = "move"; break;
+                }
+                return MouseEvt{e.x, e.y, lbl};
+            })
+        );
+    }
+};
+
+int main() {
+    return run<MouseDemo>({
+        .title = "mouse",
+        .mouse = true,
+    });
+}
+\end{lstlisting}
+
+\section{Notes}
+
+\begin{itemize}[leftmargin=*]
+  \item Coordinates are zero-based; \code{(0, 0)} is the
+    top-left cell.
+  \item Some terminals require additional config to forward
+    mouse events through tmux/screen.
+  \item Selection-by-drag in the terminal may conflict with
+    \maya{} mouse capture; users hold Shift to override.
+\end{itemize}
+
+\section{Recap}
+
+\begin{recap}
+\begin{itemize}[leftmargin=*]
+  \item Opt in via \code{RunConfig}.
+  \item Press, release, drag, move, wheel.
+  \item Coordinates in terminal cells.
+\end{itemize}
+\end{recap}
+
+\section*{Workshop}
+
+\begin{enumerate}[leftmargin=*]
+  \item Build a clickable button: highlight on press,
+    fire a command on release.
+  \item Implement drag-to-scroll on a long list.
+  \item Show a tooltip on hover.
+\end{enumerate}

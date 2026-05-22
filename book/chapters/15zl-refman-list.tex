@@ -1,0 +1,114 @@
+\chapter{Reference: lists and selection}
+\label{ch:refman-list}
+
+\begin{aside}
+A scrolling list of items with a highlighted selection.
+Build it from rows and a model index; \maya{} ships nothing
+fancier than that because nothing fancier is needed.
+\end{aside}
+
+\section{Working example}
+
+\begin{lstlisting}[language=C++]
+#include <maya/maya.hpp>
+#include <vector>
+
+using namespace maya;
+using namespace maya::dsl;
+
+struct ListDemo {
+    struct Model {
+        std::vector<std::string> items{
+            "alpha", "beta", "gamma", "delta",
+            "epsilon", "zeta", "eta", "theta"
+        };
+        int selected = 0;
+    };
+    struct Up {};
+    struct Down {};
+    struct Choose {};
+    struct Quit {};
+    using Msg = std::variant<Up, Down, Choose, Quit>;
+
+    static Model init() { return {}; }
+
+    static auto update(Model m, Msg msg)
+        -> std::pair<Model, Cmd<Msg>>
+    {
+        return std::visit(overload{
+            [&](Up) {
+                m.selected = std::max(0, m.selected - 1);
+                return std::pair{m, Cmd<Msg>{}};
+            },
+            [&](Down) {
+                int n = static_cast<int>(m.items.size());
+                m.selected = std::min(n - 1, m.selected + 1);
+                return std::pair{m, Cmd<Msg>{}};
+            },
+            [&](Choose) { return std::pair{m, Cmd<Msg>{}}; },
+            [](Quit) {
+                return std::pair{Model{}, Cmd<Msg>::quit()};
+            },
+        }, msg);
+    }
+
+    static Element view(const Model& m) {
+        std::vector<Element> rows;
+        for (size_t i = 0; i < m.items.size(); ++i) {
+            auto label = text(m.items[i]);
+            if (static_cast<int>(i) == m.selected) {
+                rows.push_back(
+                    h(t<"> ">, label | Bold) | Bg<40, 80, 140>);
+            } else {
+                rows.push_back(h(t<"  ">, label));
+            }
+        }
+        return v(
+            t<"pick one"> | Bold,
+            blank_,
+            v(rows),
+            blank_,
+            t<"up/down move, enter choose, q quit"> | Dim
+        ) | pad<1> | border_<Round>;
+    }
+
+    static auto subscribe(const Model&) -> Sub<Msg> {
+        return key_map<Msg>({
+            {'q', Quit{}},
+            {SpecialKey::Up,    Up{}},
+            {SpecialKey::Down,  Down{}},
+            {SpecialKey::Enter, Choose{}},
+        });
+    }
+};
+
+int main() { run<ListDemo>({.title = "list"}); }
+\end{lstlisting}
+
+\section{Notes}
+
+\begin{itemize}[leftmargin=*]
+  \item For long lists, clip a window of items around the
+    selection; rendering off-screen rows costs.
+  \item Use \code{Bg<...>} on the selected row; readers
+    parse highlight faster than markers.
+  \item Pair with \code{home}/\code{end} for jump-to-edges.
+\end{itemize}
+
+\section{Recap}
+
+\begin{recap}
+\begin{itemize}[leftmargin=*]
+  \item Build rows; mark one selected.
+  \item Up / Down adjust a single index.
+  \item Clip to a window for large lists.
+\end{itemize}
+\end{recap}
+
+\section*{Workshop}
+
+\begin{enumerate}[leftmargin=*]
+  \item Add a filter input that prunes the visible items.
+  \item Show the index and total in the footer.
+  \item Implement multi-select with \code{space} to toggle.
+\end{enumerate}

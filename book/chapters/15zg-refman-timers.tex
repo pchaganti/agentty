@@ -1,0 +1,117 @@
+\chapter{Reference: timers and ticks}
+\label{ch:refman-timers}
+
+\begin{aside}
+Periodic time-driven messages. Use them for animation,
+polling, and anything else that needs to wake up on a
+schedule.
+\end{aside}
+
+\section{Forms}
+
+\begin{itemize}[leftmargin=*]
+  \item \code{Sub<Msg>::every(duration, msg)}: send \code{msg}
+    every \code{duration}.
+  \item \code{Cmd<Msg>::after(duration, msg)}: send
+    \code{msg} once, \code{duration} from now.
+\end{itemize}
+
+\section{Working example}
+
+\begin{lstlisting}[language=C++]
+#include <maya/maya.hpp>
+#include <chrono>
+
+using namespace maya;
+using namespace maya::dsl;
+
+struct Timer {
+    struct Model {
+        int seconds = 0;
+        bool flashed = false;
+    };
+    struct Tick {};
+    struct Flash {};
+    struct ClearFlash {};
+    struct Quit {};
+    using Msg = std::variant<Tick, Flash, ClearFlash, Quit>;
+
+    static Model init() { return {}; }
+
+    static auto update(Model m, Msg msg)
+        -> std::pair<Model, Cmd<Msg>>
+    {
+        return std::visit(overload{
+            [&](Tick) {
+                m.seconds++;
+                return std::pair{m, Cmd<Msg>{}};
+            },
+            [&](Flash) {
+                m.flashed = true;
+                return std::pair{m,
+                    Cmd<Msg>::after(std::chrono::milliseconds(500),
+                                    ClearFlash{})};
+            },
+            [&](ClearFlash) {
+                m.flashed = false;
+                return std::pair{m, Cmd<Msg>{}};
+            },
+            [](Quit) {
+                return std::pair{Model{}, Cmd<Msg>::quit()};
+            },
+        }, msg);
+    }
+
+    static Element view(const Model& m) {
+        auto label = std::format("elapsed: {}s", m.seconds);
+        return v(
+            when(m.flashed,
+                text(label) | Bold | Fg<255, 220, 80>,
+                text(label) | Bold),
+            blank_,
+            t<"f flash, q quit"> | Dim
+        ) | pad<1> | border_<Round>;
+    }
+
+    static auto subscribe(const Model&) -> Sub<Msg> {
+        return Sub<Msg>::batch(
+            key_map<Msg>({
+                {'q', Quit{}},
+                {'f', Flash{}},
+            }),
+            Sub<Msg>::every(std::chrono::seconds(1), Tick{})
+        );
+    }
+};
+
+int main() { run<Timer>({.title = "timer"}); }
+\end{lstlisting}
+
+\section{Notes}
+
+\begin{itemize}[leftmargin=*]
+  \item Resolution is bounded by your \code{fps}; finer
+    timers fire on the next available frame.
+  \item \code{after} is "fire once" — don't use it for
+    repeats.
+  \item Timers do not drift; they're scheduled against a
+    monotonic clock.
+\end{itemize}
+
+\section{Recap}
+
+\begin{recap}
+\begin{itemize}[leftmargin=*]
+  \item \code{every} for repeats, \code{after} for one-shots.
+  \item Resolution is frame-bounded.
+  \item Use \code{after} to clear transient highlights.
+\end{itemize}
+\end{recap}
+
+\section*{Workshop}
+
+\begin{enumerate}[leftmargin=*]
+  \item Animate a spinner using \code{every(80ms, ...)}.
+  \item Show a "saved" toast for two seconds, then clear.
+  \item Build a Pomodoro timer with 25-minute work blocks.
+\end{enumerate}

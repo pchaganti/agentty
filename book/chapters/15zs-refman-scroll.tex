@@ -1,0 +1,125 @@
+\chapter{Reference: scroll regions}
+\label{ch:refman-scroll}
+
+\begin{aside}
+Long content in a small window means a scrollable region.
+Keep an offset in the Model; slice the content by the
+offset; render only the visible window.
+\end{aside}
+
+\section{Working example}
+
+\begin{lstlisting}[language=C++]
+#include <maya/maya.hpp>
+#include <vector>
+
+using namespace maya;
+using namespace maya::dsl;
+
+struct Scroll {
+    static constexpr int kVisible = 8;
+    struct Model {
+        std::vector<std::string> lines;
+        int offset = 0;
+    };
+    struct Up {};
+    struct Down {};
+    struct PageUp {};
+    struct PageDown {};
+    struct Quit {};
+    using Msg = std::variant<Up, Down, PageUp, PageDown, Quit>;
+
+    static Model init() {
+        Model m;
+        for (int i = 0; i < 60; ++i) {
+            m.lines.push_back(std::format("line {:03d}", i));
+        }
+        return m;
+    }
+
+    static auto update(Model m, Msg msg)
+        -> std::pair<Model, Cmd<Msg>>
+    {
+        int max_off = std::max(0,
+            static_cast<int>(m.lines.size()) - kVisible);
+        return std::visit(overload{
+            [&](Up) {
+                m.offset = std::max(0, m.offset - 1);
+                return std::pair{m, Cmd<Msg>{}};
+            },
+            [&](Down) {
+                m.offset = std::min(max_off, m.offset + 1);
+                return std::pair{m, Cmd<Msg>{}};
+            },
+            [&](PageUp) {
+                m.offset = std::max(0, m.offset - kVisible);
+                return std::pair{m, Cmd<Msg>{}};
+            },
+            [&](PageDown) {
+                m.offset = std::min(max_off, m.offset + kVisible);
+                return std::pair{m, Cmd<Msg>{}};
+            },
+            [](Quit) {
+                return std::pair{Model{}, Cmd<Msg>::quit()};
+            },
+        }, msg);
+    }
+
+    static Element view(const Model& m) {
+        std::vector<Element> visible;
+        int start = m.offset;
+        int end   = std::min(start + kVisible,
+                             static_cast<int>(m.lines.size()));
+        for (int i = start; i < end; ++i) {
+            visible.push_back(text(m.lines[i]));
+        }
+        return v(
+            v(visible),
+            blank_,
+            text(std::format("{} / {}",
+                m.offset + 1, m.lines.size())) | Dim
+        ) | pad<1> | border_<Round>;
+    }
+
+    static auto subscribe(const Model&) -> Sub<Msg> {
+        return key_map<Msg>({
+            {'q', Quit{}},
+            {SpecialKey::Up,       Up{}},
+            {SpecialKey::Down,     Down{}},
+            {SpecialKey::PageUp,   PageUp{}},
+            {SpecialKey::PageDown, PageDown{}},
+        });
+    }
+};
+
+int main() { run<Scroll>({.title = "scroll"}); }
+\end{lstlisting}
+
+\section{Notes}
+
+\begin{itemize}[leftmargin=*]
+  \item Slice in render, not in update; the Model stores
+    only the offset.
+  \item Clamp the offset both directions; users will mash
+    arrow keys past the edges.
+  \item For very long content, render a scrollbar from the
+    offset and total ratio.
+\end{itemize}
+
+\section{Recap}
+
+\begin{recap}
+\begin{itemize}[leftmargin=*]
+  \item Offset in Model; slice in view.
+  \item Clamp at both edges.
+  \item Show position as "n / total".
+\end{itemize}
+\end{recap}
+
+\section*{Workshop}
+
+\begin{enumerate}[leftmargin=*]
+  \item Add a scrollbar in the right margin.
+  \item Auto-scroll to the bottom when new lines arrive.
+  \item Implement \code{g} to jump home, \code{G} to end.
+\end{enumerate}

@@ -1,0 +1,211 @@
+\chapter{Reference: complete example apps}
+\label{ch:refman-apps}
+
+\begin{aside}
+The previous chapters showed one feature at a time. This
+one shows three short but complete programs. Each is small
+enough to read in one sitting and exercises several
+features at once.
+\end{aside}
+
+\section{App 1: ToDo list}
+
+\begin{lstlisting}[language=C++]
+#include <maya/maya.hpp>
+#include <vector>
+#include <string>
+
+using namespace maya;
+using namespace maya::dsl;
+
+struct Todo {
+    struct Item { std::string text; bool done = false; };
+    struct Model {
+        std::vector<Item> items;
+        std::string buffer;
+        int selected = 0;
+    };
+    struct Type { char c; };
+    struct Back {};
+    struct Add {};
+    struct Toggle {};
+    struct Up {};
+    struct Down {};
+    struct Quit {};
+    using Msg = std::variant<Type, Back, Add, Toggle, Up, Down, Quit>;
+
+    static Model init() { return {}; }
+
+    static auto update(Model m, Msg msg)
+        -> std::pair<Model, Cmd<Msg>>
+    {
+        return std::visit(overload{
+            [&](Type t) { m.buffer.push_back(t.c); return std::pair{m, Cmd<Msg>{}}; },
+            [&](Back) {
+                if (!m.buffer.empty()) m.buffer.pop_back();
+                return std::pair{m, Cmd<Msg>{}};
+            },
+            [&](Add) {
+                if (!m.buffer.empty()) {
+                    m.items.push_back({m.buffer, false});
+                    m.buffer.clear();
+                }
+                return std::pair{m, Cmd<Msg>{}};
+            },
+            [&](Toggle) {
+                if (!m.items.empty() && m.selected < static_cast<int>(m.items.size())) {
+                    m.items[m.selected].done = !m.items[m.selected].done;
+                }
+                return std::pair{m, Cmd<Msg>{}};
+            },
+            [&](Up) {
+                m.selected = std::max(0, m.selected - 1);
+                return std::pair{m, Cmd<Msg>{}};
+            },
+            [&](Down) {
+                int n = static_cast<int>(m.items.size());
+                m.selected = std::min(std::max(0, n - 1), m.selected + 1);
+                return std::pair{m, Cmd<Msg>{}};
+            },
+            [](Quit) { return std::pair{Model{}, Cmd<Msg>::quit()}; },
+        }, msg);
+    }
+
+    static Element view(const Model& m) {
+        std::vector<Element> rows;
+        for (size_t i = 0; i < m.items.size(); ++i) {
+            auto& it = m.items[i];
+            auto mark = it.done ? "[x] " : "[ ] ";
+            auto line = h(text(mark), text(it.text));
+            if (static_cast<int>(i) == m.selected) line = line | Bold | Bg<40, 80, 140>;
+            if (it.done) line = line | Dim;
+            rows.push_back(line);
+        }
+        return v(
+            t<"todo"> | Bold,
+            blank_,
+            v(rows),
+            blank_,
+            h(t<"add: ">, text(m.buffer), text("_") | Blink),
+            blank_,
+            t<"enter add, space toggle, up/down move, q quit"> | Dim
+        ) | pad<1> | border_<Round>;
+    }
+
+    static auto subscribe(const Model&) -> Sub<Msg> {
+        std::vector<std::pair<KeyEvent, Msg>> binds;
+        for (char c = ' '; c < 127; ++c) binds.push_back({c, Type{c}});
+        binds.push_back({SpecialKey::Backspace, Back{}});
+        binds.push_back({SpecialKey::Enter,     Add{}});
+        binds.push_back({' ',                   Toggle{}});
+        binds.push_back({SpecialKey::Up,        Up{}});
+        binds.push_back({SpecialKey::Down,      Down{}});
+        binds.push_back({ctrl('c'),             Quit{}});
+        return key_map<Msg>(std::move(binds));
+    }
+};
+
+int main() { run<Todo>({.title = "todo"}); }
+\end{lstlisting}
+
+\section{App 2: live system stats}
+
+A version of \code{sysmon} small enough to fit on one page,
+suitable as a starting point.
+
+\begin{lstlisting}[language=C++]
+#include <maya/maya.hpp>
+#include <chrono>
+#include <random>
+
+using namespace maya;
+using namespace maya::dsl;
+
+struct Stats {
+    struct Model {
+        std::vector<float> cpu;
+        std::vector<float> mem;
+        std::mt19937 rng{42};
+    };
+    struct Tick {};
+    struct Quit {};
+    using Msg = std::variant<Tick, Quit>;
+
+    static Model init() { return {}; }
+
+    static auto update(Model m, Msg msg)
+        -> std::pair<Model, Cmd<Msg>>
+    {
+        return std::visit(overload{
+            [&](Tick) {
+                std::uniform_real_distribution<float> d(0.f, 1.f);
+                m.cpu.push_back(d(m.rng));
+                m.mem.push_back(d(m.rng));
+                if (m.cpu.size() > 40) m.cpu.erase(m.cpu.begin());
+                if (m.mem.size() > 40) m.mem.erase(m.mem.begin());
+                return std::pair{m, Cmd<Msg>{}};
+            },
+            [](Quit) { return std::pair{Model{}, Cmd<Msg>::quit()}; },
+        }, msg);
+    }
+
+    static Element spark(const std::vector<float>& data) {
+        const char* glyphs[] = {".", ":", "-", "=", "*", "#"};
+        std::string s;
+        for (float v : data) {
+            int idx = std::min(5,
+                std::max(0, static_cast<int>(v * 6)));
+            s += glyphs[idx];
+        }
+        return text(s);
+    }
+
+    static Element view(const Model& m) {
+        return v(
+            t<"system">  | Bold,
+            blank_,
+            h(t<"cpu: ">, spark(m.cpu) | Fg<255, 200, 100>),
+            h(t<"mem: ">, spark(m.mem) | Fg<100, 200, 255>),
+            blank_,
+            t<"q quit"> | Dim
+        ) | pad<1> | border_<Round>;
+    }
+
+    static auto subscribe(const Model&) -> Sub<Msg> {
+        return Sub<Msg>::batch(
+            key_map<Msg>({ {'q', Quit{}} }),
+            Sub<Msg>::every(std::chrono::milliseconds(200),
+                            Tick{})
+        );
+    }
+};
+
+int main() { run<Stats>({.title = "stats"}); }
+\end{lstlisting}
+
+\section{Notes}
+
+\begin{itemize}[leftmargin=*]
+  \item Both apps fit in under 100 lines.
+  \item Both are pure aside from the timer (and the
+    todo's buffer-as-state).
+  \item Both can be extended without restructuring.
+\end{itemize}
+
+\section{Recap}
+
+\begin{recap}
+\begin{itemize}[leftmargin=*]
+  \item Small apps are a few dozen lines each.
+  \item Same skeleton every time.
+  \item The grammar is small; the vocabulary is wide.
+\end{itemize}
+\end{recap}
+
+\section*{Workshop}
+
+\begin{enumerate}[leftmargin=*]
+  \item Add a "clear all" key to the todo.
+  \item Replace the random source in stats with real \code{/proc} reads.
+  \item Combine both into a tab-switched app.
+\end{enumerate}

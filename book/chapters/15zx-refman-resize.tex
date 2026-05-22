@@ -1,0 +1,103 @@
+\chapter{Reference: resize handling}
+\label{ch:refman-resize}
+
+\begin{aside}
+Terminals are rubber. The window resizes; \maya{} re-runs
+layout; your job is to keep the Model in shape and let
+\code{view} adapt.
+\end{aside}
+
+\section{Working example}
+
+\begin{lstlisting}[language=C++]
+#include <maya/maya.hpp>
+
+using namespace maya;
+using namespace maya::dsl;
+
+struct ResizeDemo {
+    struct Model { int w = 80, h = 24; };
+    struct OnResize { int w; int h; };
+    struct Quit {};
+    using Msg = std::variant<OnResize, Quit>;
+
+    static Model init() { return {}; }
+
+    static auto update(Model m, Msg msg)
+        -> std::pair<Model, Cmd<Msg>>
+    {
+        return std::visit(overload{
+            [&](OnResize r) {
+                m.w = r.w; m.h = r.h;
+                return std::pair{m, Cmd<Msg>{}};
+            },
+            [](Quit) {
+                return std::pair{Model{}, Cmd<Msg>::quit()};
+            },
+        }, msg);
+    }
+
+    static Element view(const Model& m) {
+        // Adapt layout based on width.
+        if (m.w < 50) {
+            return v(
+                text(std::format("{}x{}", m.w, m.h)) | Bold,
+                t<"narrow mode"> | Dim
+            ) | pad<1> | border_<Round>;
+        }
+        return v(
+            h(
+                t<"left">  | Bold,
+                spacer_,
+                text(std::format("{}x{}", m.w, m.h)),
+                spacer_,
+                t<"right"> | Bold
+            ),
+            blank_,
+            t<"wide mode"> | Dim
+        ) | pad<1> | border_<Round>;
+    }
+
+    static auto subscribe(const Model&) -> Sub<Msg> {
+        return Sub<Msg>::batch(
+            key_map<Msg>({ {'q', Quit{}} }),
+            Sub<Msg>::on_resize([](int w, int h) {
+                return OnResize{w, h};
+            })
+        );
+    }
+};
+
+int main() { run<ResizeDemo>({.title = "resize"}); }
+\end{lstlisting}
+
+\section{Notes}
+
+\begin{itemize}[leftmargin=*]
+  \item Resize messages arrive between frames. Layout is
+    always against current dimensions; you don't have to
+    re-trigger anything.
+  \item Use width thresholds to switch between layouts
+    (narrow / wide).
+  \item Test below 40 columns; expect users on phone
+    terminals and tmux splits.
+\end{itemize}
+
+\section{Recap}
+
+\begin{recap}
+\begin{itemize}[leftmargin=*]
+  \item Subscribe with \code{on\_resize}.
+  \item Store width/height in the Model.
+  \item Branch \code{view} on size for responsive layouts.
+\end{itemize}
+\end{recap}
+
+\section*{Workshop}
+
+\begin{enumerate}[leftmargin=*]
+  \item Show a different layout below 60 columns.
+  \item Hide secondary panels when height is small.
+  \item Print a friendly "too small" placeholder under
+    20x5.
+\end{enumerate}

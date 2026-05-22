@@ -1,0 +1,103 @@
+\chapter{Reference: the Program concept}
+\label{ch:refman-program}
+
+\begin{aside}
+The smallest contract a \maya{} app must satisfy. If your
+struct passes \code{static\_assert(Program<App>)}, it will
+run.
+\end{aside}
+
+\section{Required members}
+
+A type \code{P} satisfies \code{Program} when it provides:
+
+\begin{itemize}[leftmargin=*]
+  \item a nested \code{Model} type;
+  \item a nested \code{Msg} type (usually a
+    \code{std::variant});
+  \item \code{static Model init()};
+  \item \code{static std::pair<Model, Cmd<Msg>>
+    update(Model, Msg)};
+  \item \code{static Element view(const Model\&)};
+  \item \code{static Sub<Msg> subscribe(const Model\&)}.
+\end{itemize}
+
+\section{Minimal program}
+
+\begin{lstlisting}[language=C++]
+#include <maya/maya.hpp>
+
+using namespace maya;
+using namespace maya::dsl;
+
+struct Hello {
+    struct Model {};
+    struct Quit {};
+    using Msg = std::variant<Quit>;
+
+    static Model init() { return {}; }
+
+    static auto update(Model m, Msg)
+        -> std::pair<Model, Cmd<Msg>>
+    {
+        return {m, Cmd<Msg>::quit()};
+    }
+
+    static Element view(const Model&) {
+        return t<"press q to quit"> | Bold;
+    }
+
+    static auto subscribe(const Model&) -> Sub<Msg> {
+        return key_map<Msg>({ {'q', Quit{}} });
+    }
+};
+
+static_assert(Program<Hello>);
+
+int main() {
+    run<Hello>({.title = "hello"});
+}
+\end{lstlisting}
+
+\section{Notes}
+
+\begin{itemize}[leftmargin=*]
+  \item \code{static\_assert(Program<Hello>)} is optional but
+    cheap. It surfaces missing members at compile time
+    rather than as deeply nested template errors.
+  \item \code{init()} can take config args if you wrap
+    \code{run<>} accordingly; the bare form takes none.
+  \item \code{update} returns a \emph{pair}, not just a
+    Model. The second slot is the command list.
+  \item Use \code{Cmd<Msg>\{\}} for "no side effect."
+\end{itemize}
+
+\section{Common mistakes}
+
+\begin{itemize}[leftmargin=*]
+  \item Returning \code{Model} from \code{update} instead of
+    a pair. The concept fails; the error is loud.
+  \item Forgetting \code{Quit} in the variant. Your program
+    runs but cannot exit cleanly.
+  \item Putting state in static variables instead of the
+    Model. Works once; breaks the moment you want to test.
+\end{itemize}
+
+\section{Recap}
+
+\begin{recap}
+\begin{itemize}[leftmargin=*]
+  \item Six members; one concept.
+  \item Pure functions; data effects.
+  \item Verify with a static assert.
+\end{itemize}
+\end{recap}
+
+\section*{Workshop}
+
+\begin{enumerate}[leftmargin=*]
+  \item Delete \code{subscribe} from the example. What does
+    the compiler say?
+  \item Restore it; delete \code{init}. Same question.
+  \item Add a second variant case and a key for it.
+\end{enumerate}

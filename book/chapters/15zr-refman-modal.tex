@@ -1,0 +1,107 @@
+\chapter{Reference: modal dialogs}
+\label{ch:refman-modal}
+
+\begin{aside}
+A modal is a centred panel rendered on top of the background.
+Implement it as a flag in the Model and a top-level branch in
+\code{view}.
+\end{aside}
+
+\section{Working example}
+
+\begin{lstlisting}[language=C++]
+#include <maya/maya.hpp>
+
+using namespace maya;
+using namespace maya::dsl;
+
+struct Modal {
+    struct Model { bool open = false; int count = 0; };
+    struct Open {};
+    struct Close {};
+    struct Confirm {};
+    struct Quit {};
+    using Msg = std::variant<Open, Close, Confirm, Quit>;
+
+    static Model init() { return {}; }
+
+    static auto update(Model m, Msg msg)
+        -> std::pair<Model, Cmd<Msg>>
+    {
+        return std::visit(overload{
+            [&](Open)    { m.open = true;  return std::pair{m, Cmd<Msg>{}}; },
+            [&](Close)   { m.open = false; return std::pair{m, Cmd<Msg>{}}; },
+            [&](Confirm) {
+                m.count++;
+                m.open = false;
+                return std::pair{m, Cmd<Msg>{}};
+            },
+            [](Quit) {
+                return std::pair{Model{}, Cmd<Msg>::quit()};
+            },
+        }, msg);
+    }
+
+    static Element view(const Model& m) {
+        auto base = v(
+            text(std::format("confirmed: {}", m.count)) | Bold,
+            blank_,
+            t<"o open dialog, q quit"> | Dim
+        ) | pad<1> | border_<Round>;
+
+        if (!m.open) return base;
+
+        auto dialog = v(
+            t<"are you sure?"> | Bold,
+            blank_,
+            t<"y confirm, n cancel"> | Dim
+        ) | pad<2> | border_<Double> | Bg<20, 20, 28>;
+
+        return v(base, blank_, center(dialog));
+    }
+
+    static auto subscribe(const Model& m) -> Sub<Msg> {
+        if (m.open) {
+            return key_map<Msg>({
+                {'y', Confirm{}},
+                {'n', Close{}},
+                {SpecialKey::Escape, Close{}},
+            });
+        }
+        return key_map<Msg>({
+            {'q', Quit{}},
+            {'o', Open{}},
+        });
+    }
+};
+
+int main() { run<Modal>({.title = "modal"}); }
+\end{lstlisting}
+
+\section{Notes}
+
+\begin{itemize}[leftmargin=*]
+  \item Subscriptions branch on \code{open} so the dialog
+    has its own key map; the background can't fight it.
+  \item Background dim is optional but appreciated; render
+    the base view with reduced contrast when open.
+  \item Always provide an Escape route.
+\end{itemize}
+
+\section{Recap}
+
+\begin{recap}
+\begin{itemize}[leftmargin=*]
+  \item One flag in the Model.
+  \item Branch \code{view} and \code{subscribe} on it.
+  \item Escape, always.
+\end{itemize}
+\end{recap}
+
+\section*{Workshop}
+
+\begin{enumerate}[leftmargin=*]
+  \item Add a text input inside the dialog.
+  \item Stack a second dialog ("are you really sure?").
+  \item Dim the background when the dialog is open.
+\end{enumerate}

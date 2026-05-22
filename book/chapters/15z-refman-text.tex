@@ -1,0 +1,96 @@
+\chapter{Reference: text elements}
+\label{ch:refman-text}
+
+\begin{aside}
+\code{text} for runtime strings; \code{t<"...">} for literals
+known at compile time. Both produce \code{Element}.
+\end{aside}
+
+\section{Constructors}
+
+\begin{itemize}[leftmargin=*]
+  \item \code{text(std::string)} — owns the bytes.
+  \item \code{text(std::string\_view)} — borrows; caller
+    must outlive the frame.
+  \item \code{text(int)}, \code{text(double)} — formatted as
+    decimal.
+  \item \code{t<"literal">} — zero-allocation form for
+    compile-time constants.
+\end{itemize}
+
+\section{Working example}
+
+\begin{lstlisting}[language=C++]
+#include <maya/maya.hpp>
+
+using namespace maya;
+using namespace maya::dsl;
+
+struct TextDemo {
+    struct Model { int n = 0; std::string label = "live"; };
+    struct Bump {}; struct Quit {};
+    using Msg = std::variant<Bump, Quit>;
+
+    static Model init() { return {}; }
+
+    static auto update(Model m, Msg msg)
+        -> std::pair<Model, Cmd<Msg>>
+    {
+        return std::visit(overload{
+            [&](Bump) { m.n++; return std::pair{m, Cmd<Msg>{}}; },
+            [](Quit)  { return std::pair{Model{}, Cmd<Msg>::quit()}; },
+        }, msg);
+    }
+
+    static Element view(const Model& m) {
+        return v(
+            t<"compile-time literal">,
+            text("runtime owned string"),
+            text(m.label),                    // dynamic
+            text(m.n),                        // formatted int
+            text(std::format("{:.2f}", 3.14)) // your own format
+        ) | pad<1> | border_<Round>;
+    }
+
+    static auto subscribe(const Model&) -> Sub<Msg> {
+        return key_map<Msg>({
+            {'q', Quit{}},
+            {' ', Bump{}},
+        });
+    }
+};
+
+int main() { run<TextDemo>({.title = "text"}); }
+\end{lstlisting}
+
+\section{Notes}
+
+\begin{itemize}[leftmargin=*]
+  \item \code{t<"...">} is preferred whenever the string is
+    a literal: it skips the allocation and the copy.
+  \item For format strings, build the \code{std::string}
+    first; pass the result to \code{text}.
+  \item Unicode is supported; the layout engine treats wide
+    glyphs as two cells.
+\end{itemize}
+
+\section{Recap}
+
+\begin{recap}
+\begin{itemize}[leftmargin=*]
+  \item \code{t<>} for literals, \code{text} for runtime.
+  \item Numeric overloads exist for convenience.
+  \item Use \code{std::format} for anything fancy.
+\end{itemize}
+\end{recap}
+
+\section*{Workshop}
+
+\begin{enumerate}[leftmargin=*]
+  \item Replace one \code{text(...)} with \code{t<"...">}
+    where the value is a literal.
+  \item Show the current time using
+    \code{std::chrono::system\_clock}.
+  \item Render the value of a \code{std::vector<int>}'s size
+    via \code{text(int)}.
+\end{enumerate}

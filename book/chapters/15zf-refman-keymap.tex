@@ -1,0 +1,102 @@
+\chapter{Reference: \code{key\_map} keys}
+\label{ch:refman-keymap}
+
+\begin{aside}
+Bind keys to messages declaratively. Both printable
+characters and special keys go in the same map.
+\end{aside}
+
+\section{What you can put in the map}
+
+\begin{itemize}[leftmargin=*]
+  \item Single chars: \code{'q'}, \code{' '}, \code{'\textbackslash n'}.
+  \item Special keys: \code{SpecialKey::Up},
+    \code{Down}, \code{Left}, \code{Right},
+    \code{Enter}, \code{Escape}, \code{Tab},
+    \code{Backspace}, \code{Delete}, \code{Home},
+    \code{End}, \code{PageUp}, \code{PageDown},
+    \code{F1}..\code{F12}.
+  \item Modifier combos: \code{ctrl('c')},
+    \code{alt('x')}, \code{shift(SpecialKey::Up)}.
+\end{itemize}
+
+\section{Working example}
+
+\begin{lstlisting}[language=C++]
+#include <maya/maya.hpp>
+
+using namespace maya;
+using namespace maya::dsl;
+
+struct KeyDemo {
+    struct Model { std::string last; };
+    struct Pressed { std::string label; };
+    struct Quit {};
+    using Msg = std::variant<Pressed, Quit>;
+
+    static Model init() { return {}; }
+
+    static auto update(Model m, Msg msg)
+        -> std::pair<Model, Cmd<Msg>>
+    {
+        return std::visit(overload{
+            [&](Pressed p) { m.last = p.label; return std::pair{m, Cmd<Msg>{}}; },
+            [](Quit)       { return std::pair{Model{}, Cmd<Msg>::quit()}; },
+        }, msg);
+    }
+
+    static Element view(const Model& m) {
+        return v(
+            t<"press a key">,
+            blank_,
+            text(std::format("last: {}", m.last)) | Bold,
+            blank_,
+            t<"q to quit"> | Dim
+        ) | pad<1> | border_<Round>;
+    }
+
+    static auto subscribe(const Model&) -> Sub<Msg> {
+        return key_map<Msg>({
+            {'q',                  Quit{}},
+            {' ',                  Pressed{"space"}},
+            {SpecialKey::Up,       Pressed{"up"}},
+            {SpecialKey::Down,     Pressed{"down"}},
+            {SpecialKey::Enter,    Pressed{"enter"}},
+            {SpecialKey::Escape,   Pressed{"escape"}},
+            {SpecialKey::Tab,      Pressed{"tab"}},
+            {ctrl('c'),            Quit{}},
+            {ctrl('s'),            Pressed{"ctrl-s"}},
+            {alt('x'),             Pressed{"alt-x"}},
+            {SpecialKey::F1,       Pressed{"F1"}},
+        });
+    }
+};
+
+int main() { run<KeyDemo>({.title = "keys"}); }
+\end{lstlisting}
+
+\section{Notes}
+
+\begin{itemize}[leftmargin=*]
+  \item Order does not matter; lookup is by key value.
+  \item Duplicate keys produce a runtime error at startup.
+  \item Unhandled keys are silently dropped.
+\end{itemize}
+
+\section{Recap}
+
+\begin{recap}
+\begin{itemize}[leftmargin=*]
+  \item Map literal keys, special keys, and modifier combos.
+  \item One entry per key.
+  \item Anything else is ignored.
+\end{itemize}
+\end{recap}
+
+\section*{Workshop}
+
+\begin{enumerate}[leftmargin=*]
+  \item Bind \code{?} to show a help overlay.
+  \item Bind \code{ctrl('r')} to reload.
+  \item Bind every digit \code{0}--\code{9} to a tab switch.
+\end{enumerate}

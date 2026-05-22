@@ -1,0 +1,106 @@
+\chapter{Reference: composition}
+\label{ch:refman-compose}
+
+\begin{aside}
+Big apps are made of small views. The trick is to write each
+view as a function and call it from the parent. State stays
+in one Model; rendering decomposes.
+\end{aside}
+
+\section{Working example}
+
+\begin{lstlisting}[language=C++]
+#include <maya/maya.hpp>
+
+using namespace maya;
+using namespace maya::dsl;
+
+struct Compose {
+    struct Model {
+        std::string title = "dashboard";
+        int cpu = 42;
+        int mem = 67;
+    };
+    struct Quit {};
+    using Msg = std::variant<Quit>;
+
+    static Model init() { return {}; }
+    static auto update(Model m, Msg)
+        -> std::pair<Model, Cmd<Msg>> {
+        return {m, Cmd<Msg>::quit()};
+    }
+
+    // -- Small view helpers --
+    static Element header(const Model& m) {
+        return h(
+            text(m.title) | Bold,
+            spacer_,
+            t<"q to quit"> | Dim
+        );
+    }
+
+    static Element gauge(std::string label, int pct) {
+        std::string bar;
+        for (int i = 0; i < 20; ++i) {
+            bar += (i < pct / 5) ? "#" : ".";
+        }
+        return h(
+            text(label) | Bold,
+            text(": "),
+            text(bar) | Fg<100, 220, 160>,
+            text(std::format(" {}\%", pct))
+        );
+    }
+
+    static Element body(const Model& m) {
+        return v(
+            gauge("cpu", m.cpu),
+            gauge("mem", m.mem)
+        );
+    }
+
+    // -- Top-level view glues them together --
+    static Element view(const Model& m) {
+        return v(
+            header(m),
+            blank_,
+            body(m)
+        ) | pad<1> | border_<Round>;
+    }
+
+    static auto subscribe(const Model&) -> Sub<Msg> {
+        return key_map<Msg>({ {'q', Quit{}} });
+    }
+};
+
+int main() { run<Compose>({.title = "compose"}); }
+\end{lstlisting}
+
+\section{Notes}
+
+\begin{itemize}[leftmargin=*]
+  \item Pass the Model by const reference into helpers;
+    don't reach for globals.
+  \item Helpers that take just the data they need are
+    easier to test and refactor.
+  \item For very large apps, split helpers across files; the
+    \code{Element} return type travels fine across TUs.
+\end{itemize}
+
+\section{Recap}
+
+\begin{recap}
+\begin{itemize}[leftmargin=*]
+  \item Helpers return \code{Element}.
+  \item Pass only what they need.
+  \item Top-level \code{view} glues them.
+\end{itemize}
+\end{recap}
+
+\section*{Workshop}
+
+\begin{enumerate}[leftmargin=*]
+  \item Extract three helpers from your current view.
+  \item Move them to a separate \code{views.cpp}.
+  \item Pass a parameter to make one helper reusable.
+\end{enumerate}

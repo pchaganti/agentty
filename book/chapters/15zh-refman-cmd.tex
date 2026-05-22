@@ -1,0 +1,114 @@
+\chapter{Reference: commands}
+\label{ch:refman-cmd}
+
+\begin{aside}
+A \code{Cmd<Msg>} is a description of an effect to perform.
+It is returned from \code{update}; the runtime performs the
+effect and, if it produces a result, dispatches a message.
+\end{aside}
+
+\section{Constructors}
+
+\begin{itemize}[leftmargin=*]
+  \item \code{Cmd<Msg>\{\}} — no effect.
+  \item \code{Cmd<Msg>::none()} — same; explicit form.
+  \item \code{Cmd<Msg>::quit()} — exit the program.
+  \item \code{Cmd<Msg>::after(d, msg)} — delayed message.
+  \item \code{Cmd<Msg>::batch(a, b, ...)} — combine.
+  \item \code{Cmd<Msg>::task(callable, then\_msg)} — run on a
+    worker, dispatch result.
+  \item \code{Cmd<Msg>::http\_get(url, then\_msg)} — async
+    HTTP.
+  \item \code{Cmd<Msg>::read\_file(path, then\_msg)} — async
+    file read.
+\end{itemize}
+
+\section{Working example}
+
+\begin{lstlisting}[language=C++]
+#include <maya/maya.hpp>
+#include <chrono>
+
+using namespace maya;
+using namespace maya::dsl;
+
+struct CmdDemo {
+    struct Model { int n = 0; std::string status; };
+    struct Bump {};
+    struct DelayedBump {};
+    struct Quit {};
+    using Msg = std::variant<Bump, DelayedBump, Quit>;
+
+    static Model init() { return {}; }
+
+    static auto update(Model m, Msg msg)
+        -> std::pair<Model, Cmd<Msg>>
+    {
+        return std::visit(overload{
+            [&](Bump) {
+                m.n++;
+                m.status = "bumped";
+                return std::pair{m, Cmd<Msg>{}};
+            },
+            [&](DelayedBump) {
+                m.status = "scheduled...";
+                return std::pair{m,
+                    Cmd<Msg>::after(std::chrono::seconds(1),
+                                    Bump{})};
+            },
+            [](Quit) {
+                return std::pair{Model{}, Cmd<Msg>::quit()};
+            },
+        }, msg);
+    }
+
+    static Element view(const Model& m) {
+        return v(
+            text(std::format("n = {}", m.n)) | Bold,
+            text(m.status) | Dim,
+            blank_,
+            t<"b bump, d delayed, q quit"> | Dim
+        ) | pad<1> | border_<Round>;
+    }
+
+    static auto subscribe(const Model&) -> Sub<Msg> {
+        return key_map<Msg>({
+            {'q', Quit{}},
+            {'b', Bump{}},
+            {'d', DelayedBump{}},
+        });
+    }
+};
+
+int main() { run<CmdDemo>({.title = "cmd"}); }
+\end{lstlisting}
+
+\section{Notes}
+
+\begin{itemize}[leftmargin=*]
+  \item Commands are values. You build them, return them,
+    never invoke them yourself.
+  \item Order inside \code{batch} is preserved.
+  \item \code{quit} is irrevocable: returning it once tears
+    the loop down.
+\end{itemize}
+
+\section{Recap}
+
+\begin{recap}
+\begin{itemize}[leftmargin=*]
+  \item Effects are data; the runtime performs them.
+  \item Common constructors: none, quit, after, batch, task,
+    http\_get, read\_file.
+\end{itemize}
+\end{recap}
+
+\section*{Workshop}
+
+\begin{enumerate}[leftmargin=*]
+  \item Implement a button that triggers two commands at
+    once with \code{batch}.
+  \item Use \code{task} to compute a fibonacci on a worker
+    thread; show the result.
+  \item Trigger a \code{quit} two seconds after a key press.
+\end{enumerate}

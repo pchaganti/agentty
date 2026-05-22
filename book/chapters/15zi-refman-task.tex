@@ -1,0 +1,122 @@
+\chapter{Reference: HTTP and tasks}
+\label{ch:refman-task}
+
+\begin{aside}
+Anything that blocks belongs in a command. Files, network,
+process spawns — return a \code{task} or \code{http\_get}
+and \maya{} will run it off the loop, then post the result
+back as a message.
+\end{aside}
+
+\section{Forms}
+
+\begin{itemize}[leftmargin=*]
+  \item \code{Cmd<Msg>::task(callable, then\_msg\_fn)}: run
+    \code{callable()} on a worker, pass the result to
+    \code{then\_msg\_fn} to make a \code{Msg}.
+  \item \code{Cmd<Msg>::http\_get(url, then\_msg\_fn)}: GET
+    request, dispatch a message with the body or error.
+  \item \code{Cmd<Msg>::read\_file(path, then\_msg\_fn)}:
+    async file read.
+\end{itemize}
+
+\section{Working example}
+
+\begin{lstlisting}[language=C++]
+#include <maya/maya.hpp>
+#include <thread>
+
+using namespace maya;
+using namespace maya::dsl;
+
+struct TaskDemo {
+    struct Model {
+        std::string status = "idle";
+        long answer = 0;
+    };
+    struct Start {};
+    struct Done { long value; };
+    struct Quit {};
+    using Msg = std::variant<Start, Done, Quit>;
+
+    static Model init() { return {}; }
+
+    static auto update(Model m, Msg msg)
+        -> std::pair<Model, Cmd<Msg>>
+    {
+        return std::visit(overload{
+            [&](Start) {
+                m.status = "computing...";
+                auto compute = []() -> long {
+                    std::this_thread::sleep_for(
+                        std::chrono::seconds(2));
+                    long sum = 0;
+                    for (long i = 1; i <= 1000000; ++i) sum += i;
+                    return sum;
+                };
+                return std::pair{m,
+                    Cmd<Msg>::task(compute,
+                        [](long v) { return Done{v}; })};
+            },
+            [&](Done d) {
+                m.status = "done";
+                m.answer = d.value;
+                return std::pair{m, Cmd<Msg>{}};
+            },
+            [](Quit) {
+                return std::pair{Model{}, Cmd<Msg>::quit()};
+            },
+        }, msg);
+    }
+
+    static Element view(const Model& m) {
+        return v(
+            text(m.status) | Bold,
+            text(std::format("answer: {}", m.answer)),
+            blank_,
+            t<"s start, q quit"> | Dim
+        ) | pad<1> | border_<Round>;
+    }
+
+    static auto subscribe(const Model&) -> Sub<Msg> {
+        return key_map<Msg>({
+            {'q', Quit{}},
+            {'s', Start{}},
+        });
+    }
+};
+
+int main() { run<TaskDemo>({.title = "task"}); }
+\end{lstlisting}
+
+\section{Notes}
+
+\begin{itemize}[leftmargin=*]
+  \item The worker pool is shared; long tasks block other
+    tasks, not the UI.
+  \item Exceptions in the callable become a \code{Done}
+    with a default-constructed value plus an error flag if
+    your \code{Msg} carries one.
+  \item Never touch the Model from inside the task. Only
+    the returned message may mutate state.
+\end{itemize}
+
+\section{Recap}
+
+\begin{recap}
+\begin{itemize}[leftmargin=*]
+  \item \code{task}, \code{http\_get}, \code{read\_file}.
+  \item Blocking work goes off-loop; result returns as a
+    message.
+  \item No shared state with the worker.
+\end{itemize}
+\end{recap}
+
+\section*{Workshop}
+
+\begin{enumerate}[leftmargin=*]
+  \item Spawn five tasks at once; show progress as each
+    finishes.
+  \item Fetch a URL and render the first 200 bytes.
+  \item Read a file and count its lines off-loop.
+\end{enumerate}

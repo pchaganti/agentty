@@ -1,0 +1,103 @@
+\chapter{Reference: colour and style modifiers}
+\label{ch:refman-style}
+
+\begin{aside}
+The full palette of inline style. Apply with the pipe
+operator; chain as many as you like; the order is mostly
+irrelevant.
+\end{aside}
+
+\section{Foreground / background}
+
+\begin{itemize}[leftmargin=*]
+  \item \code{Fg<R, G, B>}: 24-bit foreground.
+  \item \code{Bg<R, G, B>}: 24-bit background.
+  \item \code{Fg256<N>}, \code{Bg256<N>}: 256-colour
+    palette index.
+  \item \code{Fg16<Red>}, \code{Bg16<Blue>}: legacy 16-colour
+    names.
+\end{itemize}
+
+\section{Weight and decoration}
+
+\begin{itemize}[leftmargin=*]
+  \item \code{Bold}, \code{Dim}, \code{Italic},
+    \code{Underline}.
+  \item \code{Blink}, \code{Reverse}, \code{Strike},
+    \code{Hidden}.
+\end{itemize}
+
+\section{Working example}
+
+\begin{lstlisting}[language=C++]
+#include <maya/maya.hpp>
+
+using namespace maya;
+using namespace maya::dsl;
+
+struct StyleDemo {
+    struct Model {}; struct Quit {};
+    using Msg = std::variant<Quit>;
+
+    static Model init() { return {}; }
+    static auto update(Model m, Msg)
+        -> std::pair<Model, Cmd<Msg>> {
+        return {m, Cmd<Msg>::quit()};
+    }
+
+    static Element view(const Model&) {
+        return v(
+            t<"bold">              | Bold,
+            t<"dim">               | Dim,
+            t<"italic">            | Italic,
+            t<"underline">         | Underline,
+            t<"strike">            | Strike,
+            t<"reverse">           | Reverse,
+            blank_,
+            t<"red on black">      | Fg<255, 80, 80>,
+            t<"green on dark">     | Fg<100, 220, 120>,
+            t<"blue on dark">      | Fg<100, 180, 255>,
+            t<"warning">           | Fg<20, 20, 20> | Bg<255, 220, 80>,
+            blank_,
+            t<"bold + italic + cyan"> | Bold | Italic | Fg<100, 220, 220>,
+            blank_,
+            t<"q to quit">         | Dim
+        ) | pad<1> | border_<Round>;
+    }
+
+    static auto subscribe(const Model&) -> Sub<Msg> {
+        return key_map<Msg>({ {'q', Quit{}} });
+    }
+};
+
+int main() { run<StyleDemo>({.title = "style"}); }
+\end{lstlisting}
+
+\section{Notes}
+
+\begin{itemize}[leftmargin=*]
+  \item Modifiers compose left-to-right; later ones win on
+    conflicts (e.g. two foregrounds).
+  \item True colour is the default; the runtime
+    automatically degrades to 256-colour where the terminal
+    cannot do 24-bit.
+  \item \code{Blink} is honoured rarely; treat as a hint.
+\end{itemize}
+
+\section{Recap}
+
+\begin{recap}
+\begin{itemize}[leftmargin=*]
+  \item Fg / Bg in 24-bit, 256, or 16.
+  \item Bold, Dim, Italic, Underline, Strike, Reverse.
+  \item Chain with pipes.
+\end{itemize}
+\end{recap}
+
+\section*{Workshop}
+
+\begin{enumerate}[leftmargin=*]
+  \item Build a status bar with three coloured pills.
+  \item Use \code{Reverse} to highlight a selected row.
+  \item Make a "danger" badge: bold, white-on-red.
+\end{enumerate}

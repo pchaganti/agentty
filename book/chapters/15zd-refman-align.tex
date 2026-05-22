@@ -1,0 +1,89 @@
+\chapter{Reference: alignment and centering}
+\label{ch:refman-align}
+
+\begin{aside}
+Push content to a corner, the middle, or anywhere in between.
+The alignment helpers wrap a child and shift it within the
+slot they receive.
+\end{aside}
+
+\section{Forms}
+
+\begin{itemize}[leftmargin=*]
+  \item \code{center(child)}: middle on both axes.
+  \item \code{align(x, y, child)}: \code{x, y} in [0, 1];
+    \code{0} is left/top, \code{1} is right/bottom.
+  \item \code{left(child)}, \code{right(child)},
+    \code{top(child)}, \code{bottom(child)}: edge sugar.
+\end{itemize}
+
+\section{Working example}
+
+\begin{lstlisting}[language=C++]
+#include <maya/maya.hpp>
+
+using namespace maya;
+using namespace maya::dsl;
+
+struct AlignDemo {
+    struct Model {}; struct Quit {};
+    using Msg = std::variant<Quit>;
+
+    static Model init() { return {}; }
+    static auto update(Model m, Msg)
+        -> std::pair<Model, Cmd<Msg>> {
+        return {m, Cmd<Msg>::quit()};
+    }
+
+    static Element view(const Model&) {
+        return v(
+            center(t<"centred"> | Bold) | fixed_height<5> | border_<Round>,
+            blank_,
+            h(
+                left(t<"left">)   | flex<1> | border_<Round>,
+                center(t<"mid">)  | flex<1> | border_<Round>,
+                right(t<"right">) | flex<1> | border_<Round>
+            ),
+            blank_,
+            t<"q to quit"> | Dim
+        );
+    }
+
+    static auto subscribe(const Model&) -> Sub<Msg> {
+        return key_map<Msg>({ {'q', Quit{}} });
+    }
+};
+
+int main() { run<AlignDemo>({.title = "align"}); }
+\end{lstlisting}
+
+\section{Notes}
+
+\begin{itemize}[leftmargin=*]
+  \item Alignment is only visible if the wrapper has spare
+    space. A naked \code{center} around a wider element is a
+    no-op.
+  \item \code{flex<1>} on siblings divides the row's spare
+    width equally.
+  \item Use \code{fixed\_height} to give alignment something
+    to push against vertically.
+\end{itemize}
+
+\section{Recap}
+
+\begin{recap}
+\begin{itemize}[leftmargin=*]
+  \item \code{center}, \code{align}, edge sugar.
+  \item Visible only with extra room.
+  \item Combine with \code{flex} for shared-width groups.
+\end{itemize}
+\end{recap}
+
+\section*{Workshop}
+
+\begin{enumerate}[leftmargin=*]
+  \item Build a splash screen: centred title and subtitle.
+  \item Align a status bar to the bottom.
+  \item Use \code{align(0.5, 0.25, ...)} to put a banner at
+    the top quarter.
+\end{enumerate}

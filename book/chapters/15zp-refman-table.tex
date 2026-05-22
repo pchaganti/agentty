@@ -1,0 +1,106 @@
+\chapter{Reference: tables}
+\label{ch:refman-table}
+
+\begin{aside}
+A table is a column of rows of columns. The expressive power
+is in the helpers: column widths, header styling, zebra
+stripes, alignment.
+\end{aside}
+
+\section{Working example}
+
+\begin{lstlisting}[language=C++]
+#include <maya/maya.hpp>
+#include <vector>
+
+using namespace maya;
+using namespace maya::dsl;
+
+struct TableDemo {
+    struct Row { std::string name; int age; std::string job; };
+    struct Model {
+        std::vector<Row> rows{
+            {"ada",    36, "mathematician"},
+            {"alan",   42, "logician"},
+            {"grace",  85, "compiler"},
+            {"linus",  54, "kernel"},
+        };
+    };
+    struct Quit {};
+    using Msg = std::variant<Quit>;
+
+    static Model init() { return {}; }
+    static auto update(Model m, Msg)
+        -> std::pair<Model, Cmd<Msg>> {
+        return {m, Cmd<Msg>::quit()};
+    }
+
+    static Element view(const Model& m) {
+        auto cell = [](std::string s, int w) {
+            s.resize(w, ' ');
+            return text(s);
+        };
+
+        auto header = h(
+            cell("name", 10) | Bold,
+            cell("age",   5) | Bold,
+            cell("job",  16) | Bold
+        );
+
+        std::vector<Element> body;
+        bool zebra = false;
+        for (auto& r : m.rows) {
+            auto row = h(
+                cell(r.name,         10),
+                cell(std::to_string(r.age), 5),
+                cell(r.job,          16)
+            );
+            if (zebra) row = row | Bg<30, 30, 36>;
+            zebra = !zebra;
+            body.push_back(row);
+        }
+
+        return v(
+            header,
+            v(body),
+            blank_,
+            t<"q to quit"> | Dim
+        ) | pad<1> | border_<Round>;
+    }
+
+    static auto subscribe(const Model&) -> Sub<Msg> {
+        return key_map<Msg>({ {'q', Quit{}} });
+    }
+};
+
+int main() { run<TableDemo>({.title = "table"}); }
+\end{lstlisting}
+
+\section{Notes}
+
+\begin{itemize}[leftmargin=*]
+  \item Pad cells to a fixed width before passing to
+    \code{text}; uniform widths make rows align.
+  \item Use \code{Bg<...>} for zebra stripes; readers track
+    rows by the stripe.
+  \item For sortable tables, sort the underlying vector;
+    don't try to sort in render.
+\end{itemize}
+
+\section{Recap}
+
+\begin{recap}
+\begin{itemize}[leftmargin=*]
+  \item Build cells, pad to fixed width.
+  \item Header row above, body below.
+  \item Zebra stripes with alternating background.
+\end{itemize}
+\end{recap}
+
+\section*{Workshop}
+
+\begin{enumerate}[leftmargin=*]
+  \item Add a sort key; press a column letter to sort.
+  \item Highlight the row under the cursor.
+  \item Add a footer with the row count.
+\end{enumerate}

@@ -1,0 +1,136 @@
+\chapter{Reference: full enum and key list}
+\label{ch:refman-enums}
+
+\begin{aside}
+The complete set of enumerated constants \maya{} exposes.
+Look here when the compiler asks for a name and you've
+forgotten it.
+\end{aside}
+
+\section{SpecialKey}
+
+\begin{itemize}[leftmargin=*]
+  \item \code{Up}, \code{Down}, \code{Left}, \code{Right}.
+  \item \code{Enter}, \code{Escape}, \code{Tab},
+    \code{Backspace}, \code{Delete}.
+  \item \code{Home}, \code{End}, \code{PageUp},
+    \code{PageDown}, \code{Insert}.
+  \item \code{F1} through \code{F12}.
+\end{itemize}
+
+\section{BorderStyle}
+
+\begin{itemize}[leftmargin=*]
+  \item \code{None}, \code{Round}, \code{Square},
+    \code{Heavy}, \code{Double}, \code{Ascii}.
+\end{itemize}
+
+\section{MouseButton}
+
+\begin{itemize}[leftmargin=*]
+  \item \code{Left}, \code{Middle}, \code{Right}.
+  \item \code{WheelUp}, \code{WheelDown},
+    \code{WheelLeft}, \code{WheelRight}.
+  \item \code{None} for move events with no button held.
+\end{itemize}
+
+\section{MouseKind}
+
+\begin{itemize}[leftmargin=*]
+  \item \code{Press}, \code{Release}, \code{Drag},
+    \code{Move}.
+\end{itemize}
+
+\section{Cursor}
+
+\begin{itemize}[leftmargin=*]
+  \item \code{Hidden}, \code{Block}, \code{Underscore},
+    \code{Bar}.
+  \item \code{BlinkingBlock}, \code{BlinkingBar},
+    \code{BlinkingUnderscore}.
+\end{itemize}
+
+\section{Working example}
+
+\begin{lstlisting}[language=C++]
+#include <maya/maya.hpp>
+
+using namespace maya;
+using namespace maya::dsl;
+
+struct EnumDemo {
+    struct Model { std::string last = "(none)"; };
+    struct Got { std::string label; };
+    struct Quit {};
+    using Msg = std::variant<Got, Quit>;
+
+    static Model init() { return {}; }
+    static auto update(Model m, Msg msg)
+        -> std::pair<Model, Cmd<Msg>> {
+        return std::visit(overload{
+            [&](Got g) { m.last = g.label; return std::pair{m, Cmd<Msg>{}}; },
+            [](Quit) { return std::pair{Model{}, Cmd<Msg>::quit()}; },
+        }, msg);
+    }
+
+    static Element view(const Model& m) {
+        return v(
+            text(std::format("last: {}", m.last)),
+            blank_,
+            t<"try F1..F4, arrows, page up/down"> | Dim,
+            t<"q to quit"> | Dim
+        ) | pad<1> | border_<Round>;
+    }
+
+    static auto subscribe(const Model&) -> Sub<Msg> {
+        return key_map<Msg>({
+            {'q', Quit{}},
+            {SpecialKey::F1,       Got{"F1"}},
+            {SpecialKey::F2,       Got{"F2"}},
+            {SpecialKey::F3,       Got{"F3"}},
+            {SpecialKey::F4,       Got{"F4"}},
+            {SpecialKey::Up,       Got{"up"}},
+            {SpecialKey::Down,     Got{"down"}},
+            {SpecialKey::Left,     Got{"left"}},
+            {SpecialKey::Right,    Got{"right"}},
+            {SpecialKey::PageUp,   Got{"pgup"}},
+            {SpecialKey::PageDown, Got{"pgdn"}},
+            {SpecialKey::Home,     Got{"home"}},
+            {SpecialKey::End,      Got{"end"}},
+        });
+    }
+};
+
+int main() { run<EnumDemo>({.title = "enums"}); }
+\end{lstlisting}
+
+\section{Notes}
+
+\begin{itemize}[leftmargin=*]
+  \item Not every key reaches every terminal; F-keys in
+    particular are sometimes captured by tmux or by the
+    terminal emulator itself.
+  \item \code{Insert} is rarely useful; default to other
+    bindings.
+  \item \code{shift(...)}, \code{ctrl(...)}, \code{alt(...)}
+    can modify any of these.
+\end{itemize}
+
+\section{Recap}
+
+\begin{recap}
+\begin{itemize}[leftmargin=*]
+  \item One enum per concern.
+  \item All keys reachable via \code{key\_map}.
+  \item Modifier wrappers compose.
+\end{itemize}
+\end{recap}
+
+\section*{Workshop}
+
+\begin{enumerate}[leftmargin=*]
+  \item Print a label for every key you press.
+  \item Build a "vim-like" set of bindings (\code{hjkl},
+    \code{gg}, \code{G}).
+  \item Try every cursor style with \code{RunConfig::cursor}.
+\end{enumerate}
