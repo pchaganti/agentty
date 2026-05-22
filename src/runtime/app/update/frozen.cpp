@@ -31,6 +31,7 @@
 #include <utility>
 
 #include <maya/dsl.hpp>
+#include <maya/platform/io.hpp>
 #include <maya/render/cache_id.hpp>
 #include <maya/widget/conversation.hpp>
 #include <maya/widget/turn.hpp>
@@ -215,23 +216,24 @@ void rehydrate_frozen(Model& m) {
     //      "paint from top, fast-scroll to bottom" lag on thread
     //      resume.
     //
-    // Two caps in conjunction:
-    //   • Turn cap (kRehydrateTurns) bounds the build cost on
-    //     turn-heavy threads where each turn is small.
-    //   • Row budget (kRehydrateRowBudget) bounds the paint cost on
-    //     content-heavy threads where ONE turn (e.g. a Write of a
-    //     2000-line file) can blow past the budget by itself.
-    //
-    // Either cap stops the backward walk. The row estimate is bytes
-    // / 60 (rough "average rendered chars per row" across prose,
-    // code, tool bodies) — deliberately conservative so we under-
-    // count and stop early rather than over-emit. Older turns live
-    // in the on-disk JSON (m.d.current.messages is intact); they're
-    // just invisible inside agentty until the next live append
-    // shifts the window. Composer history (↑ in the composer) still
-    // walks every prior user prompt, so the recall path is unaffected.
-    constexpr std::size_t kRehydrateTurns     = 6;
-    constexpr std::size_t kRehydrateRowBudget = 200;   // ~3-8 viewports
+    // Row budget = current terminal rows − composer reserve. Fitting
+    // the rehydrated tail inside ONE viewport eliminates the visible
+    // scroll animation entirely: maya's case-A (Fresh) compose path
+    // emits every canvas row from row 0, and any row past the viewport
+    // bottom triggers a \r\n scroll. When total_rows ≤ term_h, no row
+    // scrolls — the screen paints in place. Older turns live in the
+    // on-disk JSON (m.d.current.messages is intact); they're just
+    // invisible inside agentty until the next live append shifts the
+    // window. Composer history (↑ in the composer) still walks every
+    // prior user prompt, so the recall path is unaffected.
+    constexpr std::size_t kRehydrateTurns = 6;
+    const auto term_size = maya::platform::query_terminal_size(
+        maya::platform::stdout_handle());
+    // Reserve ~6 rows for the composer + status line so the rehydrated
+    // transcript leaves room for chrome without forcing a scroll.
+    constexpr int kComposerReserve = 6;
+    const std::size_t kRehydrateRowBudget = static_cast<std::size_t>(
+        std::max(8, term_size.height.value - kComposerReserve));
 
     auto estimate_msg_rows = [](const Message& mm) -> std::size_t {
         std::size_t bytes = mm.text.size() + mm.streaming_text.size();
