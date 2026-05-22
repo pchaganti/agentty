@@ -154,7 +154,7 @@ ExecResult run_web_search(const WebSearchArgs& a) {
     if (found == 0) return ToolOutput{"no results found for: " + a.query, std::nullopt};
     std::string s = out.str();
     if (!a.display_description.empty())
-        s = a.display_description + "\n\n" + s;
+        s = a.display_description + "\n" + s;
     return ToolOutput{std::move(s), std::nullopt};
 }
 

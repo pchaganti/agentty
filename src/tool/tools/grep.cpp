@@ -385,7 +385,7 @@ ExecResult run_ripgrep(const GrepArgs& a) {
     }
     std::string body = out.str();
     if (!a.display_description.empty())
-        body = a.display_description + "\n\n" + body;
+        body = a.display_description + "\n" + body;
     return ToolOutput{std::move(body), std::nullopt};
 }
 
@@ -593,7 +593,7 @@ ExecResult run_builtin(const GrepArgs& a) {
     }
     std::string body = out.str();
     if (!a.display_description.empty())
-        body = a.display_description + "\n\n" + body;
+        body = a.display_description + "\n" + body;
     return ToolOutput{std::move(body), std::nullopt};
 }
 

@@ -336,7 +336,7 @@ ExecResult run_read(const ReadArgs& a) {
                 "end_line=180).",
                 kib, a.path.string(), outline);
             if (!a.display_description.empty())
-                out = a.display_description + "\n\n" + out;
+                out = a.display_description + "\n" + out;
 
             // Still record the read in the staleness cache so a
             // re-read of the same (path, offset=1, limit=2000) tuple
@@ -423,7 +423,7 @@ ExecResult run_read(const ReadArgs& a) {
         out += hint;
     }
     if (!a.display_description.empty())
-        out = a.display_description + "\n\n" + out;
+        out = a.display_description + "\n" + out;
 
     // Record the (path, offset, limit) → mtime pair so the next Read of
     // the same range short-circuits to the sentinel. Computed up top so

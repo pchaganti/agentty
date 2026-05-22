@@ -86,7 +86,7 @@ ExecResult run_glob(const GlobArgs& a) {
                           std::nullopt};
     std::string body = "Found " + std::to_string(n) + " file(s):\n" + out.str();
     if (!a.display_description.empty())
-        body = a.display_description + "\n\n" + body;
+        body = a.display_description + "\n" + body;
     return ToolOutput{std::move(body), std::nullopt};
 }
 

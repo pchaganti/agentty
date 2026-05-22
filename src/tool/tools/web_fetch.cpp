@@ -144,7 +144,7 @@ ExecResult run_web_fetch(const WebFetchArgs& a) {
     if (truncated) out << "\n[body truncated at 20KB]";
     std::string s = out.str();
     if (!a.display_description.empty())
-        s = a.display_description + "\n\n" + s;
+        s = a.display_description + "\n" + s;
     return ToolOutput{std::move(s), std::nullopt};
 }
 

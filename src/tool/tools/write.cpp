@@ -231,7 +231,7 @@ ExecResult run_write(const WriteArgs& a) {
     std::string prefix;
     if (!staleness_warning.empty()) prefix += staleness_warning;
     if (!a.display_description.empty())
-        prefix += a.display_description + "\n\n";
+        prefix += a.display_description + "\n";
     auto msg = std::format("{}{} {} ({}+ {}-){}",
                            prefix,
                            exists ? "Overwrote" : "Created",

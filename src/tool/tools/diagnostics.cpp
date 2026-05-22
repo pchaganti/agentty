@@ -80,7 +80,7 @@ ExecResult run_diagnostics(const DiagnosticsArgs& a) {
     auto output = util::legacy_format(sub, std::chrono::seconds{60});
     if (output.empty()) return ToolOutput{"no diagnostics (clean build)", std::nullopt};
     if (!a.display_description.empty())
-        output = a.display_description + "\n\n" + output;
+        output = a.display_description + "\n" + output;
     return ToolOutput{std::move(output), std::nullopt};
 }
 

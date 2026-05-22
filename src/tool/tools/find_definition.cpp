@@ -146,7 +146,7 @@ ExecResult run_find_definition(const FindDefinitionArgs& a) {
     if (matches > 50) out << "[>50 definitions, truncated]\n";
     std::string body = out.str();
     if (!a.display_description.empty())
-        body = a.display_description + "\n\n" + body;
+        body = a.display_description + "\n" + body;
     return ToolOutput{std::move(body), std::nullopt};
 }
 
