@@ -228,30 +228,23 @@ Step submit_message(Model m) {
 
     auto trim = trim_frozen_if_oversized(m);
     auto launch = cmd::launch_stream(m);
-    // Submit collapses the composer (N rows of typed text → 1 idle
-    // row) AT THE SAME FRAME as the conversation gains the new
-    // User turn + empty Assistant placeholder. On short terminals
-    // the typed-message rows had already overflowed into native
-    // scrollback during streaming-of-typing; after the shrink,
-    // maya's prev_cells still claims those rows as inside the
-    // updatable viewport and the next diff skips them (treating
-    // them as committed scrollback). Result: prior-frame composer
-    // contents stay stranded above the live area with a gap below.
-    //
-    // commit_scrollback_overflow asks maya to advance prev_cells
-    // past whatever has already overflowed (= max(0, prev_rows -
-    // term_h) rows). After it runs, updatable_start drops to 0
-    // and the next diff scans the full common range — every
-    // visible row gets correctly emitted. Non-destructive: the
-    // overflowed rows already live in the terminal's native
-    // scrollback and stay there. Mirrors picker.cpp's thread-swap
-    // discipline (same shape: a wholesale canvas-shape change
-    // that the inline diff can't sweep cleanly on its own).
+    // No commit_scrollback_overflow here. Submit is not a wholesale
+    // model swap — it appends to the existing transcript, so maya's
+    // normal row diff handles the composer-shrink + new-turn-rows
+    // transition correctly. agent_session.cpp fires commit_scrollback
+    // only on the FROZEN_MAX trim; we mirror that here. Past versions
+    // fired commit_scrollback_overflow on every submit to flush a
+    // suspected composer-shrink seam, but the call advances prev_cells
+    // past whatever the renderer thinks has overflowed — when nothing
+    // has actually overflowed, the bookkeeping turns valid scrollback
+    // mirror rows into "forget these" and the next diff re-emits
+    // them, surfacing as duplicate cards in scrollback.
     std::vector<Cmd<Msg>> parts;
     if (!trim.is_none()) parts.push_back(std::move(trim));
-    parts.push_back(Cmd<Msg>::commit_scrollback_overflow());
     parts.push_back(std::move(launch));
-    auto cmd = Cmd<Msg>::batch(std::move(parts));
+    auto cmd = parts.size() == 1
+        ? std::move(parts.front())
+        : Cmd<Msg>::batch(std::move(parts));
     return {std::move(m), std::move(cmd)};
 }
 

@@ -1533,11 +1533,10 @@ Step stream_update(Model m, msg::StreamMsg sm) {
                     m.s.status = "auth expired \xE2\x80\x94 refreshing token\xE2\x80\xA6";
                     m.s.status_until = {};
                     auto refresh_cmd = cmd::refresh_oauth(std::move(refresh_token));
-                    if (prepended_into_committed_text) {
-                        return {std::move(m),
-                            Cmd<Msg>::batch(std::move(refresh_cmd),
-                                            Cmd<Msg>::force_redraw())};
-                    }
+                    // No force_redraw — it's resize-only. The
+                    // StreamingMarkdown pre-settle above already
+                    // locks the message's height; the next render
+                    // takes the normal diff path.
                     return {std::move(m), std::move(refresh_cmd)};
                 }
                 // No refresh_token on disk (env-var OAuth, api-key with
@@ -1579,14 +1578,10 @@ Step stream_update(Model m, msg::StreamMsg sm) {
                 placeholder.role = Role::Assistant;
                 m.d.current.messages.push_back(std::move(placeholder));
                 auto retry_cmd = Cmd<Msg>::after(delay, Msg{RetryStream{}});
-                if (prepended_into_committed_text) {
-                    // Resolve the scrollback↔viewport seam mismatch
-                    // before the retry stream starts feeding new
-                    // deltas through StreamingMarkdown.
-                    return {std::move(m),
-                        Cmd<Msg>::batch(std::move(retry_cmd),
-                                        Cmd<Msg>::force_redraw())};
-                }
+                // No force_redraw — resize-only. The pre-settle
+                // above already finalised StreamingMarkdown so its
+                // height is locked before the retry stream feeds new
+                // deltas; the normal diff path handles the rest.
                 return {std::move(m), std::move(retry_cmd)};
             }
 
@@ -1654,15 +1649,9 @@ Step stream_update(Model m, msg::StreamMsg sm) {
                         + std::chrono::milliseconds{50},
                     Msg{ClearStatus{stamp}});
                 if (prepended_into_committed_text) {
-                    // Terminal-path counterpart of the retry-path fix
-                    // above: the message body just grew by prepend, so
-                    // StreamingMarkdown will re-parse from scratch on
-                    // the next set_content and the scrollback tail
-                    // disagrees with the new live frame. Force a full
-                    // repaint on the next render.
-                    return {std::move(m),
-                        Cmd<Msg>::batch(std::move(status_cmd),
-                                        Cmd<Msg>::force_redraw())};
+                    // Pre-settle above already locked the message
+                    // height; no force_redraw (resize-only rule).
+                    return {std::move(m), std::move(status_cmd)};
                 }
                 return {std::move(m), std::move(status_cmd)};
             }
