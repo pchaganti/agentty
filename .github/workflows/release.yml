@@ -258,6 +258,9 @@ jobs:
               -e "s|source_x86_64=.*|source_x86_64=(\"agentty-$V-x86_64::file:///pkg/agentty-linux-x86_64\")|" \
               -e "s/sha256sums_x86_64=.*/sha256sums_x86_64=('SKIP')/" \
               packaging/arch/PKGBUILD > "$work/PKGBUILD"
+          # makepkg would try to "extract" the raw ELF and then package() can't
+          # find it in srcdir; mark it noextract so it's symlinked in verbatim.
+          printf 'noextract=("agentty-%s-x86_64")\n' "$V" >> "$work/PKGBUILD"
           cp bins/agentty-linux-x86_64 "$work/agentty-linux-x86_64"
           docker run --rm -v "$work":/pkg -w /pkg archlinux:base-devel bash -c '
             useradd -m -u 1000 build 2>/dev/null || true
