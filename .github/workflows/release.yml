@@ -169,7 +169,7 @@ jobs:
       matrix:
         include:
           - arch: arm64
-            runner: macos-15   # Apple Silicon (Xcode 16 / AppleClang 16+ for C++26)
+            runner: macos-15         # Apple Silicon
           - arch: x86_64
             runner: macos-15-intel   # Intel (macos-13 retired)
     runs-on: ${{ matrix.runner }}
@@ -182,21 +182,49 @@ jobs:
           git config --global url."https://github.com/".insteadOf "git@github.com:"
           git submodule update --init --recursive
       - name: Install deps (Homebrew)
-        run: brew install openssl@3 nghttp2 ninja
-      - name: Configure + build (standalone, static OpenSSL/nghttp2)
+        # GCC, NOT AppleClang: agentty + maya require C++26 (std::expected,
+        # std::format) requested via CMake's cxx_std_26 compile feature, which
+        # AppleClang doesn't advertise (configure fails in maya). openssl@3
+        # ships a static .a; nghttp2 ships only the dylib, so it's built from
+        # source below.
+        run: brew install gcc openssl@3 ninja
+      - name: Build static nghttp2 (Homebrew ships only the dylib)
         run: |
-          # Pin to GitHub Actions' macOS deployment baseline so the binary
-          # runs on older OS versions than the runner. STANDALONE statically
-          # links OpenSSL + nghttp2; only libSystem stays dynamic.
-          cmake -B build -GNinja -DCMAKE_BUILD_TYPE=Release \
+          ver=1.64.0
+          curl -fsSL "https://github.com/nghttp2/nghttp2/releases/download/v${ver}/nghttp2-${ver}.tar.gz" | tar xz
+          cd "nghttp2-${ver}"
+          ./configure --prefix="$PWD/../nghttp2-static" \
+            --enable-lib-only --enable-static --disable-shared CFLAGS="-O2"
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+      - name: Configure + build (standalone)
+        run: |
+          gcc_pfx="$(brew --prefix gcc)"
+          # Resolve the versioned compilers (gcc-15, g++-15 …) without pinning
+          # a version Homebrew may bump out from under us.
+          GCC="$(ls "$gcc_pfx"/bin/gcc-* | grep -E 'gcc-[0-9]+$' | sort -V | tail -1)"
+          GXX="$(ls "$gcc_pfx"/bin/g++-* | grep -E 'g\+\+-[0-9]+$' | sort -V | tail -1)"
+          # Fold GCC's runtime into the binary so it runs without Homebrew GCC
+          # present: -static-libstdc++/-static-libgcc cover libstdc++/libgcc,
+          # but libquadmath has no -static flag — link its archive by full path
+          # (macOS ld picks the dylib otherwise). Result: only the system
+          # frameworks + libSystem remain dynamic.
+          QUADMATH="$gcc_pfx/lib/gcc/current/libquadmath.a"
+          PKG_CONFIG_PATH="$PWD/nghttp2-static/lib/pkgconfig" \
+          CC="$GCC" CXX="$GXX" cmake -B build -GNinja -DCMAKE_BUILD_TYPE=Release \
             -DAGENTTY_STANDALONE=ON -DAGENTTY_AUTO_PULL_MAYA=OFF \
             -DAGENTTY_USE_MIMALLOC=OFF \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
             -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
-            -DCMAKE_PREFIX_PATH="$(brew --prefix nghttp2)"
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc $QUADMATH"
           cmake --build build -j"$(sysctl -n hw.ncpu)"
           strip build/agentty
           cp build/agentty agentty-macos-${{ matrix.arch }}
+      - name: Verify portability (no Homebrew dylibs)
+        run: |
+          otool -L agentty-macos-${{ matrix.arch }}
+          if otool -L agentty-macos-${{ matrix.arch }} | grep -qE '/opt/homebrew|/usr/local'; then
+            echo "::error::binary links Homebrew dylibs — not portable"; exit 1
+          fi
       - name: Upload to release
         run: gh release upload "$TAG" agentty-macos-${{ matrix.arch }} --clobber
 
