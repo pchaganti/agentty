@@ -1,0 +1,58 @@
+name: ci
+
+# Lightweight build + test gate so every master commit / PR gets a status
+# check (the green tick). NOT a release: a single native Linux build against
+# the system's shared libs (no musl/static, no QEMU cross-builds, no
+# packaging) — those run in release.yml on a tag. Goal here is "does it still
+# compile and do the smoke tests pass", fast.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+# Cancel an in-flight run when newer commits land on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: build + test (linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init maya submodule (HTTPS)
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule update --init --recursive
+
+      - name: Install deps
+        # GCC 14 for C++26 (std::expected / std::format); ubuntu-latest's
+        # default g++ can lag. Shared libs are fine here — this isn't a
+        # distributable build.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            g++-14 cmake ninja-build pkg-config \
+            libssl-dev libnghttp2-dev zlib1g-dev
+
+      - name: Configure
+        env:
+          CC: gcc-14
+          CXX: g++-14
+        run: |
+          cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=Release \
+            -DAGENTTY_AUTO_PULL_MAYA=OFF \
+            -DAGENTTY_USE_MIMALLOC=OFF \
+            -DAGENTTY_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

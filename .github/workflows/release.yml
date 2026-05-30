@@ -70,23 +70,17 @@ jobs:
           pipx run git-archive-all "agentty-${V}.tar.gz"
           gh release upload "$TAG" "agentty-${V}.tar.gz" --clobber
 
-  build-linux:
-    name: linux ${{ matrix.arch }}
+  # Linux static (musl) binaries — one job per arch, NOT a matrix. A matrix
+  # job only reports complete when its slowest leg finishes (aarch64 under
+  # QEMU, ~13 min), and `needs:` can't target a single matrix leg — so a
+  # matrix would re-gate the fast packages behind the slow build, and a failed
+  # aarch64 leg would block x86 packaging entirely. Separate jobs let the x86
+  # binary + packages publish in ~5 min while aarch64 streams in later, and
+  # isolate each arch's failures from the others.
+  build-linux-x86_64:
+    name: linux x86_64
     needs: prepare
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            platform: linux/amd64
-            cmarch: avx2
-          - arch: aarch64
-            platform: linux/arm64
-            cmarch: native
-          - arch: i686
-            platform: linux/386
-            cmarch: sse2
     env:
       TAG: ${{ needs.prepare.outputs.tag }}
     steps:
@@ -95,13 +89,10 @@ jobs:
         run: |
           git config --global url."https://github.com/".insteadOf "git@github.com:"
           git submodule update --init --recursive
-      - name: Set up QEMU
-        if: matrix.platform != 'linux/amd64'
-        uses: docker/setup-qemu-action@v3
       - name: Build static binary (Alpine 3.21 / musl / GCC 14)
         run: |
-          docker run --rm --platform ${{ matrix.platform }} \
-            -e CMARCH='${{ matrix.cmarch }}' \
+          docker run --rm --platform linux/amd64 \
+            -e CMARCH='avx2' \
             -v "$PWD":/src -w /src alpine:3.21 sh -c '
               set -ex
               apk add --no-cache build-base cmake ninja git linux-headers pkgconfig \
@@ -114,15 +105,90 @@ jobs:
                     -DAGENTTY_ARCH="$CMARCH"
               cmake --build build-rel -j"$(nproc)"
               strip build-rel/agentty
-              cp build-rel/agentty agentty-linux-${{ matrix.arch }}
+              cp build-rel/agentty agentty-linux-x86_64
             '
       - name: Upload to release + stash for packaging
-        run: gh release upload "$TAG" agentty-linux-${{ matrix.arch }} --clobber
+        run: gh release upload "$TAG" agentty-linux-x86_64 --clobber
       - uses: actions/upload-artifact@v4
         with:
-          name: bin-linux-${{ matrix.arch }}
-          path: agentty-linux-${{ matrix.arch }}
+          name: bin-linux-x86_64
+          path: agentty-linux-x86_64
           if-no-files-found: error
+
+  build-linux-aarch64:
+    name: linux aarch64
+    needs: prepare
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init maya submodule (HTTPS)
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule update --init --recursive
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Build static binary (Alpine 3.21 / musl / GCC 14)
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -e CMARCH='native' \
+            -v "$PWD":/src -w /src alpine:3.21 sh -c '
+              set -ex
+              apk add --no-cache build-base cmake ninja git linux-headers pkgconfig \
+                openssl-dev openssl-libs-static nghttp2-dev nghttp2-static zlib-static
+              git config --global --add safe.directory /src
+              rm -rf build-rel
+              cmake -S . -B build-rel -GNinja -DCMAKE_BUILD_TYPE=Release \
+                    -DAGENTTY_STANDALONE=ON -DAGENTTY_FULLY_STATIC=ON \
+                    -DAGENTTY_AUTO_PULL_MAYA=OFF -DAGENTTY_USE_MIMALLOC=OFF \
+                    -DAGENTTY_ARCH="$CMARCH"
+              cmake --build build-rel -j"$(nproc)"
+              strip build-rel/agentty
+              cp build-rel/agentty agentty-linux-aarch64
+            '
+      - name: Upload to release + stash for packaging
+        run: gh release upload "$TAG" agentty-linux-aarch64 --clobber
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-linux-aarch64
+          path: agentty-linux-aarch64
+          if-no-files-found: error
+
+  build-linux-i686:
+    name: linux i686
+    needs: prepare
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init maya submodule (HTTPS)
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule update --init --recursive
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Build static binary (Alpine 3.21 / musl / GCC 14)
+        run: |
+          docker run --rm --platform linux/386 \
+            -e CMARCH='sse2' \
+            -v "$PWD":/src -w /src alpine:3.21 sh -c '
+              set -ex
+              apk add --no-cache build-base cmake ninja git linux-headers pkgconfig \
+                openssl-dev openssl-libs-static nghttp2-dev nghttp2-static zlib-static
+              git config --global --add safe.directory /src
+              rm -rf build-rel
+              cmake -S . -B build-rel -GNinja -DCMAKE_BUILD_TYPE=Release \
+                    -DAGENTTY_STANDALONE=ON -DAGENTTY_FULLY_STATIC=ON \
+                    -DAGENTTY_AUTO_PULL_MAYA=OFF -DAGENTTY_USE_MIMALLOC=OFF \
+                    -DAGENTTY_ARCH="$CMARCH"
+              cmake --build build-rel -j"$(nproc)"
+              strip build-rel/agentty
+              cp build-rel/agentty agentty-linux-i686
+            '
+      - name: Upload to release
+        run: gh release upload "$TAG" agentty-linux-i686 --clobber
 
   build-windows:
     name: windows x86_64
@@ -228,9 +294,11 @@ jobs:
       - name: Upload to release
         run: gh release upload "$TAG" agentty-macos-${{ matrix.arch }} --clobber
 
-  package-linux:
-    name: packages
-    needs: [prepare, build-linux]
+  # x86_64 packages — deb (amd64) / rpm (x86_64) / Arch (x86_64). Needs only
+  # the x86 build, so it publishes ~5 min in without waiting on aarch64.
+  package-linux-x86_64:
+    name: packages x86_64
+    needs: [prepare, build-linux-x86_64]
     runs-on: ubuntu-latest
     env:
       V: ${{ needs.prepare.outputs.version }}
@@ -239,9 +307,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          name: bin-linux-x86_64
           path: bins
-          pattern: bin-linux-*
-          merge-multiple: true
       - name: Tooling
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rpm libarchive-tools zstd
       - name: Build + upload .deb / .rpm / .pkg.tar.zst
@@ -249,10 +316,8 @@ jobs:
           mkdir -p dist
           chmod +x bins/agentty-linux-*
           # deb/build.sh cd's into a tmpdir, so the output dir must be absolute.
-          bash packaging/deb/build.sh "$V" amd64 bins/agentty-linux-x86_64  "$PWD/dist"
-          bash packaging/deb/build.sh "$V" arm64 bins/agentty-linux-aarch64 "$PWD/dist"
-          bash packaging/rpm/build.sh "$V" x86_64  bins/agentty-linux-x86_64  "$PWD/dist"
-          bash packaging/rpm/build.sh "$V" aarch64 bins/agentty-linux-aarch64 "$PWD/dist"
+          bash packaging/deb/build.sh "$V" amd64 bins/agentty-linux-x86_64 "$PWD/dist"
+          bash packaging/rpm/build.sh "$V" x86_64 bins/agentty-linux-x86_64 "$PWD/dist"
           # Arch .pkg.tar.zst built by hand (bsdtar + zstd) — same philosophy as
           # the deb builder. Avoids makepkg's fakeroot, which is unreliable in
           # containers ("libfakeroot: payload not recognized").
@@ -280,13 +345,48 @@ jobs:
             | zstd -19 -T0 > "dist/agentty-bin-${V}-1-x86_64.pkg.tar.zst"
           gh release upload "$TAG" dist/*.deb dist/*.rpm dist/*.pkg.tar.zst --clobber
 
+  # aarch64 packages — deb (arm64) / rpm (aarch64). Needs only the aarch64
+  # build, so it streams in when that QEMU build finishes (no Arch pkg: the
+  # AUR agentty-bin is x86_64-only).
+  package-linux-aarch64:
+    name: packages aarch64
+    needs: [prepare, build-linux-aarch64]
+    runs-on: ubuntu-latest
+    env:
+      V: ${{ needs.prepare.outputs.version }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-linux-aarch64
+          path: bins
+      - name: Tooling
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rpm
+      - name: Build + upload .deb / .rpm
+        run: |
+          mkdir -p dist
+          chmod +x bins/agentty-linux-*
+          # deb/build.sh cd's into a tmpdir, so the output dir must be absolute.
+          bash packaging/deb/build.sh "$V" arm64 bins/agentty-linux-aarch64 "$PWD/dist"
+          bash packaging/rpm/build.sh "$V" aarch64 bins/agentty-linux-aarch64 "$PWD/dist"
+          gh release upload "$TAG" dist/*.deb dist/*.rpm --clobber
+
   # Runs last; regenerates SHA256SUMS over whatever is on the release. The
   # binaries are already live regardless of whether this finishes — it only
   # adds/refreshes the checksum file. `always()` so a single slow/failed build
   # leg still gets a checksum file for everything that did land.
   checksums:
     name: checksums
-    needs: [prepare, build-linux, build-macos, build-windows, package-linux]
+    needs:
+      - prepare
+      - build-linux-x86_64
+      - build-linux-aarch64
+      - build-linux-i686
+      - build-macos
+      - build-windows
+      - package-linux-x86_64
+      - package-linux-aarch64
     if: always()
     runs-on: ubuntu-latest
     env:
