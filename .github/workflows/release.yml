@@ -169,7 +169,7 @@ jobs:
       matrix:
         include:
           - arch: arm64
-            runner: macos-14   # Apple Silicon
+            runner: macos-15   # Apple Silicon (Xcode 16 / AppleClang 16+ for C++26)
           - arch: x86_64
             runner: macos-15-intel   # Intel (macos-13 retired)
     runs-on: ${{ matrix.runner }}
