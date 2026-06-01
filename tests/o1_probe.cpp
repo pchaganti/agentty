@@ -238,6 +238,59 @@ static double active_run_ms(int write_lines) {
     return best;
 }
 
+// Measures the STREAMING-WRITE render cost: a write tool that is
+// actively streaming (non-terminal, body growing) as the live tail.
+// This is the "streaming mutating tool" scenario the user feels as
+// slow. The live card is rebuilt + repainted every frame; we vary the
+// streamed body size and report per-frame render cost. If this grows
+// with body size, the streaming preview isn't bounding its work.
+static double streaming_write_ms(int streamed_lines) {
+    Model m;
+    m.d.current.id = agentty::ThreadId{"probe"};
+    Message u; u.role = Role::User; u.text = "write a big file";
+    m.d.current.messages.push_back(std::move(u));
+    Message a; a.role = Role::Assistant;
+    ToolUse t;
+    t.id   = ToolCallId{"sw_1"};
+    t.name = ToolName{"write"};
+    // Streaming state: the card body reads args["content"], which the
+    // reducer fills incrementally from stream_decoded_value during the
+    // stream. is_terminal is false → the streaming/tail-windowed preview.
+    t.args = {{"file_path", "src/foo.cpp"},
+              {"content", code_block(streamed_lines)}};
+    t.args_streaming = "{\"file_path\":\"src/foo.cpp\",\"content\":\"";
+    t.args_streaming += code_block(streamed_lines);   // approximate raw size
+    t.status = ToolUse::Running{steady_clock::now(), {}};
+    a.tool_calls.push_back(std::move(t));
+    m.d.current.messages.push_back(std::move(a));
+    m.s.phase = agentty::phase::Streaming{agentty::phase::Active{}};
+
+    agentty::app::detail::clear_frozen(m);
+    agentty::app::detail::freeze_through(m, 1);   // freeze the User
+    (void)agentty::app::detail::trim_frozen_if_oversized(m);
+
+    auto build_root = [&] {
+        return maya::AppLayout{{
+            .thread        = agentty::ui::thread_config(m),
+            .changes_strip = agentty::ui::changes_strip_config(m),
+            .composer      = agentty::ui::composer_config(m),
+            .status_bar    = agentty::ui::status_bar_config(m),
+            .overlay       = std::nullopt,
+        }}.build();
+    };
+    maya::StylePool pool;
+    maya::Canvas canvas(120, 4000, &pool);
+    double best = 1e9;
+    for (int i = 0; i < 9; ++i) {
+        auto root = build_root();
+        canvas.clear();
+        auto t0 = steady_clock::now();
+        maya::render_tree(root, canvas, pool, maya::theme::dark, true);
+        best = std::min(best, ms(steady_clock::now() - t0));
+    }
+    return best;
+}
+
 // SCALING breakdown: an in-flight run accumulating N settled edits,
 // one per sub-turn (the real auto-pilot shape), plus a streaming tail
 // keeping the run non-terminal. Measures view-build (turn_config) and
@@ -356,6 +409,18 @@ int main() {
     }
 
     scaling_breakdown();
+
+    // ── Streaming write: a write tool actively streaming as the live
+    // tail, body growing. This is the "streaming mutating tool" path
+    // the user reports as slow. Per-frame render should be FLAT in the
+    // streamed body size (the preview is tail-windowed); if it grows,
+    // the streaming card isn't bounding its layout/paint work.
+    std::printf("\nstreaming write (live card, growing body):\n");
+    std::printf("%-14s | %12s\n", "streamed_lines", "render_ms");
+    std::printf("---------------+--------------\n");
+    for (int sl : {50, 200, 800, 3000, 8000}) {
+        std::printf("%-14d | %12.3f\n", sl, streaming_write_ms(sl));
+    }
 
     // ── Rehydrate footprint: rows the resume freeze seeds to the wire.
     // The 30s open on a real long thread was the WIRE EMIT of tens of
