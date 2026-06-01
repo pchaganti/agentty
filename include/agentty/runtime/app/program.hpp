@@ -121,16 +121,32 @@ struct AgenttyApp {
         // deadlines, so a tight bucket here costs nothing when no
         // animation is live.
         //
-        // 33 ms = 30 fps — fast enough for the welcome screen's
-        // sine-wave wordmark bob, the streaming caret pulse, and
-        // the spinner. The composer cursor blink (530 ms period)
-        // still resolves correctly inside this bucket: two adjacent
-        // ~265 ms half-periods land in different 33 ms buckets so
-        // the toggle is captured.
+        // CRITICAL for idle CPU: this bucket is the ONLY thing that
+        // advances the hash on a time basis. If it ticks at 33ms
+        // unconditionally, a settled thread re-runs view()+render()
+        // 30x/sec FOREVER — and once a frame is large enough (right
+        // after a big edit/write) that its emit can't fully drain the
+        // non-blocking tty in one go, maya's loop holds needs_render
+        // true with a 0ms poll to drain the residue, so the 30Hz
+        // re-render compounds into a busy-spin (observed ~58% CPU,
+        // process state R). The fix: only tick at the fast 33ms rate
+        // when a fine-grained animation is actually on screen — the
+        // streaming caret, the spinner, or the welcome wordmark bob.
+        // When the thread is idle the only live animation is the
+        // composer cursor blink (~530ms period), so a 256ms bucket
+        // captures its toggle while cutting idle re-renders from
+        // 30/sec to ~4/sec. maya's RAF still wakes the loop for the
+        // blink; this only governs how often that wake turns into an
+        // actual repaint.
         const auto now_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
-        mix(static_cast<std::uint64_t>(now_ms / 33));
+        const bool fine_anim_live =
+            m.s.active()                              // spinner / streaming caret
+            || m.d.current.messages.empty()           // welcome wordmark bob
+            || !m.ui.composer.queued.empty();         // queued-chip pulse
+        const std::int64_t bucket_ms = fine_anim_live ? 33 : 256;
+        mix(static_cast<std::uint64_t>(now_ms / bucket_ms));
 
         return k;
     }
