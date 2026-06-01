@@ -174,6 +174,69 @@ static double live_tail_ms(Model& m) {
     return best;
 }
 
+// Measures the ACTIVE-RUN render cost — the real symptom. Simulates an
+// in-flight auto-pilot run: the session is active (spinner ticking),
+// and the final assistant run has an EARLIER sub-turn carrying a
+// completed big write/edit card plus a streaming tail sub-turn. The
+// whole run is non-terminal (the tail streams), so freeze_through
+// can't freeze it — it stays in the live tail and repaints every
+// frame. This is what the user feels "while edit/write tools are
+// used": the big card from a prior sub-turn re-laid-out 30-60x/sec
+// for the rest of the run.
+static double active_run_ms(int write_lines) {
+    Model m;
+    m.d.current.id = agentty::ThreadId{"probe"};
+    // A couple of settled exchanges first.
+    for (int t = 0; t < 3; ++t) {
+        Message u; u.role = Role::User; u.text = "do the thing please";
+        m.d.current.messages.push_back(std::move(u));
+        Message a; a.role = Role::Assistant; a.text = "On it.";
+        a.tool_calls.push_back(write_tool(write_lines));
+        m.d.current.messages.push_back(std::move(a));
+    }
+    // In-flight run: User + assistant sub-turn with a DONE big write +
+    // a streaming sub-turn (the tail) that keeps the run non-terminal.
+    {
+        Message u; u.role = Role::User; u.text = "now do more";
+        m.d.current.messages.push_back(std::move(u));
+        Message a1; a1.role = Role::Assistant; a1.text = "Working on it.";
+        a1.tool_calls.push_back(write_tool(write_lines));   // DONE, settled
+        m.d.current.messages.push_back(std::move(a1));
+        Message a2; a2.role = Role::Assistant;              // streaming tail
+        a2.streaming_text = "Let me also";
+        m.d.current.messages.push_back(std::move(a2));
+    }
+    // Mark the session active so reserve_slot / spinner engage exactly
+    // as in the real run loop.
+    m.s.phase = agentty::phase::Streaming{agentty::phase::Active{}};
+
+    agentty::app::detail::clear_frozen(m);
+    agentty::app::detail::freeze_through(m, m.d.current.messages.size());
+    (void)agentty::app::detail::trim_frozen_if_oversized(m);
+
+    auto build_root = [&] {
+        return maya::AppLayout{{
+            .thread        = agentty::ui::thread_config(m),
+            .changes_strip = agentty::ui::changes_strip_config(m),
+            .composer      = agentty::ui::composer_config(m),
+            .status_bar    = agentty::ui::status_bar_config(m),
+            .overlay       = std::nullopt,
+        }}.build();
+    };
+
+    maya::StylePool pool;
+    maya::Canvas canvas(120, 4000, &pool);
+    double best = 1e9;
+    for (int i = 0; i < 7; ++i) {
+        auto root = build_root();
+        canvas.clear();
+        auto t0 = steady_clock::now();
+        maya::render_tree(root, canvas, pool, maya::theme::dark, true);
+        best = std::min(best, ms(steady_clock::now() - t0));
+    }
+    return best;
+}
+
 int main() {
     struct Shape { const char* name; int turns; int lines; };
     Shape shapes[] = {
@@ -186,16 +249,17 @@ int main() {
         {"200t x 500-line", 200, 500},
         {"500t x 500-line", 500, 500},
     };
-    std::printf("%-18s | %12s | %10s | %10s | %12s\n",
-                "shape", "frozen_rows", "cold_ms", "warm_ms", "livetail_ms");
-    std::printf("-------------------+--------------+------------+------------+--------------\n");
+    std::printf("%-18s | %12s | %10s | %10s | %12s | %12s\n",
+                "shape", "frozen_rows", "cold_ms", "warm_ms", "livetail_ms", "activerun_ms");
+    std::printf("-------------------+--------------+------------+------------+--------------+--------------\n");
     for (auto& s : shapes) {
         auto m  = build(s.turns, s.lines);
         auto c  = warm_render_ms(m);
         auto m2 = build(s.turns, s.lines);
         double lt = live_tail_ms(m2);
-        std::printf("%-18s | %12zu | %10.2f | %10.2f | %12.2f\n",
-                    s.name, m.ui.frozen_row_total, c.cold, c.warm, lt);
+        double ar = active_run_ms(s.lines);
+        std::printf("%-18s | %12zu | %10.2f | %10.2f | %12.2f | %12.2f\n",
+                    s.name, m.ui.frozen_row_total, c.cold, c.warm, lt, ar);
     }
     return 0;
 }

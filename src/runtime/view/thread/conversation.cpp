@@ -24,6 +24,7 @@
 #include <utility>
 
 #include <maya/dsl.hpp>
+#include <maya/render/cache_id.hpp>
 #include <maya/widget/activity_indicator.hpp>
 #include <maya/widget/conversation.hpp>
 #include <maya/widget/permission.hpp>
@@ -118,7 +119,17 @@ void build_live_tail(const Model& m, int& running_turn,
                 && tail.streaming_text.empty()
                 && tail.pending_stream.empty()
                 && tail.tool_calls.empty();
-            const bool reserve_slot   = m.s.active();
+            // Only the LAST run in the tail is the in-flight one whose
+            // height must stay reserved across the indicator↔content
+            // flip. Earlier runs in the tail are already settled (the
+            // model moved on to a new sub-turn) — giving them a spacer
+            // both wastes 2 rows and, more importantly, makes their
+            // body shape differ from what freeze_range will build,
+            // which would prevent the hash_id cache below from engaging
+            // and force a full repaint of their (possibly huge) bodies
+            // every frame for the whole duration of the active run.
+            const bool is_last_run     = (run_end >= total);
+            const bool reserve_slot   = m.s.active() && is_last_run;
             const bool show_indicator = reserve_slot && tail_is_empty_placeholder;
             if (show_indicator) {
                 using namespace maya::dsl;
@@ -162,6 +173,38 @@ void build_live_tail(const Model& m, int& running_turn,
                 // across the indicator↔content transition.
                 using namespace maya::dsl;
                 cfg.body.emplace_back(v(text(""), text("")).build());
+            }
+
+            // Cache the settled-but-not-yet-frozen run. A run sitting in
+            // the live tail with every tool terminal and no active
+            // stream is byte-stable: its body (which may include a
+            // multi-thousand-line write/edit card) won't change until
+            // freeze_through moves it into m.ui.frozen. Without a
+            // hash_id the live tail has no cache entry, so maya REBUILDS
+            // and REPAINTS that whole body every frame — a 3000-line
+            // write in the tail measured ~80ms/frame (o1_probe
+            // livetail_ms column). Stamping the SAME key freeze_range
+            // will use means: (a) the body paints once and blits
+            // thereafter while it waits to freeze, and (b) the cache
+            // entry survives the freeze handoff (identical key) so the
+            // freeze instant is seamless. Only when the run is fully
+            // terminal AND no indicator/spinner slot was added (those
+            // mutate per frame and must miss).
+            const bool run_terminal = [&] {
+                for (std::size_t j = i; j < run_end; ++j)
+                    for (const auto& tc : m.d.current.messages[j].tool_calls)
+                        if (!tc.is_terminal()) return false;
+                return true;
+            }();
+            if (run_terminal && !reserve_slot) {
+                maya::CacheIdBuilder kb;
+                kb.add(std::string_view{"agentty.turn.assistant_run"})
+                  .add(static_cast<std::uint64_t>(run_end - i));
+                for (std::size_t j = i; j < run_end; ++j) {
+                    kb.add(std::string_view{m.d.current.messages[j].id.value});
+                    kb.add(m.d.current.messages[j].compute_render_key());
+                }
+                cfg.hash_id = kb.build();
             }
             out.push_back(maya::Turn{std::move(cfg)}.build());
             ++running_turn;
