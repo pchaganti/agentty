@@ -4,6 +4,9 @@ All notable changes to agentty. Versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Transient backoff that never recovered + frequent "stream stalled" after long sessions.** `transient_retries` only reset to 0 on the first content *delta*, so a stream that connected, sent heartbeats, then went silent before any byte (common during brown-outs and long opus turns) climbed the retry ladder every attempt until it hit `kMaxRetries` and latched terminal — the session was dead until restart. Two fixes: (1) a heartbeat (SSE `ping` / `thinking_delta`) now resets the retry budget too, since it proves the wire is alive even pre-content; (2) the budget decays over wall-clock time — if the previous failure was longer ago than `kRetryDecayWindow` (90 s) the connection was healthy in between, so the new failure starts a fresh ladder instead of inheriting an unrelated earlier blip. Net effect: fast-failing connections (refused/reset within 90 s) still converge to terminal at attempt 6, but slow stalls minutes apart recover indefinitely. `Esc` still breaks the loop at any point.
+
 ## [0.1.1]
 
 ### Added

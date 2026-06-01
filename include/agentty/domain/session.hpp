@@ -76,8 +76,24 @@ struct Active {
     // Per-turn retry counters. truncation_retries: silent re-launches
     // when the stream EOFs mid-tool-args. transient_retries: 5xx /
     // network / overloaded / 429. Independent budgets.
+    //
+    // transient_retries is NOT purely monotonic per turn: it resets to
+    // 0 whenever the wire proves healthy — first content delta OR a
+    // heartbeat (SSE ping / thinking_delta). A stream that connects,
+    // pings, then stalls before any content used to climb the ladder
+    // every attempt and hit kMaxRetries with the session dead; the
+    // heartbeat reset gives each healthy-then-stalled attempt a fresh
+    // budget so long sessions recover instead of latching terminal.
     int truncation_retries = 0;
     int transient_retries  = 0;
+
+    // Wall-clock stamp of the last transient/stall failure. The retry
+    // decision decays the budget: if the previous failure was more
+    // than kRetryDecayWindow ago the connection has been healthy in
+    // the interim, so transient_retries resets before counting this
+    // one. Stops a multi-hour session from accumulating unrelated
+    // brown-out failures into a permanent budget exhaustion.
+    std::chrono::steady_clock::time_point last_failure_at{};
 
     // Live tok/s speedometer — bytes of text/json delta, not the rare
     // usage field. first_delta_at excludes TTFT from the rate divisor.

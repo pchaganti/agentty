@@ -206,6 +206,15 @@ backoff_with_jitter(ErrorClass kind, int attempt) noexcept {
 // long outages. Esc still breaks the loop at any point.
 inline constexpr int kMaxRetries = 6;
 
+// Budget-decay window. transient_retries is a per-turn counter, but a
+// long session sees unrelated brown-outs accrue into it. If the prior
+// failure was longer ago than this, the connection has been healthy in
+// the interim, so the retry decision resets the counter to 0 before
+// counting the new failure. Decoupled from kMaxRetries so a slow
+// regional incident (failures every 20-45 s, within the window) still
+// converges to terminal, while transient blips minutes apart never do.
+inline constexpr std::chrono::seconds kRetryDecayWindow{90};
+
 [[nodiscard]] constexpr std::string_view to_string(ErrorClass k) noexcept {
     switch (k) {
         case ErrorClass::Transient: return "transient";

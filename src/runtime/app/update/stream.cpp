@@ -1248,8 +1248,18 @@ Step stream_update(Model m, msg::StreamMsg sm) {
             // passes where the model reasons silently for 60-120 s
             // between visible deltas; without this the watchdog would
             // fire on every non-trivial opus turn.
-            if (auto* a = active_ctx(m.s.phase))
+            if (auto* a = active_ctx(m.s.phase)) {
                 a->last_event_at = std::chrono::steady_clock::now();
+                // A heartbeat proves the wire is alive even before any
+                // content delta. Reset the retry budget so a stream
+                // that connects, pings, then stalls before its first
+                // byte gets a fresh ladder instead of inheriting the
+                // connect-time attempts. This is the pre-delta analogue
+                // of the first-delta reset in StreamTextDelta and the
+                // primary fix for sessions that latched terminal after
+                // a run of healthy-but-stalled attempts.
+                a->transient_retries = 0;
+            }
             return done(std::move(m));
         },
         [&](StreamFinished e) -> Step {
@@ -1317,6 +1327,16 @@ Step stream_update(Model m, msg::StreamMsg sm) {
 
                 const phase::Active* cctx = active_ctx(m.s.phase);
                 int prior = cctx ? cctx->transient_retries : 0;
+                // Same budget-decay as the normal path: a compaction
+                // that failed long after the last failure starts fresh.
+                {
+                    auto cnow = std::chrono::steady_clock::now();
+                    if (cctx
+                        && cctx->last_failure_at.time_since_epoch().count() != 0
+                        && cnow - cctx->last_failure_at >= provider::kRetryDecayWindow) {
+                        prior = 0;
+                    }
+                }
                 const bool can_retry_compact =
                     cctx
                     && (klass == provider::ErrorClass::Transient
@@ -1349,6 +1369,7 @@ Step stream_update(Model m, msg::StreamMsg sm) {
                     m.s.compaction_buffer.clear();
                     auto ctx = take_active_ctx(std::move(m.s.phase)).value();
                     ctx.transient_retries = prior + 1;
+                    ctx.last_failure_at   = std::chrono::steady_clock::now();
                     ctx.retry             = retry::Scheduled{};
                     m.s.phase = phase::Streaming{std::move(ctx)};
                     return {std::move(m),
@@ -1457,6 +1478,21 @@ Step stream_update(Model m, msg::StreamMsg sm) {
             }
             const phase::Active* err_ctx = active_ctx(m.s.phase);
             int prior_transient = err_ctx ? err_ctx->transient_retries : 0;
+            // Budget decay: if the previous failure on this ctx was
+            // longer ago than kRetryDecayWindow, the wire was healthy in
+            // between (no failure, no stall for that whole window), so
+            // this failure starts a fresh ladder instead of inheriting
+            // an unrelated brown-out from earlier in a long turn. Keeps
+            // a multi-hour session from accumulating sporadic blips into
+            // a permanent terminal latch.
+            {
+                auto now = std::chrono::steady_clock::now();
+                if (err_ctx
+                    && err_ctx->last_failure_at.time_since_epoch().count() != 0
+                    && now - err_ctx->last_failure_at >= provider::kRetryDecayWindow) {
+                    prior_transient = 0;
+                }
+            }
 
             // ── Auth (401/403): try a one-shot OAuth refresh ─────────
             // The bearer token expired (or was rotated) mid-session.
@@ -1492,6 +1528,7 @@ Step stream_update(Model m, msg::StreamMsg sm) {
                     // counters and the Scheduled retry sentinel.
                     auto ctx = take_active_ctx(std::move(m.s.phase)).value();
                     ctx.transient_retries = prior_transient + 1;
+                    ctx.last_failure_at   = std::chrono::steady_clock::now();
                     ctx.retry             = retry::Scheduled{};
                     m.s.phase = phase::Streaming{std::move(ctx)};
                     if (last) m.d.current.messages.pop_back();
@@ -1540,6 +1577,7 @@ Step stream_update(Model m, msg::StreamMsg sm) {
                                  + delay + std::chrono::milliseconds{1500};
                 auto ctx = take_active_ctx(std::move(m.s.phase)).value();
                 ctx.transient_retries = attempt + 1;
+                ctx.last_failure_at   = std::chrono::steady_clock::now();
                 ctx.retry             = retry::Scheduled{};
                 m.s.phase = phase::Streaming{std::move(ctx)};
                 if (last) m.d.current.messages.pop_back();
