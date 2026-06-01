@@ -43,6 +43,20 @@ namespace agentty::app::detail {
 
 namespace {
 
+// Live-canvas row budget = a small multiple of the terminal viewport.
+// The live m.ui.frozen vector IS the inline canvas; every full repaint
+// (resume swap, resize→Divergent wipe+repaint, Ctrl-L) walks it top to
+// bottom and the user sees the paint. Bounding it to ~2 screens keeps
+// all three cheap. Older rows live in native terminal scrollback (the
+// terminal redraws them instantly) and on disk (recall via picker).
+std::size_t frozen_row_budget() {
+    const auto sz = maya::platform::query_terminal_size(
+        maya::platform::stdout_handle());
+    const int h = sz.height.value > 0 ? sz.height.value : 40;
+    // ~2 viewports, floored so a tiny window still keeps useful context.
+    return static_cast<std::size_t>(std::max(48, h * 2));
+}
+
 // Thin dim ─ rule between turns. Pushed before each fresh-speaker
 // turn so settled turns are visually separated.
 maya::Element gap_row() {
@@ -390,20 +404,20 @@ void rehydrate_frozen(Model& m) {
     const std::size_t total = msgs.size();
     if (total == 0) return;
 
-    // Bounded rehydrate. The CPU-side resume cost is small (~200 ms on
-    // the largest real threads: load + rehydrate + cold render). The
-    // 30 s open the user hit was the WIRE EMIT: maya's first frame
-    // pushes every frozen canvas row to the terminal row-by-row, and
-    // for a thread that rehydrated to ~36 000 rows that is the terminal
-    // physically scrolling through 36 000 lines. There is no way to
-    // seed native scrollback faster than the terminal can paint it.
+    // Bounded rehydrate. The live frozen vector IS the inline canvas:
+    // every full repaint maya does (resume swap, RESIZE → Divergent
+    // wipe+repaint, Ctrl-L) walks the whole canvas top-to-bottom, and
+    // the user WATCHES that paint. So the live canvas height — not just
+    // resume — is what must stay small. A generous 1500-row seed still
+    // means every resize repaints 1500 rows from the top.
     //
-    // So we seed only a bounded tail — the SAME row window the live app
-    // ever re-renders (kFrozenMaxRows in trim_frozen_if_oversized).
-    // Anything older than that the app would trim out of its live tree
-    // the moment you interacted anyway, and it lives intact on disk
-    // (recall it via the thread picker). This keeps scroll-up showing
-    // a generous, instant slice of recent history without a 30 s paint.
+    // Bound the seed to a SMALL multiple of the viewport (~2 screens).
+    // Everything older was emitted to the terminal's NATIVE scrollback
+    // on the very first paint (or while live), so scroll-up still shows
+    // it — painted instantly by the terminal, never re-emitted by us.
+    // The full transcript is intact on disk; recall older context via
+    // the picker. Keeping the canvas ~2 screens makes resume, resize,
+    // and redraw all paint only ~2 screens.
     //
     // Walk backward over whole speaker-runs accumulating estimated
     // rows; stop after the run that crosses the budget so the most
@@ -411,7 +425,7 @@ void rehydrate_frozen(Model& m) {
     // the budget, cut INSIDE it at sub-turn granularity (keep the
     // trailing sub-turns that fit) so even a giant final auto-pilot run
     // resumes fast.
-    constexpr std::size_t kRehydrateRowBudget = 1500;
+    const std::size_t kRehydrateRowBudget = frozen_row_budget();
     std::size_t units      = 0;
     std::size_t row_budget = 0;
     std::size_t start      = total;
@@ -511,7 +525,14 @@ maya::Cmd<Msg> trim_frozen_if_oversized(Model& m) {
     // full bodies are NEVER collapsed (the `show_all` UX is intact);
     // they simply graduate from the in-app re-render window into
     // native terminal scrollback.
-    constexpr std::size_t kFrozenMaxRows = 1500;
+    // Live-canvas row cap = ~2 viewports (same budget rehydrate seeds
+    // to, so steady-state and resume agree). Above it, the oldest
+    // entries are dropped; maya's row diff sees a shorter live tree and
+    // the already-overflowed rows commit to native scrollback. Bounding
+    // the canvas to ~2 screens keeps EVERY full repaint cheap — the
+    // per-frame tick, a resize (Divergent wipe+repaint), and Ctrl-L all
+    // walk only ~2 screens instead of thousands of rows.
+    const std::size_t kFrozenMaxRows = frozen_row_budget();
     constexpr std::size_t kFrozenMaxEntries = 120;
     // Retention floor. Expressed in ROWS, not a fixed entry count: the
     // canvas blit cost is O(rows), and even on a cache HIT maya copies
