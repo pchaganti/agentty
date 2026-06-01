@@ -54,6 +54,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <chrono>
 #include <list>
 #include <memory>
@@ -123,11 +124,24 @@ struct MessageMdCache {
 };
 
 struct TurnConfigCache {
-    // Reserved for future per-(thread, msg) view-state. Empty for now —
-    // the legacy `agent_timeline` slot was removed: settled assistant
-    // panels are built into m.ui.frozen by freeze_range and never
-    // re-rendered from this cache, so the slot was populated and
-    // immediately bypassed forever.
+    // Cached AgentTimeline panel Element for a settled sub-turn.
+    //
+    // During a long auto-pilot tool loop the whole assistant run stays
+    // in the LIVE tail (mid-stream freezing is forbidden — it would
+    // split one visual Turn across the frozen/live seam, see
+    // cmd_factory.cpp). So every sub-turn's tool panel is rebuilt +
+    // re-laid-out + re-painted every frame until finalize_turn at Idle.
+    // Per-event maya cell caching (hash_id) is disabled because it
+    // corrupts inline scrollback, so we can't blit — but we CAN skip
+    // rebuilding the panel Element for a sub-turn whose tools have ALL
+    // gone terminal: its rendered shape is frozen until the message is
+    // edited (which mints a new MessageId → new cache slot). Cache the
+    // built Element keyed on the message's render key; reuse it while
+    // the key matches. Pure Element-value reuse — no hash_id, no
+    // compose-path change, no corruption risk. Only the in-flight
+    // sub-turn (some tool still Running/Pending) rebuilds each frame.
+    std::shared_ptr<maya::Element>            settled_panel;
+    std::uint64_t                             settled_panel_key = 0;
 };
 
 // LRU-bounded render cache. Both the markdown render and the turn-config

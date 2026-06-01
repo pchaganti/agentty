@@ -1,5 +1,6 @@
 #include "agentty/runtime/view/thread/turn/turn.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <optional>
@@ -407,6 +408,56 @@ void append_assistant_tool_panel(maya::Turn::Config& cfg,
         agent_timeline_config(tool_calls, frame, style.color)}.build());
 }
 
+// Cached variant: append THIS sub-turn message's tool panel, reusing a
+// cached Element when every tool in the message is terminal.
+//
+// Why this exists: during a long auto-pilot tool loop the whole
+// assistant run lives in the rebuilt-every-frame live tail (mid-stream
+// freezing is forbidden). Without caching, every settled sub-turn's
+// panel is re-laid-out + re-painted every frame, so per-frame cost
+// grows O(sub-turns-in-run) for the duration of the loop. A sub-turn
+// whose tools are ALL terminal has a frozen rendered shape (its bytes
+// are immutable; an edit replaces the Message wholesale with a new
+// MessageId → fresh cache slot), so we build its panel Element ONCE and
+// reuse it while the message's render key matches. Pure Element-value
+// reuse — no maya hash_id, no compose-path change, so it cannot
+// reintroduce the per-event-cache scrollback corruption (see
+// agent_timeline.cpp). The in-flight sub-turn (some tool still
+// Running/Pending, or its render key still moving) always rebuilds.
+void append_cached_tool_panel(maya::Turn::Config& cfg,
+                              const Message& msg,
+                              const Model& m,
+                              const SpeakerStyle& style)
+{
+    if (msg.tool_calls.empty()) return;
+
+    const bool all_terminal = std::all_of(
+        msg.tool_calls.begin(), msg.tool_calls.end(),
+        [](const ToolUse& tc) { return tc.is_terminal(); });
+
+    if (!all_terminal) {
+        // In-flight panel — spinner frame moves, status changes; build
+        // fresh so the live card animates.
+        append_assistant_tool_panel(
+            cfg, std::span<const ToolUse>{msg.tool_calls}, m, style);
+        return;
+    }
+
+    auto& slot = m.ui.view_cache.turn_config(m.d.current.id, msg.id);
+    const std::uint64_t key = msg.compute_render_key();
+    if (!slot.settled_panel || slot.settled_panel_key != key) {
+        // Spinner frame is irrelevant for a settled panel (no running
+        // tool), so a fixed 0 keeps the cached build deterministic.
+        slot.settled_panel = std::make_shared<maya::Element>(
+            maya::AgentTimeline{
+                agent_timeline_config(
+                    std::span<const ToolUse>{msg.tool_calls}, 0,
+                    style.color)}.build());
+        slot.settled_panel_key = key;
+    }
+    cfg.body.emplace_back(*slot.settled_panel);
+}
+
 // Single-message body slot append: text (if any) then this message's
 // tool panel (if any). Used by `turn_config` for non-run-merged
 // renders (User turns delegate to a different branch; this is hit by
@@ -586,10 +637,7 @@ maya::Turn::Config turn_config_for_assistant_run(
             cfg.body.emplace_back(cached_markdown_for(m_i, m));
         }
         if (!m_i.tool_calls.empty()) {
-            append_assistant_tool_panel(
-                cfg,
-                std::span<const ToolUse>{m_i.tool_calls},
-                m, style);
+            append_cached_tool_panel(cfg, m_i, m, style);
         }
         if (m_i.error && error_accum.empty()) error_accum = *m_i.error;
     }
