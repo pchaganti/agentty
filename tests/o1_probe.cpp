@@ -129,6 +129,51 @@ static RenderCost warm_render_ms(Model& m) {
     return {cold, warm};
 }
 
+// Measures the LIVE-TAIL render cost: the most-recent turn is NOT
+// frozen — it sits in cfg.live_tail, which carries no hash_id and is
+// REBUILT + REPAINTED from scratch on every frame. This is what the
+// user feels WHILE a write/edit tool is active (streaming or just
+// settled-but-not-yet-frozen): the in-flight turn's whole body —
+// including a 3000-line write card — is re-laid-out and re-painted
+// 30-60x/sec. freeze_through stops at the last user message so the
+// final assistant run stays live, exactly as during an active run.
+static double live_tail_ms(Model& m) {
+    agentty::app::detail::clear_frozen(m);
+    // Freeze everything EXCEPT the final assistant run: find the last
+    // User message and freeze up to it, leaving the trailing turn live.
+    const auto& msgs = m.d.current.messages;
+    std::size_t live_start = msgs.size();
+    for (std::size_t k = msgs.size(); k-- > 0; ) {
+        if (msgs[k].role == Role::User) { live_start = k; break; }
+    }
+    agentty::app::detail::freeze_through(m, live_start);
+    (void)agentty::app::detail::trim_frozen_if_oversized(m);
+
+    auto build_root = [&] {
+        return maya::AppLayout{{
+            .thread        = agentty::ui::thread_config(m),
+            .changes_strip = agentty::ui::changes_strip_config(m),
+            .composer      = agentty::ui::composer_config(m),
+            .status_bar    = agentty::ui::status_bar_config(m),
+            .overlay       = std::nullopt,
+        }}.build();
+    };
+
+    maya::StylePool pool;
+    maya::Canvas canvas(120, 4000, &pool);
+    // Real loop: rebuild the tree AND repaint every frame (live tail
+    // has no hash_id, so there's no cache to prime).
+    double best = 1e9;
+    for (int i = 0; i < 7; ++i) {
+        auto root = build_root();
+        canvas.clear();
+        auto t0 = steady_clock::now();
+        maya::render_tree(root, canvas, pool, maya::theme::dark, true);
+        best = std::min(best, ms(steady_clock::now() - t0));
+    }
+    return best;
+}
+
 int main() {
     struct Shape { const char* name; int turns; int lines; };
     Shape shapes[] = {
@@ -141,14 +186,16 @@ int main() {
         {"200t x 500-line", 200, 500},
         {"500t x 500-line", 500, 500},
     };
-    std::printf("%-18s | %12s | %12s | %12s\n",
-                "shape", "frozen_rows", "cold_ms", "warm_ms");
-    std::printf("-------------------+--------------+--------------+--------------\n");
+    std::printf("%-18s | %12s | %10s | %10s | %12s\n",
+                "shape", "frozen_rows", "cold_ms", "warm_ms", "livetail_ms");
+    std::printf("-------------------+--------------+------------+------------+--------------\n");
     for (auto& s : shapes) {
-        auto m = build(s.turns, s.lines);
-        auto c = warm_render_ms(m);
-        std::printf("%-18s | %12zu | %12.2f | %12.2f\n",
-                    s.name, m.ui.frozen_row_total, c.cold, c.warm);
+        auto m  = build(s.turns, s.lines);
+        auto c  = warm_render_ms(m);
+        auto m2 = build(s.turns, s.lines);
+        double lt = live_tail_ms(m2);
+        std::printf("%-18s | %12zu | %10.2f | %10.2f | %12.2f\n",
+                    s.name, m.ui.frozen_row_total, c.cold, c.warm, lt);
     }
     return 0;
 }
