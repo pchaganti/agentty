@@ -915,4 +915,13 @@ if(AGENTTY_BUILD_TESTS)
             "-framework CoreFoundation")
     endif()
     add_test(NAME midrun_freeze_test COMMAND midrun_freeze_test)
+
+    # table_render_test — pins maya's GFM table classification: a
+    # well-formed table (header line starts at '|', blank line before)
+    # is a Table block; a malformed one with lead-in prose on the header
+    # line is a Paragraph (the wall-of-pipes a model produced). Standalone
+    # against maya only — no agentty sources needed.
+    add_executable(table_render_test tests/table_render_test.cpp)
+    target_link_libraries(table_render_test PRIVATE maya::maya)
+    add_test(NAME table_render_test COMMAND table_render_test)
 endif()
