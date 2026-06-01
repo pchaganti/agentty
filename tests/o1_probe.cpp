@@ -43,6 +43,11 @@ static double ms(steady_clock::duration d) {
     return duration_cast<duration<double, std::milli>>(d).count();
 }
 
+// Side-channel: the most recent streaming_write_ms() view-build time,
+// so main() can print it alongside the paint time without restructuring
+// the function's return.
+static double g_last_stream_view_ms = 0.0;
+
 static std::string code_block(int n) {
     std::string out;
     for (int i = 0; i < n; ++i)
@@ -280,14 +285,18 @@ static double streaming_write_ms(int streamed_lines) {
     };
     maya::StylePool pool;
     maya::Canvas canvas(120, 4000, &pool);
-    double best = 1e9;
+    double best = 1e9, best_view = 1e9;
     for (int i = 0; i < 9; ++i) {
+        auto t_v0 = steady_clock::now();
         auto root = build_root();
+        auto t_v1 = steady_clock::now();
         canvas.clear();
         auto t0 = steady_clock::now();
         maya::render_tree(root, canvas, pool, maya::theme::dark, true);
         best = std::min(best, ms(steady_clock::now() - t0));
+        best_view = std::min(best_view, ms(t_v1 - t_v0));
     }
+    g_last_stream_view_ms = best_view;
     return best;
 }
 
@@ -416,10 +425,11 @@ int main() {
     // streamed body size (the preview is tail-windowed); if it grows,
     // the streaming card isn't bounding its layout/paint work.
     std::printf("\nstreaming write (live card, growing body):\n");
-    std::printf("%-14s | %12s\n", "streamed_lines", "render_ms");
-    std::printf("---------------+--------------\n");
+    std::printf("%-14s | %12s | %12s\n", "streamed_lines", "view_ms", "render_ms");
+    std::printf("---------------+--------------+--------------\n");
     for (int sl : {50, 200, 800, 3000, 8000}) {
-        std::printf("%-14d | %12.3f\n", sl, streaming_write_ms(sl));
+        double r = streaming_write_ms(sl);
+        std::printf("%-14d | %12.3f | %12.3f\n", sl, g_last_stream_view_ms, r);
     }
 
     // ── Rehydrate footprint: rows the resume freeze seeds to the wire.

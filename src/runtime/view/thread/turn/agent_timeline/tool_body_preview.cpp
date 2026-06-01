@@ -65,6 +65,36 @@ void accumulate_grep_hits(const std::string& output, GrepHits& out) {
     }
 }
 
+// During streaming the body grows by a delta every ~120ms and the view
+// rebuilds the whole Turn every frame. Handing maya the FULL content
+// means: (a) an O(N) std::move copy into the Config, and (b) maya's
+// split_lines/elide/count_lines each walk the entire body — all to
+// render the last few tail lines. Slice to a bounded tail window on our
+// side so per-frame cost is O(window), not O(file). maya's FileWrite /
+// CodeBlock / FileRead renderers are tail-anchored (show_all=false →
+// last code_tail lines), so the visible output is byte-identical to
+// feeding the full body. Keep a generous margin (kStreamTailLines) so
+// the widget's tail budget is always satisfied. When the tool goes
+// terminal the caller feeds the full content (show_all=true) and the
+// final card renders everything.
+constexpr std::size_t kStreamTailLines = 64;
+
+[[nodiscard]] std::string tail_window(std::string_view s,
+                                      std::size_t keep_lines) {
+    if (s.empty()) return {};
+    // Walk backwards counting newlines; stop after keep_lines+1 of them
+    // (the +1 anchors the start of the first kept line).
+    std::size_t nl_seen = 0;
+    std::size_t start = s.size();
+    for (std::size_t i = s.size(); i-- > 0;) {
+        if (s[i] == '\n') {
+            if (++nl_seen > keep_lines) { start = i + 1; break; }
+        }
+        if (i == 0) start = 0;
+    }
+    return std::string{s.substr(start)};
+}
+
 } // namespace
 
 GrepHits collect_grep_hits(std::span<const ToolUse> tool_calls) {
@@ -210,7 +240,6 @@ maya::ToolBodyPreview::Config tool_body_preview_config(
         const bool streaming_now = !tc.is_terminal();
         if (!content.empty()) {
             out.kind = Kind::FileWrite;
-            out.text = std::move(content);
             out.text_color = text_tertiary;
             out.show_footer_stats = true;
             // During streaming the body grows every ~120 ms — `show_all`
@@ -224,6 +253,21 @@ maya::ToolBodyPreview::Config tool_body_preview_config(
             // the body is final.
             out.show_all     = !streaming_now;
             out.is_streaming = streaming_now;
+            if (streaming_now) {
+                // Feed maya only the tail window. The widget renders just
+                // the last few lines while streaming (show_all=false), so
+                // slicing here makes the per-frame copy + split_lines
+                // O(window) instead of O(file) — the dominant cost when a
+                // large write streams in. maya's footer derives N-lines /
+                // bytes from out.text, so a sliced body would show a wrong
+                // total; suppress it mid-stream (the status bar carries the
+                // live byte/tok rate) and it returns with the true total
+                // the instant the tool goes terminal (full body, show_all).
+                out.text = tail_window(content, kStreamTailLines);
+                out.show_footer_stats = false;
+            } else {
+                out.text = std::move(content);
+            }
         } else if (tc.is_running()) {
             out.kind = Kind::FileWrite;
             out.text_color = text_tertiary;
