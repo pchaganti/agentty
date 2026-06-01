@@ -227,18 +227,49 @@ std::optional<Msg> on_login(const ui::login::State& state, const KeyEvent& ev) {
 }
 
 std::optional<Msg> on_global(const KeyEvent& ev) {
-    if (ev.mods.ctrl) {
-        if (auto* ck = std::get_if<CharKey>(&ev.key)) {
-            switch (static_cast<char>(ck->codepoint)) {
-                case 'c': case 'C': return Quit{};
-                case '/':           return OpenModelPicker{};
-                case 'j': case 'J': return OpenThreadList{};
-                case 'k': case 'K': return OpenCommandPalette{};
-                case 'l': case 'L': return RedrawScreen{};
-                case 'r': case 'R': return OpenDiffReview{};
-                case 'n': case 'N': return NewThread{};
-                case 't': case 'T': return OpenTodoModal{};
-                case 'e': case 'E': return ComposerToggleExpand{};
+    // Ctrl-J on legacy terminals (iSH, plain xterm, tmux without KKP /
+    // modifyOtherKeys) arrives as the bare LF byte 0x0A. maya's input
+    // parser folds BOTH \r (0x0D) and \n (0x0A) into SpecialKey::Enter,
+    // so by the time we see it the key looks identical to Return — and
+    // every other Ctrl shortcut works because they arrive as distinct
+    // control bytes, but Ctrl-J gets swallowed into Enter. The only
+    // surviving discriminator is raw_sequence, which preserves the
+    // original byte: Return sends \r, Ctrl-J sends \n. Recover the
+    // OpenThreadList binding from that.  (Terminals that map Return to
+    // LF can't distinguish the two; there Ctrl-J is simply unavailable,
+    // which is unavoidable for this keystroke.)
+    if (std::holds_alternative<SpecialKey>(ev.key)
+        && std::get<SpecialKey>(ev.key) == SpecialKey::Enter
+        && !ev.mods.shift && !ev.mods.alt && !ev.mods.ctrl
+        && ev.raw_sequence == "\n")
+        return OpenThreadList{};
+    if (auto* ck = std::get_if<CharKey>(&ev.key)) {
+        char32_t c = ck->codepoint;
+        // Legacy terminals (iSH, plain xterm, tmux without KKP /
+        // modifyOtherKeys) deliver Ctrl-<letter> as the raw control
+        // byte 0x01..0x1A with NO ctrl modifier flag set — e.g. Ctrl-K
+        // arrives as 0x0B. Normalise that to the lower-case letter with
+        // ctrl implied so the shortcuts fire regardless of keyboard-
+        // protocol support. (Ctrl-J / 0x0A is handled above since maya
+        // turns it into Enter before we ever see it as a CharKey.)
+        const bool raw_ctrl = (c >= 0x01 && c <= 0x1A);
+        if (raw_ctrl) c = U'a' + (c - 1);
+        // 0x09 (Ctrl-I / Tab) and 0x0D (Ctrl-M / Enter) are excluded:
+        // those are unconditionally Tab / Enter on legacy terminals and
+        // hijacking them would break tab-completion and submit.
+        const bool ctrl = ev.mods.ctrl || (raw_ctrl && c != U'i' && c != U'm');
+        if (ctrl) {
+            switch (c) {
+                case U'c': case U'C': return Quit{};
+                case U'/':           return OpenModelPicker{};
+                case U'j': case U'J': return OpenThreadList{};
+                case U'k': case U'K': return OpenCommandPalette{};
+                case U'l': case U'L': return RedrawScreen{};
+                case U'r': case U'R': return OpenDiffReview{};
+                case U'n': case U'N': return NewThread{};
+                case U't': case U'T': return OpenTodoModal{};
+                case U'e': case U'E': return ComposerToggleExpand{};
+                default: break;
             }
         }
     }
