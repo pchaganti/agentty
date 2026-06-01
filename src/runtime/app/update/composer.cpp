@@ -312,13 +312,14 @@ Step smart_paste_from_clipboard(Model m) {
         return composer_update(std::move(m), ComposerPaste{std::move(*txt)});
     }
 
-    // Both failed — pick the more informative error. read_clipboard_image
-    // tends to produce a precise reason ("could not open Windows
-    // clipboard", "clipboard has no image (no PNG/DIBV5/...)"), whereas
-    // the text path's "clipboard has no text" is generic. Prefer
-    // whichever has actual content.
-    std::string err = !txt_err.empty() ? std::move(txt_err)
-                    : !img_err.empty() ? std::move(img_err)
+    // Both failed. The image path produces the actionable reason
+    // ("no clipboard on this host (headless / SSH / airgap)…", "install
+    // wl-clipboard", "could not open Windows clipboard"), whereas the
+    // text path's "clipboard has no text" is generic noise. Prefer the
+    // image error; only fall back to the text error if the image path
+    // said nothing.
+    std::string err = !img_err.empty() ? std::move(img_err)
+                    : !txt_err.empty() ? std::move(txt_err)
                     : std::string{"clipboard is empty"};
     auto cmd = set_status_toast(m, std::move(err), std::chrono::seconds{6});
     return {std::move(m), std::move(cmd)};
