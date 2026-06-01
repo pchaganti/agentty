@@ -226,7 +226,18 @@ Step tool_update(Model m, msg::ToolMsg tm) {
             // cost flat as edits/writes pile up in one long auto-pilot
             // turn (no-op when nothing new is freezable).
             freeze_settled_subturns(m);
+            // The freeze grows m.ui.frozen by the just-settled sub-turns.
+            // In one long auto-pilot turn that prefix balloons to
+            // thousands of rows, and the per-frame canvas blit is
+            // O(rows) even on a cache hit — so everything slows as
+            // edits/writes accumulate. Trim the frozen prefix to ~2
+            // viewports here too (not just on submit/stream-finish);
+            // the overflow has already painted to native scrollback.
+            auto trim = trim_frozen_if_oversized(m);
             auto cmd = cmd::kick_pending_tools(m);
+            if (!trim.is_none())
+                return {std::move(m), Cmd<Msg>::batch(
+                    std::vector<Cmd<Msg>>{std::move(trim), std::move(cmd)})};
             return {std::move(m), std::move(cmd)};
         },
 

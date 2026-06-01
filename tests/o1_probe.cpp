@@ -252,10 +252,19 @@ static void scaling_breakdown() {
         m.d.current.id = agentty::ThreadId{"scale"};
         Message u; u.role = Role::User; u.text = "do many edits";
         m.d.current.messages.push_back(std::move(u));
+        agentty::app::detail::clear_frozen(m);
+        agentty::app::detail::freeze_through(m, 1);   // freeze the User
+
+        // Real auto-pilot cadence: each settled sub-turn is appended,
+        // then freeze_settled_subturns + trim_frozen_if_oversized fire
+        // on its ToolExecOutput (matching tool.cpp). Replaying this
+        // per-edit is what lets the trim bound the frozen prefix — a
+        // single end-of-run freeze merges every edit into ONE entry
+        // that trim can't split, masking the unbounded growth.
+        static int c = 0;
         for (int e = 0; e < n; ++e) {
             Message a; a.role = Role::Assistant;
             ToolUse t;
-            static int c = 0;
             t.id   = ToolCallId{"e_" + std::to_string(++c)};
             t.name = ToolName{"edit"};
             nlohmann::json edits = nlohmann::json::array();
@@ -266,21 +275,21 @@ static void scaling_breakdown() {
             t.status = ToolUse::Done{now - milliseconds{5}, now, "edited"};
             a.tool_calls.push_back(std::move(t));
             m.d.current.messages.push_back(std::move(a));
+            // A streaming successor placeholder keeps the just-appended
+            // sub-turn freezable while leaving an active tail (the real
+            // post-tool continuation in cmd_factory pushes one).
+            Message ph; ph.role = Role::Assistant; ph.streaming_text = "";
+            m.d.current.messages.push_back(std::move(ph));
+            agentty::app::detail::freeze_settled_subturns(m);
+            (void)agentty::app::detail::trim_frozen_if_oversized(m);
+            // Drop the placeholder before the next real sub-turn lands
+            // (the live tail is rebuilt each cycle).
+            m.d.current.messages.pop_back();
         }
         Message tail; tail.role = Role::Assistant;
         tail.streaming_text = "more";
         m.d.current.messages.push_back(std::move(tail));
         m.s.phase = agentty::phase::Streaming{agentty::phase::Active{}};
-
-        agentty::app::detail::clear_frozen(m);
-        // Real auto-pilot flow: the User turn is frozen on submit, then
-        // each settled sub-turn freezes its completed prefix
-        // incrementally (freeze_settled_subturns runs on every
-        // ToolExecOutput). Replay both — calling the mid-run freeze
-        // once per sub-turn so frozen accrues as separate entries
-        // (exactly the real per-settle cadence), which lets trim bound
-        // the row total. Measures the LIVE frame the user sees.
-        agentty::app::detail::freeze_through(m, 1);   // freeze the User
         agentty::app::detail::freeze_settled_subturns(m);
         (void)agentty::app::detail::trim_frozen_if_oversized(m);
 
