@@ -418,20 +418,56 @@ maya::Cmd<Msg> trim_frozen_if_oversized(Model& m) {
     // native terminal scrollback.
     constexpr std::size_t kFrozenMaxRows = 1500;
     constexpr std::size_t kFrozenMaxEntries = 120;
+    // Retention floor. Expressed in ROWS, not a fixed entry count: the
+    // canvas blit cost is O(rows), and even on a cache HIT maya copies
+    // every cached cell into the back buffer each frame (the hash_id
+    // cache saves the body REBUILD — markdown parse, tool-card
+    // construction — but not the per-frame cell copy). So a tail of a
+    // few multi-thousand-row write/edit bodies keeps the canvas at
+    // ~6000 rows and pins per-frame render near 50ms even though
+    // nothing is changing. Those bodies already painted to native
+    // terminal scrollback when they were live; re-blitting them every
+    // frame buys nothing. The keep count is therefore ROW-driven: keep
+    // trailing entries until they cover ~kFrozenMaxRows of recent work,
+    // never fewer than 2 (always show some context) and never more
+    // than kKeepMinEntries when the row budget is already met by fewer
+    // — a tail of many TINY turns still shows kKeepMinEntries of them,
+    // but a tail of giant bodies trims down to the 1–2 that fit the
+    // budget instead of being floored at 8 fat panels.
     constexpr std::size_t kKeepMinEntries = 8;
 
     const bool over_rows    = m.ui.frozen_row_total > kFrozenMaxRows;
     const bool over_entries = m.ui.frozen.size() > kFrozenMaxEntries;
     if (!over_rows && !over_entries) return maya::Cmd<Msg>::none();
 
-    // Drop entries from the front until both caps are satisfied, but
-    // never below kKeepMinEntries so the live context stays visible
-    // even when the tail is a single enormous write/edit body.
+    // Row-driven keep count: walk back from the newest entry summing
+    // rows until we've covered kFrozenMaxRows. That entry count is the
+    // floor. Then widen to kKeepMinEntries ONLY if those entries were
+    // small enough that the row budget wasn't yet spent (so small-turn
+    // tails keep ample context); a single giant body that already
+    // fills the budget keeps just itself (clamped to a 2-entry min so
+    // the very latest exchange is always visible).
+    std::size_t budget_entries = 0;
+    std::size_t keep_rows      = 0;
+    for (std::size_t k = m.ui.frozen.size(); k-- > 0; ) {
+        ++budget_entries;
+        keep_rows += static_cast<std::size_t>(m.ui.frozen_rows[k]);
+        if (keep_rows >= kFrozenMaxRows) break;
+    }
+    // If the row budget was met before reaching kKeepMinEntries, the
+    // budget count wins (giant bodies). If it wasn't (small turns),
+    // allow up to kKeepMinEntries for context.
+    std::size_t keep_entries =
+        (keep_rows >= kFrozenMaxRows)
+            ? budget_entries
+            : std::max(budget_entries, kKeepMinEntries);
+    if (keep_entries < 2)                  keep_entries = 2;
+    if (keep_entries > m.ui.frozen.size()) keep_entries = m.ui.frozen.size();
+
+    // Drop entries from the front until both caps are satisfied,
+    // bounded by the retention floor computed above.
     std::size_t drop = 0;
-    const std::size_t max_drop =
-        m.ui.frozen.size() > kKeepMinEntries
-            ? m.ui.frozen.size() - kKeepMinEntries
-            : std::size_t{0};
+    const std::size_t max_drop = m.ui.frozen.size() - keep_entries;
     std::size_t rows_after    = m.ui.frozen_row_total;
     std::size_t entries_after = m.ui.frozen.size();
     while (drop < max_drop

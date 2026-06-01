@@ -75,32 +75,58 @@ static Model build(int n_turns, int write_lines) {
     return m;
 }
 
-static double warm_render_ms(Model& m) {
+struct RenderCost { double cold; double warm; };
+
+// Measures BOTH the cold-paint cost (fresh tree every iteration —
+// every ComponentElement is a cache miss, the pessimal case the old
+// probe reported) and the cache-hit warm cost (rebuild the SAME tree
+// each frame so maya's hash_id-keyed ComponentCache blits the settled
+// entries instead of repainting them — the cost the user ACTUALLY
+// feels per frame in the live run loop, where frozen entries don't
+// change between ticks).
+static RenderCost warm_render_ms(Model& m) {
     // Live-session flow: freeze the whole thread, then trim.
     agentty::app::detail::clear_frozen(m);
     agentty::app::detail::freeze_through(m, m.d.current.messages.size());
     (void)agentty::app::detail::trim_frozen_if_oversized(m);
 
-    auto root = maya::AppLayout{{
-        .thread        = agentty::ui::thread_config(m),
-        .changes_strip = agentty::ui::changes_strip_config(m),
-        .composer      = agentty::ui::composer_config(m),
-        .status_bar    = agentty::ui::status_bar_config(m),
-        .overlay       = std::nullopt,
-    }}.build();
+    auto build_root = [&] {
+        return maya::AppLayout{{
+            .thread        = agentty::ui::thread_config(m),
+            .changes_strip = agentty::ui::changes_strip_config(m),
+            .composer      = agentty::ui::composer_config(m),
+            .status_bar    = agentty::ui::status_bar_config(m),
+            .overlay       = std::nullopt,
+        }}.build();
+    };
 
     maya::StylePool pool;
     maya::Canvas canvas(120, 4000, &pool);
+
+    // COLD: fresh tree each iteration (cache miss every entry).
+    double cold = 1e9;
+    for (int i = 0; i < 7; ++i) {
+        auto root = build_root();
+        canvas.clear();
+        auto t0 = steady_clock::now();
+        maya::render_tree(root, canvas, pool, maya::theme::dark, true);
+        cold = std::min(cold, ms(steady_clock::now() - t0));
+    }
+
+    // WARM (cache-hit): one tree, painted repeatedly. After the first
+    // paint populates the hash_id cache, subsequent paints blit the
+    // settled cells — this is the real per-frame loop cost.
+    auto root = build_root();
     canvas.clear();
-    maya::render_tree(root, canvas, pool, maya::theme::dark, true);  // cold
-    double best = 1e9;
+    maya::render_tree(root, canvas, pool, maya::theme::dark, true);  // prime cache
+    double warm = 1e9;
     for (int i = 0; i < 7; ++i) {
         canvas.clear();
         auto t0 = steady_clock::now();
         maya::render_tree(root, canvas, pool, maya::theme::dark, true);
-        best = std::min(best, ms(steady_clock::now() - t0));
+        warm = std::min(warm, ms(steady_clock::now() - t0));
     }
-    return best;
+    return {cold, warm};
 }
 
 int main() {
@@ -109,17 +135,20 @@ int main() {
         {"6t x 300-line",   6,   300},
         {"6t x 800-line",   6,   800},
         {"6t x 3000-line",  6,   3000},
+        {"3t x 3000-line",  3,   3000},
+        {"10t x 2000-line", 10,  2000},
         {"50t x 500-line",  50,  500},
         {"200t x 500-line", 200, 500},
         {"500t x 500-line", 500, 500},
     };
-    std::printf("%-18s | %12s | %14s\n", "shape", "frozen_rows", "warm_render_ms");
-    std::printf("-------------------+--------------+----------------\n");
+    std::printf("%-18s | %12s | %12s | %12s\n",
+                "shape", "frozen_rows", "cold_ms", "warm_ms");
+    std::printf("-------------------+--------------+--------------+--------------\n");
     for (auto& s : shapes) {
         auto m = build(s.turns, s.lines);
-        double w = warm_render_ms(m);
-        std::printf("%-18s | %12zu | %14.2f\n",
-                    s.name, m.ui.frozen_row_total, w);
+        auto c = warm_render_ms(m);
+        std::printf("%-18s | %12zu | %12.2f | %12.2f\n",
+                    s.name, m.ui.frozen_row_total, c.cold, c.warm);
     }
     return 0;
 }
