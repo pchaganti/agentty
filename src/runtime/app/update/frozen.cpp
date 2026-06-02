@@ -608,11 +608,19 @@ void freeze_streaming_text_prefix(Model& m) {
     bool fence_fallback = false;
     if (split == 0 && fence_open && !fence_marker.empty()
         && last_line_nl >= kMinSplitBytes) {
-        // Closing marker matches the OPENING run's kind. Three chars is
-        // a valid close for any longer run, but echo the exact marker
-        // (sans info string) to be safe with ```` longer fences.
-        std::string close_marker =
-            (fence_marker.find('~') != std::string::npos) ? "~~~" : "```";
+        // Synthesize a CLOSING fence that the CommonMark engine will
+        // actually accept. Per cm_block.cpp append_to_leaf, a line closes
+        // a fence iff its leading fence-char run length is >= the OPENING
+        // fence's length and the rest of the line is blank. So the close
+        // must echo the opening run length, not a fixed 3 — a model that
+        // opened with ````` ```` ````` (4+ backticks, used when the code
+        // itself contains a triple-backtick) would NOT be closed by
+        // ``` and the stray marker would render as code content.
+        const char fc = (fence_marker.find('~') != std::string::npos) ? '~' : '`';
+        std::size_t run = 0;
+        while (run < fence_marker.size() && fence_marker[run] == fc) ++run;
+        if (run < 3) run = 3;
+        std::string close_marker(run, fc);
         split          = last_line_nl;
         reopen_prefix  = fence_marker + "\n";
         fence_fallback = true;
