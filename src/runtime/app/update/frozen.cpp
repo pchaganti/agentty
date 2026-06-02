@@ -151,11 +151,12 @@ std::size_t wrapped_rows(std::string_view body, int cols) {
 // tree. A tool card renders its big payload (write `content`, edit
 // `edits[].new_text`/`old_text`, etc.) one row per source line, so the
 // real rendered height tracks newlines in those strings — NOT the JSON
-// byte length. Summing per-string wrapped_rows captures multi-line
-// payloads accurately and biases toward OVER-counting (the safe
-// direction for the trim's "provably above the viewport" proof).
-// Non-string scalars contribute nothing (they render inline in the
-// header, not the body). Cheap: no allocation, no dump().
+// byte length. Summing per-string wrapped_rows counts each payload's
+// real source lines (plus wrap), which tracks the rendered height
+// closely without OVER-counting — the safe side for the mid-run trim's
+// keep-loop (see estimate_msg_rows). Non-string scalars contribute
+// nothing (they render inline in the header, not the body). Cheap: no
+// allocation, no dump().
 std::size_t estimate_json_string_rows(const nlohmann::json& j, int cols) {
     switch (j.type()) {
         case nlohmann::json::value_t::string:
@@ -185,30 +186,36 @@ std::size_t estimate_msg_rows(const Message& mm) {
     if (!mm.streaming_text.empty()) rows += wrapped_rows(mm.streaming_text, cols);
 
     for (const auto& tc : mm.tool_calls) {
-        // The RENDERED body of a settled tool card is one ROW PER SOURCE
-        // LINE (line-numbered write, per-hunk edit diff, read/grep
-        // output), not bytes/width. The old `body_bytes / w` estimate
-        // catastrophically UNDER-counted any body with many short lines:
-        // a 300-line write of ~20-char lines is ~300 rendered rows but
-        // bytes/width put it at ~79. That under-count is the root of the
-        // scrollback duplication — trim_frozen_above_viewport's "provably
-        // above the viewport" proof reads these row counts, and an
-        // under-counted (still on-screen) entry gets dropped, re-emitting
-        // committed scrollback rows shifted = the turn appears twice.
-        // Count newlines in the rendered text sources instead; wrapping
-        // only ADDS rows, so newline-count is a safe LOWER bound that's
-        // far closer to reality, and we keep the byte term as an extra
-        // over-count cushion for wrapped long lines.
+        // The RENDERED body of a tool card is one ROW PER SOURCE LINE
+        // (line-numbered write, per-hunk edit diff, read/grep output),
+        // not bytes/width — a 300-line write of ~20-char lines is ~300
+        // rendered rows, which bytes/width put at ~79.
+        //
+        // This count must NOT OVER-estimate. It feeds two trims, and the
+        // mid-run one (trim_frozen_above_viewport) walks the NEWEST
+        // entries summing rows until it has "kept a viewport", then drops
+        // the rest as off-screen. If a kept entry over-counts, the keep
+        // sum reaches the viewport margin before the real rows do, so the
+        // proof drops an entry whose real rows are STILL on screen —
+        // re-emitting committed scrollback rows = the duplication ghost.
+        // An UNDER-count only keeps more (a taller canvas, never a
+        // dropped on-screen entry), so under/exact is the safe side.
+        //
+        // The body shows up in exactly one source per tool state:
+        //   • settled  → parsed `args` (write content / edit hunks) or
+        //                `output()` (read/grep result). args wins; we do
+        //                NOT also add args_streaming, which holds the
+        //                SAME bytes in raw-JSON form (append-only, never
+        //                cleared) and would double the count.
+        //   • streaming→ args not parsed yet; the live card renders from
+        //                args_streaming, so count that instead.
         std::size_t tool_rows = 0;
-        if (!tc.output().empty())
-            tool_rows += wrapped_rows(tc.output(), cols);
-        if (!tc.args_streaming.empty())
-            tool_rows += wrapped_rows(tc.args_streaming, cols);
-        // Args JSON: the big body is a string field (write `content`,
-        // edit `edits[].new_text`/`old_text`). Count newlines across all
-        // string values so a multi-line payload counts its real lines.
         if (!tc.args.is_null())
             tool_rows += estimate_json_string_rows(tc.args, cols);
+        else if (!tc.args_streaming.empty())
+            tool_rows += wrapped_rows(tc.args_streaming, cols);
+        if (!tc.output().empty())
+            tool_rows += wrapped_rows(tc.output(), cols);
         rows += tool_rows;
         // Header / footer / chrome rows per tool card (~4 rows even
         // for an empty body — title, divider, status, blank). Fixed
@@ -917,6 +924,17 @@ maya::Cmd<Msg> trim_frozen_above_viewport(Model& m) {
     // floor) so the canvas stays near a single screen during a long run
     // — per-frame cost (clear + verify + blit) stays flat and minimal —
     // while never racing the visible region.
+    //
+    // PROOF DEPENDS ON: frozen_rows[k] never OVER-counting an entry's
+    // real rendered height. The keep-loop stops once the ESTIMATED sum
+    // of kept entries reaches kViewportKeepRows; if an estimate were
+    // high, the loop would stop early and the kept entries' REAL rows
+    // could fall short of a viewport, leaving a dropped entry on screen
+    // (the duplication ghost). estimate_msg_rows is built to under-count
+    // or hit exactly, never over (see its body), so estimated-kept >=
+    // margin implies real-kept >= margin >= term_h. An under-count only
+    // keeps a few extra entries — a slightly taller canvas, never a
+    // corrupt one.
     // Query terminal geometry through the SAME helper the row estimate
     // uses (term_dims) so the keep-margin and the per-entry row counts
     // are computed against one consistent terminal state — a width/height
