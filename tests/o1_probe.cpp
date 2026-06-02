@@ -12,13 +12,16 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include <maya/render/canvas.hpp>
+#include <maya/render/diff.hpp>
 #include <maya/render/renderer.hpp>
+#include <maya/render/serialize.hpp>
 #include <maya/style/theme.hpp>
 #include <maya/widget/app_layout.hpp>
 
@@ -368,6 +371,123 @@ static double streaming_text_ms(int body_lines, double& view_out) {
     return best;
 }
 
+// Measures WIRE BYTES per frame for a growing streaming-text answer —
+// the metric that matters over SSH, where the bottleneck is bytes on
+// the wire, not local CPU. Feeds the prose in 1 KB chunks (the real
+// pacer cadence), runs the live freeze+trim each chunk, renders to a
+// canvas, and diffs against the previous frame's canvas. Records the
+// emitted ANSI byte count per frame. A bounded per-frame render means
+// max_bytes/frame stays FLAT regardless of total body size; if a
+// freeze handoff (mid-stream prefix freeze, or the end-of-turn
+// freeze_through) shifts every live row, the diff re-emits the whole
+// viewport and max_bytes spikes — that's the visible SSH lag/repaint.
+struct WireCost { std::size_t max_frame; std::size_t total; int frames;
+                  std::size_t max_steady; std::size_t max_boundary;
+                  std::size_t end_of_turn; };
+
+static WireCost streaming_text_wire_bytes(int body_lines) {
+    Model m;
+    m.d.current.id = agentty::ThreadId{"wire"};
+    Message u; u.role = Role::User; u.text = "explain this in detail";
+    m.d.current.messages.push_back(std::move(u));
+    Message a; a.role = Role::Assistant;
+    m.d.current.messages.push_back(std::move(a));
+    m.s.phase = agentty::phase::Streaming{agentty::phase::Active{}};
+    agentty::app::detail::clear_frozen(m);
+    agentty::app::detail::freeze_through(m, 1);
+
+    std::string full;
+    for (int i = 0; i < body_lines; ++i) {
+        if (i % 7 == 0) full += "## Section " + std::to_string(i) + "\n\n";
+        full += "This is a sentence of a long streaming answer that the "
+                "model is writing out token by token, line ";
+        full += std::to_string(i);
+        full += ".\n\n";
+    }
+
+    constexpr int kW = 120, kH = 30000, kTermH = 40;
+    maya::StylePool pool;
+    // Two canvases: ping-pong front/back so each frame diffs against the
+    // immediately-preceding rendered frame, exactly as the live loop does.
+    maya::Canvas cv_a(kW, kH, &pool);
+    maya::Canvas cv_b(kW, kH, &pool);
+    maya::Canvas* prev = &cv_a;
+    maya::Canvas* cur  = &cv_b;
+    bool have_prev = false;
+
+    auto render_into = [&](maya::Canvas& c) {
+        auto r = agentty::app::AgenttyApp::view(m);
+        c.clear();
+        maya::render_tree(r, c, pool, maya::theme::dark, true);
+    };
+
+    WireCost wc{0, 0, 0, 0, 0, 0};
+    constexpr std::size_t kChunk = 1024;
+    std::size_t fed = 0;
+    std::string out;
+    std::size_t prev_frozen = m.ui.frozen.size();
+    while (fed < full.size()) {
+        const std::size_t n = std::min(kChunk, full.size() - fed);
+        m.d.current.messages.back().streaming_text.append(full, fed, n);
+        fed += n;
+        agentty::app::detail::freeze_streaming_text_prefix(m);
+        agentty::app::detail::freeze_settled_subturns(m);
+        (void)agentty::app::detail::trim_frozen_above_viewport(m);
+        const bool freeze_happened = m.ui.frozen.size() != prev_frozen;
+        prev_frozen = m.ui.frozen.size();
+
+        render_into(*cur);
+        if (have_prev) {
+            out.clear();
+            maya::diff(*prev, *cur, pool, out);
+            wc.max_frame = std::max(wc.max_frame, out.size());
+            wc.total += out.size();
+            ++wc.frames;
+            if (freeze_happened)
+                wc.max_boundary = std::max(wc.max_boundary, out.size());
+            else
+                wc.max_steady = std::max(wc.max_steady, out.size());
+        }
+        std::swap(prev, cur);
+        have_prev = true;
+        (void)kTermH;
+    }
+
+    // End-of-turn settle: mirror finalize_turn's idle freeze. Drain the
+    // last streaming_text into `text`, pre-settle the StreamingMarkdown
+    // so the height is locked, then freeze_through the whole transcript
+    // — the live tail becomes a frozen entry. Render the settled frame
+    // and diff it against the last streaming frame. If the frozen render
+    // is cell-identical to the pre-settle live render, this emits ~0
+    // bytes; if it shifts even one row, the diff re-emits the viewport
+    // — the visible end-of-turn repaint the user feels over SSH.
+    {
+        auto& last = m.d.current.messages.back();
+        if (last.role == Role::Assistant && !last.streaming_text.empty()) {
+            last.text += last.streaming_text;
+            last.streaming_text.clear();
+        }
+        // Pre-settle the StreamingMarkdown so its height is locked
+        // before the frozen snapshot — exactly what finalize_turn does.
+        if (last.role == Role::Assistant && !last.text.empty()) {
+            auto& cache = m.ui.view_cache.message_md(m.d.current.id, last.id);
+            if (!cache.streaming)
+                cache.streaming = std::make_shared<maya::StreamingMarkdown>();
+            cache.streaming->set_content(last.text);
+            cache.streaming->finish();
+        }
+        m.s.phase = agentty::phase::Idle{};
+        agentty::app::detail::freeze_through(m, m.d.current.messages.size());
+        render_into(*cur);
+        if (have_prev) {
+            out.clear();
+            maya::diff(*prev, *cur, pool, out);
+            wc.end_of_turn = out.size();
+        }
+    }
+    return wc;
+}
+
 // SCALING breakdown: an in-flight run accumulating N settled edits,
 // one per sub-turn (the real auto-pilot shape), plus a streaming tail
 // keeping the run non-terminal. Measures view-build (turn_config) and
@@ -510,6 +630,22 @@ int main() {
         double vv = 0;
         double r = streaming_text_ms(bl, vv);
         std::printf("%-12d | %12.3f | %12.3f\n", bl, vv, r);
+    }
+
+    // ── Streaming TEXT wire bytes: bytes emitted to the terminal per
+    // frame as the prose answer grows. This is the SSH-relevant metric
+    // — CPU is flat (above), but if a freeze handoff re-emits the whole
+    // viewport, max_bytes/frame spikes and the user on a slow link sees
+    // lag + an end-of-turn repaint. Flat max_bytes = bounded wire cost.
+    std::printf("\nstreaming text wire bytes (per-frame ANSI emitted):\n");
+    std::printf("%-12s | %12s | %12s | %12s | %12s\n",
+                "body_lines", "max_steady", "max_bndry", "mean/fr", "end_of_turn");
+    std::printf("-------------+--------------+--------------+--------------+--------------\n");
+    for (int bl : {50, 200, 800, 2000, 5000}) {
+        auto wc = streaming_text_wire_bytes(bl);
+        double mean = wc.frames ? double(wc.total) / wc.frames : 0.0;
+        std::printf("%-12d | %12zu | %12zu | %12.0f | %12zu\n",
+                    bl, wc.max_steady, wc.max_boundary, mean, wc.end_of_turn);
     }
 
     // ── Rehydrate footprint: rows the resume freeze seeds to the wire.

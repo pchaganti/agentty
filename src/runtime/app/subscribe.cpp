@@ -1,6 +1,7 @@
 #include "agentty/runtime/app/subscribe.hpp"
 
 #include <chrono>
+#include <cstdlib>
 #include <optional>
 #include <variant>
 
@@ -18,6 +19,26 @@ using maya::SpecialKey;
 namespace pick = agentty::ui::pick;
 
 namespace {
+
+// True when agentty is driven over an SSH session. Detected once from
+// the env the SSH daemon exports into the remote shell. Over SSH the
+// wire (not local CPU) is the render bottleneck: each streaming frame
+// emits several KB of ANSI diff, and at 30 fps that saturates a
+// high-latency / low-bandwidth link, producing the mid-turn lag and
+// the end-of-turn catch-up repaint. We slow the streaming tick when
+// remote (see the cadence block below).
+bool running_over_ssh() {
+    static const bool remote = [] {
+        // Escape hatch: a fast LAN SSH hop doesn't need throttling.
+        if (const char* off = std::getenv("AGENTTY_NO_SSH_THROTTLE");
+            off && off[0] && off[0] != '0')
+            return false;
+        return std::getenv("SSH_CONNECTION") != nullptr
+            || std::getenv("SSH_TTY") != nullptr
+            || std::getenv("SSH_CLIENT") != nullptr;
+    }();
+    return remote;
+}
 
 // ── Per-modal key handlers — return std::nullopt to fall through ──────────
 
@@ -487,10 +508,30 @@ Sub<Msg> subscribe(const Model& m) {
     // cut the flicker frequency by 3× at the cost of a slightly choppier
     // spinner. The capability is heuristic-detected once at startup; see
     // maya::ansi::env_supports_synchronized_output().
+    //
+    // SSH override: when remote, the wire — not local paint — is the
+    // bottleneck. Each streaming frame emits several KB of ANSI diff;
+    // at 30 fps that's ~290 KB/s, which saturates a high-latency or
+    // low-bandwidth link and shows up as mid-turn lag plus an
+    // end-of-turn catch-up repaint (the kernel send buffer drains the
+    // backlog after the stream stops). We clamp the streaming tick to
+    // at least 80 ms (~12 fps) when remote — the SSH round-trip latency
+    // already dominates perceived smoothness, so dropped frames aren't
+    // noticeable, while the sustained byte rate falls proportionally.
+    // We take the SLOWER of the local choice and the SSH floor so a
+    // non-sync terminal (already 100 ms) is never sped up. The reveal
+    // SPEED is unchanged — the pacer is bytes/second, not bytes/tick, so
+    // prose fills at the same wall-clock rate, just in fewer, larger
+    // frames.
     if (m.s.active()) {
-        static const auto tick_period = maya::ansi::env_supports_synchronized_output()
-            ? std::chrono::milliseconds(33)
-            : std::chrono::milliseconds(100);
+        static const auto tick_period = [] {
+            auto base = maya::ansi::env_supports_synchronized_output()
+                ? std::chrono::milliseconds(33)
+                : std::chrono::milliseconds(100);
+            if (running_over_ssh())
+                return std::max(base, std::chrono::milliseconds(80));
+            return base;
+        }();
         auto tick = Sub<Msg>::every(tick_period, Tick{});
         return Sub<Msg>::batch(std::move(key_sub), std::move(paste_sub), std::move(tick));
     }
