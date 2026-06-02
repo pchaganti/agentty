@@ -300,6 +300,74 @@ static double streaming_write_ms(int streamed_lines) {
     return best;
 }
 
+// Measures the STREAMING-TEXT render cost: a single assistant message
+// with NO tool calls whose markdown body grows token-by-token (the
+// model writing a long prose answer). This is the gap the existing
+// freeze machinery does NOT cover: freeze_settled_subturns can only
+// freeze a sub-turn whose tools are all terminal, so a pure-text
+// sub-turn stays fully live until the stream finishes. The whole
+// growing body is re-laid-out + re-painted every frame; if this grows
+// with body size, that's the progressive mid-stream lag the user
+// feels on long answers (and the source of the end-of-turn full
+// repaint when it finally freezes in one jump).
+static double streaming_text_ms(int body_lines, double& view_out) {
+    Model m;
+    m.d.current.id = agentty::ThreadId{"probe"};
+    Message u; u.role = Role::User; u.text = "explain this in detail";
+    m.d.current.messages.push_back(std::move(u));
+    Message a; a.role = Role::Assistant;
+    // Plausible long markdown answer: paragraphs + the occasional list.
+    std::string body;
+    for (int i = 0; i < body_lines; ++i) {
+        if (i % 7 == 0) body += "## Section " + std::to_string(i) + "\n\n";
+        body += "This is a sentence of a long streaming answer that the "
+                "model is writing out token by token, line ";
+        body += std::to_string(i);
+        body += ".\n\n";
+    }
+    a.streaming_text = std::move(body);   // still streaming → not freezable
+    m.d.current.messages.push_back(std::move(a));
+    m.s.phase = agentty::phase::Streaming{agentty::phase::Active{}};
+
+    agentty::app::detail::clear_frozen(m);
+    agentty::app::detail::freeze_through(m, 1);   // freeze the User
+    // Replay the REAL per-tick cadence: the body doesn't appear all at
+    // once — it grows ~1 KB/tick and the Tick handler runs the bound
+    // each time. Simulate by revealing the body in chunks, running the
+    // freeze+trim after each, exactly like meta.cpp's Tick arm. This is
+    // what produces MULTIPLE frozen entries (so the trim can drop old
+    // ones) instead of one giant un-trimmable block.
+    {
+        std::string full = std::move(m.d.current.messages.back().streaming_text);
+        m.d.current.messages.back().streaming_text.clear();
+        constexpr std::size_t kChunk = 1024;
+        std::size_t fed = 0;
+        while (fed < full.size()) {
+            const std::size_t n = std::min(kChunk, full.size() - fed);
+            m.d.current.messages.back().streaming_text.append(full, fed, n);
+            fed += n;
+            agentty::app::detail::freeze_streaming_text_prefix(m);
+            agentty::app::detail::freeze_settled_subturns(m);
+            (void)agentty::app::detail::trim_frozen_above_viewport(m);
+        }
+    }
+
+    maya::StylePool pool;
+    maya::Canvas canvas(120, 30000, &pool);
+    double best = 1e9, best_view = 1e9;
+    for (int i = 0; i < 9; ++i) {
+        auto t_v0 = steady_clock::now();
+        auto r = agentty::app::AgenttyApp::view(m);
+        auto t_v1 = steady_clock::now();
+        canvas.clear();
+        maya::render_tree(r, canvas, pool, maya::theme::dark, true);
+        best = std::min(best, ms(steady_clock::now() - t_v1));
+        best_view = std::min(best_view, ms(t_v1 - t_v0));
+    }
+    view_out = best_view;
+    return best;
+}
+
 // SCALING breakdown: an in-flight run accumulating N settled edits,
 // one per sub-turn (the real auto-pilot shape), plus a streaming tail
 // keeping the run non-terminal. Measures view-build (turn_config) and
@@ -430,6 +498,18 @@ int main() {
     for (int sl : {50, 200, 800, 3000, 8000}) {
         double r = streaming_write_ms(sl);
         std::printf("%-14d | %12.3f | %12.3f\n", sl, g_last_stream_view_ms, r);
+    }
+
+    // ── Streaming TEXT: a single assistant message, no tools, whose
+    // markdown body grows as the model writes a long prose answer.
+    // This is the uncovered gap — should grow with body size today.
+    std::printf("\nstreaming text (live prose answer, growing body):\n");
+    std::printf("%-12s | %12s | %12s\n", "body_lines", "view_ms", "render_ms");
+    std::printf("-------------+--------------+--------------\n");
+    for (int bl : {50, 200, 800, 2000, 5000}) {
+        double vv = 0;
+        double r = streaming_text_ms(bl, vv);
+        std::printf("%-12d | %12.3f | %12.3f\n", bl, vv, r);
     }
 
     // ── Rehydrate footprint: rows the resume freeze seeds to the wire.

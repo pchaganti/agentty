@@ -213,6 +213,12 @@ Step meta_update(Model m, msg::MetaMsg mm) {
             // freezable / the prefix is within margin.
             maya::Cmd<Msg> tick_trim = maya::Cmd<Msg>::none();
             if (m.s.active()) {
+                // Bound a long PURE-TEXT answer first: split its committed
+                // markdown prefix into a settled sub-turn so the next
+                // freeze_settled_subturns call can freeze it. Without
+                // this a 5k-line prose reply re-lays-out every frame
+                // (~13 ms/frame); with it only the ~2KB live tail does.
+                freeze_streaming_text_prefix(m);
                 freeze_settled_subturns(m);
                 tick_trim = trim_frozen_above_viewport(m);
             }

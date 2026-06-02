@@ -334,11 +334,22 @@ void freeze_settled_subturns(Model& m) {
         bool terminal_tools = !mm.tool_calls.empty();
         for (const auto& tc : mm.tool_calls)
             if (!tc.is_terminal()) { terminal_tools = false; break; }
-        // Freeze a sub-turn only if it has at least one tool and all of
-        // them are terminal. A text-only or empty sub-turn (the active
-        // streaming placeholder, or the tail the model is writing into)
-        // stays live.
-        if (!terminal_tools) break;
+        // A settled TEXT-ONLY sub-turn is also freezable: no tools, a
+        // committed `text` body, and nothing still streaming into it.
+        // This is the prefix freeze_streaming_text_prefix carves off a
+        // long prose answer — its bytes are final, so it can graduate
+        // into the frozen prefix immediately. The ACTIVE tail keeps its
+        // bytes in streaming_text, so it never matches here and stays
+        // live.
+        const bool settled_text_only =
+            mm.tool_calls.empty()
+            && !mm.text.empty()
+            && mm.streaming_text.empty()
+            && mm.pending_stream.empty();
+        // Freeze a sub-turn only if it's a settled terminal-tool batch
+        // OR a settled text-only block. The active streaming placeholder
+        // (empty, or growing streaming_text) stays live.
+        if (!terminal_tools && !settled_text_only) break;
         cut = i + 1;
     }
 
@@ -393,6 +404,121 @@ void freeze_settled_subturns(Model& m) {
 
     m.ui.frozen_through = cut;
     m.ui.frozen_midrun  = true;   // remainder of this run is a continuation
+}
+
+namespace {
+
+// Find the last markdown block boundary (a blank line, "\n\n") in
+// `s[0..limit)` that is NOT inside an open ``` code fence. Returns the
+// byte offset just past the boundary (start of the next block), or 0 if
+// no safe split point exists. Scanning fence state from the start is
+// O(limit); `limit` is bounded by the committed prefix we're about to
+// move out of the live tail (it happens at most once per ~budget rows of
+// growth), so this is not a per-frame O(body) tax.
+std::size_t last_safe_block_split(const std::string& s, std::size_t limit) {
+    if (limit == 0 || limit > s.size()) limit = s.size();
+    bool in_fence = false;
+    std::size_t best = 0;          // start-of-next-block offset, fence-closed
+    std::size_t line_start = 0;
+    for (std::size_t i = 0; i < limit; ) {
+        std::size_t eol = s.find('\n', i);
+        const bool last_line = (eol == std::string::npos || eol >= limit);
+        const std::size_t line_end = last_line ? limit : eol;
+        // A line opening/closing a fence: starts with ``` or ~~~ after
+        // optional leading spaces. Toggling on either bound is enough
+        // for split safety (we only need to know we're between blocks).
+        std::size_t p = line_start;
+        while (p < line_end && (s[p] == ' ' || s[p] == '\t')) ++p;
+        if (line_end - p >= 3
+            && ((s[p] == '`' && s[p+1] == '`' && s[p+2] == '`')
+             || (s[p] == '~' && s[p+1] == '~' && s[p+2] == '~'))) {
+            in_fence = !in_fence;
+        }
+        // Blank line = block boundary. Only a candidate split when the
+        // fence is closed at this point (splitting mid-fence would
+        // render two broken code blocks).
+        if (p == line_end && !in_fence) {
+            // The boundary is the byte just past this blank line's
+            // newline, i.e. the start of the next block's first line.
+            best = last_line ? line_end : (eol + 1);
+        }
+        if (last_line) break;
+        i = eol + 1;
+        line_start = i;
+    }
+    return best;
+}
+
+} // namespace
+
+void freeze_streaming_text_prefix(Model& m) {
+    auto& msgs = m.d.current.messages;
+    if (msgs.empty()) return;
+
+    // The active sub-turn is the back message. Only split a PURE-TEXT
+    // assistant tail: no tool_calls (those are handled by
+    // freeze_settled_subturns), and the growing body lives in
+    // streaming_text. A message that already has settled `text` is a
+    // mid-run continuation whose prior prefix is settled but not yet
+    // frozen as its own message — we still only split the streaming
+    // portion so the freeze stays append-only.
+    Message& active = msgs.back();
+    if (active.role != Role::Assistant) return;
+    if (!active.tool_calls.empty()) return;
+    if (active.streaming_text.empty()) return;
+
+    // Keep a trailing window LIVE so the actively-revealing edge keeps
+    // animating and we never split inside the block the model is still
+    // writing. This window must stay SMALL: if the live (unfrozen)
+    // portion grows past one viewport it overflows into committed
+    // scrollback, and the markdown widget's per-block reveal can shift a
+    // blank line by ±1 row as a `\n\n` boundary commits — rewriting a
+    // row already emitted to native scrollback (a duplication ghost).
+    // Splitting early keeps the oscillating region on-screen (mutable),
+    // so the seam stays clean. ~1 KB ≈ well under a viewport of prose.
+    constexpr std::size_t kLiveTailBytes = 1024;
+    if (active.streaming_text.size() <= kLiveTailBytes) return;
+    const std::size_t scan_limit = active.streaming_text.size() - kLiveTailBytes;
+
+    // Split as soon as there's a committed block beyond the live window.
+    // The freeze handoff is a cache hit (same hash key the live tail
+    // stamped), so frequent small splits are cheap; the cost we're
+    // avoiding is a tall live re-layout every frame. A modest floor
+    // avoids churning on tiny prefixes.
+    constexpr std::size_t kMinSplitBytes = 512;
+    if (scan_limit < kMinSplitBytes) return;
+
+    const std::size_t split = last_safe_block_split(active.streaming_text,
+                                                    scan_limit);
+    if (split == 0) return;   // no safe boundary yet (e.g. one long fence)
+
+    // Carve the committed prefix out of the active tail. If this is the
+    // FIRST split of this sub-turn, `active.text` is empty and the
+    // prefix is purely streamed bytes. On a later split `active.text`
+    // may hold an earlier settled sub-turn's body (text→tool→text run);
+    // that body belongs to a DIFFERENT logical message already, so we
+    // never fold it here — we only move streaming_text bytes.
+    std::string prefix_body = active.streaming_text.substr(0, split);
+    active.streaming_text.erase(0, split);
+
+    // The new settled message carries the committed prefix as `text`
+    // (settled), inheriting the active message's identity-relevant
+    // fields. A fresh MessageId keeps the render-cache keyed per visual
+    // unit. Inserted just before the active tail so the run reads
+    // [settled-text][growing-text] — identical shape to a post-tool
+    // continuation, which the live tail / freeze path already handle.
+    Message settled;
+    settled.role      = Role::Assistant;
+    settled.text      = std::move(prefix_body);
+    settled.timestamp = active.timestamp;
+    // Insert before back(): msgs.end() - 1.
+    msgs.insert(msgs.end() - 1, std::move(settled));
+
+    // The settled prefix is now its own terminal (no tools, has text)
+    // sub-turn in the live tail. freeze_settled_subturns will freeze it
+    // on this same tick (called right after this in the Tick handler),
+    // collapsing it into the zero-copy hash-keyed frozen prefix and
+    // leaving only the small live tail to re-paint each frame.
 }
 
 void clear_frozen(Model& m) {

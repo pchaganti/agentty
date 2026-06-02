@@ -221,9 +221,141 @@ static void test_incremental_freeze_prefix_stable() {
           "committed prefix mutated across an incremental freeze");
 }
 
+// Reassemble the full assistant body the user should see from the
+// model's messages: every Assistant message's settled `text` plus the
+// active tail's `streaming_text`, in order. The split must be a pure
+// partition of the bytes — no loss, no reorder, no duplication.
+static std::string assembled_body(const Model& m) {
+    std::string out;
+    for (const auto& msg : m.d.current.messages) {
+        if (msg.role != Role::Assistant) continue;
+        out += msg.text;
+        out += msg.streaming_text;
+    }
+    return out;
+}
+
+// A long PURE-TEXT answer streaming in. freeze_settled_subturns can't
+// touch it (no terminal tool), so without freeze_streaming_text_prefix
+// the whole growing body stays live and re-paints every frame. This
+// test feeds the body in chunks (the real per-tick cadence), runs the
+// prefix-freeze bound each tick, and asserts:
+//   (1) the committed scrollback prefix never mutates (no duplication),
+//   (2) the assembled body equals the original bytes at every step
+//       (the split loses/reorders nothing),
+//   (3) the live tail stays bounded (the whole point).
+static void test_streaming_text_prefix_freeze() {
+    constexpr int kTermH = 40;
+
+    Model m;
+    m.d.current.id = agentty::ThreadId{"stext"};
+    Message u; u.role = Role::User; u.text = "explain in detail";
+    m.d.current.messages.push_back(std::move(u));
+    agentty::app::detail::clear_frozen(m);
+    agentty::app::detail::freeze_through(m, 1);
+
+    // Push the active streaming assistant message.
+    Message a; a.role = Role::Assistant;
+    m.d.current.messages.push_back(std::move(a));
+    m.s.phase = agentty::phase::Streaming{agentty::phase::Active{}};
+
+    // The full body the model will produce — prose with the occasional
+    // heading and a fenced code block (the fence must never be split
+    // mid-block). ~6000 lines so the canvas overflows many viewports.
+    std::string full;
+    for (int i = 0; i < 6000; ++i) {
+        if (i % 11 == 0) full += "## Heading " + std::to_string(i) + "\n\n";
+        if (i % 23 == 0) {
+            full += "```cpp\n";
+            full += code_block(3);
+            full += "```\n\n";
+        }
+        full += "Sentence number " + std::to_string(i)
+             +  " of a long streaming prose answer.\n\n";
+    }
+
+    std::vector<std::string> prev;
+    int worst_divergence = -1, diverging_step = -1;
+    std::size_t max_live_tail_bytes = 0;
+    bool content_ok = true;
+
+    constexpr std::size_t kChunk = 1024;
+    std::size_t fed = 0, step = 0;
+    while (fed < full.size()) {
+        const std::size_t n = std::min(kChunk, full.size() - fed);
+        m.d.current.messages.back().streaming_text.append(full, fed, n);
+        fed += n;
+        ++step;
+
+        // Per-tick bound, exactly as meta.cpp's Tick arm runs it —
+        // EXCEPT the trim. trim_frozen_above_viewport drops frozen
+        // entries that have overflowed into native terminal scrollback;
+        // those rows are gone from the app's canvas but still visible in
+        // the terminal. render_rows here renders the WHOLE (post-trim)
+        // tree with no scrollback model, so a trim legitimately shortens
+        // its output — which would false-positive the committed-prefix
+        // check. The seam invariant we test is that the FREEZE itself
+        // (prefix split) never rewrites an already-emitted row; trimming
+        // is verified separately. So freeze here, don't trim.
+        agentty::app::detail::freeze_streaming_text_prefix(m);
+        agentty::app::detail::freeze_settled_subturns(m);
+
+        // (2) content integrity: assembled == bytes fed so far.
+        if (assembled_body(m) != full.substr(0, fed)) content_ok = false;
+
+        // (3) live tail bound.
+        std::size_t live_bytes = 0;
+        for (std::size_t i = m.ui.frozen_through;
+             i < m.d.current.messages.size(); ++i) {
+            live_bytes += m.d.current.messages[i].text.size()
+                        + m.d.current.messages[i].streaming_text.size();
+        }
+        max_live_tail_bytes = std::max(max_live_tail_bytes, live_bytes);
+
+        // (1) committed-prefix stability.
+        auto cur = render_rows(m);
+        if (!prev.empty()) {
+            int d = first_committed_divergence(prev, cur, kTermH);
+            if (d >= 0 && (worst_divergence < 0 || d < worst_divergence)) {
+                worst_divergence = d;
+                diverging_step   = static_cast<int>(step);
+            }
+        }
+        prev = std::move(cur);
+    }
+
+    CHECK(content_ok,
+          "assembled body diverged from fed bytes (split lost/reordered text)");
+    if (worst_divergence >= 0) {
+        std::fprintf(stderr,
+            "  committed prefix changed at row %d on step %d\n",
+            worst_divergence, diverging_step);
+    }
+    CHECK(worst_divergence < 0,
+          "committed prefix mutated across a streaming-text prefix freeze");
+    // The live tail should stay within a few KB — the whole point of the
+    // bound. Generous ceiling (kLiveTailBytes window + one chunk + a
+    // block) to avoid flakiness while still catching unbounded growth.
+    CHECK(max_live_tail_bytes < 8192,
+          "live tail grew unbounded — prefix freeze did not engage");
+
+    // Final settle (finalize_turn): the remaining tail commits to text
+    // and the whole run freezes. Assembled body must still be exact.
+    {
+        auto& last = m.d.current.messages.back();
+        if (!last.streaming_text.empty()) {
+            last.text += last.streaming_text;
+            last.streaming_text.clear();
+        }
+    }
+    CHECK(assembled_body(m) == full,
+          "final assembled body != original after settle");
+}
+
 int main() {
     std::printf("midrun_seam_test\n");
     test_incremental_freeze_prefix_stable();
+    test_streaming_text_prefix_freeze();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures) { std::printf("FAILED\n"); return 1; }
     std::printf("PASSED\n");

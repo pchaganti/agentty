@@ -100,6 +100,26 @@ void freeze_through(Model& m, std::size_t live_start);
 // no freezable completed prefix.
 void freeze_settled_subturns(Model& m);
 
+// freeze_streaming_text_prefix: mid-stream bound for a long PURE-TEXT
+// sub-turn (a prose answer with no tool calls). freeze_settled_subturns
+// can't touch it — there's no terminal tool to mark the sub-turn done,
+// so the whole growing markdown body stays in the live tail and is
+// re-laid-out + re-painted every frame. Render cost climbs with body
+// size (~13 ms/frame at 5k lines, vs 0.26 ms flat for a tail-windowed
+// tool card).
+//
+// This splits the active text-only message at the last SAFE markdown
+// block boundary (a blank line outside an open code fence), keeping a
+// trailing window live so the actively-revealing edge still animates.
+// The committed prefix is moved into its own settled Assistant Message
+// inserted just before the active one, producing a [settled-text]
+// [growing-text] run — the exact shape a post-tool continuation makes,
+// which freeze_settled_subturns then freezes with no new render logic.
+// The active (tail) message stays messages.back() so the StreamTextDelta
+// / StreamToolUseStart append-to-back invariant holds. No-op until the
+// committed prefix exceeds a row budget.
+void freeze_streaming_text_prefix(Model& m);
+
 // rehydrate_frozen: rebuild m.ui.frozen from scratch from the current
 // thread's messages + compaction records. Used on thread switch /
 // thread load — anywhere the messages vector was replaced wholesale.
