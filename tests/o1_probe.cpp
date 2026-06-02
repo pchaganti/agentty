@@ -404,6 +404,16 @@ static WireCost streaming_text_wire_bytes(int body_lines) {
         full += std::to_string(i);
         full += ".\n\n";
     }
+    // End the answer in a fenced code block whose closing ``` is the
+    // LAST thing in the message (the common Claude "here's the code"
+    // ending). find_block_boundary won't commit it during streaming
+    // (no trailing newline after the close), so it renders via
+    // render_tail until finish() — the divergence that drives the
+    // "full repaint when the last block renders" symptom.
+    full += "Here is the final snippet:\n\n";
+    full += "```cpp\n";
+    full += code_block(8);
+    full += "```";
 
     constexpr int kW = 120, kH = 30000, kTermH = 40;
     maya::StylePool pool;
@@ -461,29 +471,49 @@ static WireCost streaming_text_wire_bytes(int body_lines) {
     // is cell-identical to the pre-settle live render, this emits ~0
     // bytes; if it shifts even one row, the diff re-emits the viewport
     // — the visible end-of-turn repaint the user feels over SSH.
+    //
+    // CRITICAL: render the LAST STREAMING frame through the SAME
+    // streaming widget (live tail path) with all bytes revealed, THEN
+    // call finish() and render again. NOTE: with set_content fed the
+    // FULL body at once, the eager-closing-fence commit (maya
+    // boundary.cpp) already commits the trailing fence on the
+    // set_content call, so this no longer reproduces the pre-fix
+    // render_tail vs block-path divergence — the authoritative guard
+    // for that is maya's `eager closing fence (no snap)` cell-equality
+    // test. This residual ~2.4 KB is the spinner/cursor drop on settle,
+    // which is irreducible and flat.
     {
         auto& last = m.d.current.messages.back();
         if (last.role == Role::Assistant && !last.streaming_text.empty()) {
             last.text += last.streaming_text;
             last.streaming_text.clear();
         }
-        // Pre-settle the StreamingMarkdown so its height is locked
-        // before the frozen snapshot — exactly what finalize_turn does.
         if (last.role == Role::Assistant && !last.text.empty()) {
             auto& cache = m.ui.view_cache.message_md(m.d.current.id, last.id);
             if (!cache.streaming)
                 cache.streaming = std::make_shared<maya::StreamingMarkdown>();
+            // Live-tail render: full bytes revealed, but NOT finished —
+            // the last block still goes through render_tail.
             cache.streaming->set_content(last.text);
+            cache.streaming->set_live(true);
+            cache.revealed_size    = last.text.size();
+            cache.last_settled_size = static_cast<std::size_t>(-1);
+        }
+        render_into(*cur);            // last streaming frame (render_tail)
+        std::swap(prev, cur);
+        // Now settle: finish() commits the last block to the block path.
+        if (last.role == Role::Assistant && !last.text.empty()) {
+            auto& cache = m.ui.view_cache.message_md(m.d.current.id, last.id);
             cache.streaming->finish();
+            cache.streaming->set_live(false);
+            cache.last_settled_size = last.text.size();
         }
         m.s.phase = agentty::phase::Idle{};
         agentty::app::detail::freeze_through(m, m.d.current.messages.size());
-        render_into(*cur);
-        if (have_prev) {
-            out.clear();
-            maya::diff(*prev, *cur, pool, out);
-            wc.end_of_turn = out.size();
-        }
+        render_into(*cur);            // settled frame (committed block path)
+        out.clear();
+        maya::diff(*prev, *cur, pool, out);
+        wc.end_of_turn = out.size();
     }
     return wc;
 }
