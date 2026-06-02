@@ -174,6 +174,27 @@ Step meta_update(Model m, msg::MetaMsg mm) {
                 }
             }
 
+            // ── Per-tick canvas bound (the SPEED path) ───────────
+            // Tick is the dominant render driver during a stream. Without
+            // bounding here, a long single turn (a big streaming response,
+            // or one auto-pilot turn with many write/edit cards) grows the
+            // live canvas unboundedly: every settled-but-unfrozen sub-turn
+            // re-lays-out + re-paints each tick, and the shadow verify +
+            // canvas.clear() walk the whole oversized canvas. Cost climbs
+            // with turn length — the progressive slowdown felt mid-stream.
+            //
+            // Freeze any sub-turns that became terminal (into the
+            // zero-copy, hash-keyed frozen prefix maya blits) and trim the
+            // prefix to a viewport margin. trim_frozen_above_viewport drops
+            // only entries provably above the viewport, so it can't trigger
+            // the mid-run duplication bug. Both no-op when nothing is
+            // freezable / the prefix is within margin.
+            maya::Cmd<Msg> tick_trim = maya::Cmd<Msg>::none();
+            if (m.s.active()) {
+                freeze_settled_subturns(m);
+                tick_trim = trim_frozen_above_viewport(m);
+            }
+
             // ── Stream-stall watchdog ──────────────────────────────────
             // 120 s of total silence is overwhelmingly likely to be a
             // wedged transport rather than legitimate model behaviour.
@@ -230,6 +251,8 @@ Step meta_update(Model m, msg::MetaMsg mm) {
                     a->rate_last_sample_bytes = a->live_delta_bytes;
                 }
             }
+            if (!tick_trim.is_none())
+                return {std::move(m), std::move(tick_trim)};
             return done(std::move(m));
         },
         [&](Quit) -> Step {

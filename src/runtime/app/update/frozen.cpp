@@ -631,16 +631,19 @@ maya::Cmd<Msg> trim_frozen_above_viewport(Model& m) {
     //
     // Safety margin: keep at least kViewportKeepRows of the MOST RECENT
     // frozen content on the canvas, plus the live tail maya renders on
-    // top of frozen. A dropped entry is therefore separated from the
-    // viewport bottom by (kViewportKeepRows + live-tail rows) — well
-    // more than term_h — so its rows have definitely scrolled off into
-    // native scrollback. We keep a 3x viewport margin (vs the ~2x steady
-    // -state budget) precisely so this never races the visible region.
+    // top of frozen. For a dropped entry to be off-screen, the kept
+    // frozen rows + live tail must exceed term_h; keeping >= term_h of
+    // frozen alone already guarantees the oldest KEPT entry's top sits
+    // at-or-above the viewport top, so everything dropped is provably in
+    // native scrollback. We keep ~1.5x viewport (a cushion over the 1x
+    // floor) so the canvas stays near a single screen during a long run
+    // — per-frame cost (clear + verify + blit) stays flat and minimal —
+    // while never racing the visible region.
     const auto sz = maya::platform::query_terminal_size(
         maya::platform::stdout_handle());
     const int term_h = sz.height.value > 0 ? sz.height.value : 40;
     const std::size_t kViewportKeepRows =
-        static_cast<std::size_t>(std::max(96, term_h * 3));
+        static_cast<std::size_t>(std::max(64, (term_h * 3) / 2));
 
     // Only worth doing once the canvas is meaningfully over the keep
     // margin — trimming churns maya's inline diff (commit_scrollback_
