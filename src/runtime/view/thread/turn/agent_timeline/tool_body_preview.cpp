@@ -106,28 +106,6 @@ constexpr std::size_t kLiveTailLines = 64;
     return std::string{s.substr(start)};
 }
 
-// First `keep_lines` lines of `s`, head-anchored. Unlike tail_window,
-// this is APPEND-ONLY as `s` grows: line 1..keep_lines never change
-// content when more lines arrive at the end, they just stop being the
-// last thing rendered. Used for the streaming WRITE preview so the
-// rows it commits to native scrollback are byte-identical to the
-// settled show_all render's first rows — a tail-anchored preview
-// instead SHIFTS its top rows as the file grows, so when those rows
-// have already overflowed into scrollback and the card later settles to
-// a head-anchored full body, the committed rows no longer match and the
-// card is re-emitted below them (the duplicated-write ghost).
-[[nodiscard]] std::string head_window(std::string_view s,
-                                      std::size_t keep_lines) {
-    if (s.empty()) return {};
-    std::size_t nl_seen = 0;
-    for (std::size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == '\n') {
-            if (++nl_seen >= keep_lines) return std::string{s.substr(0, i + 1)};
-        }
-    }
-    return std::string{s};
-}
-
 // Body for a terminal line-oriented tool sitting in the LIVE tail.
 // Frozen builds keep the full body (full content, painted once); the
 // live path elides to a bounded tail window so per-frame split_lines
@@ -322,40 +300,36 @@ maya::ToolBodyPreview::Config tool_body_preview_config(
             out.kind = Kind::FileWrite;
             out.text_color = text_tertiary;
             out.show_footer_stats = true;
-            // While streaming, the body grows every ~120 ms. The PRIOR
-            // approach pinned the preview to a TAIL window (last N lines):
-            // as the file grew, the top rows of that window kept changing
-            // content. Once they overflowed into native scrollback they
-            // were frozen there — but on settle the card switches to a
-            // head-anchored show_all render from line 1, so the committed
-            // rows no longer matched and the whole card was re-emitted
-            // below them: the write appeared TWICE in scrollback.
-            //
-            // Fix: render the streaming preview HEAD-anchored with
-            // show_all over a bounded head window. The first N lines never
-            // change as more arrive (append-only growth), and they are
-            // byte-identical to the settled show_all render's first N
-            // lines — so anything that commits to scrollback mid-stream
-            // stays valid through the freeze handoff. No row is ever
-            // rewritten; the card only grows downward.
+            // While streaming, show a SMALL tail preview (the last few
+            // lines of what's been written so far) — show_all=false lets
+            // maya elide to its `code_tail` budget, the compact "watch it
+            // write" look. The duplicated-write ghost came from feeding a
+            // LARGE tail slice (64 lines): once those rows overflowed into
+            // native scrollback they were frozen, but on settle the card
+            // switched to a head-anchored show_all render from line 1, so
+            // the committed rows no longer matched and the card was
+            // re-emitted below them (two copies). Keeping the streaming
+            // preview SMALL (a slice barely above maya's tail budget)
+            // keeps it inside the live viewport so it never commits to
+            // scrollback — only the settled show_all render reaches
+            // scrollback, and it's painted once.
+            out.show_all     = !streaming_now;
             out.is_streaming = streaming_now;
             if (streaming_now) {
-                // Head window, full render: append-only and seam-stable.
-                // O(window) per frame (the slice bounds split_lines).
-                // Footer derives line/byte totals from out.text, which is
-                // a partial head here, so suppress it mid-stream (the
-                // status bar carries the live byte/tok rate); it returns
-                // with the true total the instant the tool settles.
-                out.text = head_window(content, kStreamTailLines);
-                out.show_all = true;
+                // Small tail slice → O(window) per frame and a fixed
+                // compact card height. show_all=false above makes maya
+                // render just its `code_tail` lines from this slice.
+                // Footer totals would be wrong on a partial body, so
+                // suppress mid-stream (status bar carries the live rate);
+                // it returns with the true total the instant we settle.
+                out.text = tail_window(content, kStreamTailLines);
                 out.show_footer_stats = false;
             } else {
-                // Terminal: full body, head-anchored, in BOTH the live
-                // tail and the frozen snapshot. Identical bytes / anchor /
-                // height across the freeze instant, and a pure superset of
-                // the streaming head window above — so the handoff never
-                // moves a committed row.
-                out.show_all = true;
+                // Terminal: full body, show_all, in BOTH the live tail and
+                // the frozen snapshot — identical bytes/height across the
+                // freeze instant. This is the only write render that ever
+                // commits to native scrollback, so there is nothing above
+                // it to disagree with.
                 out.text = std::move(content);
             }
         } else if (tc.is_running()) {
