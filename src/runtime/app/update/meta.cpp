@@ -120,6 +120,25 @@ Step meta_update(Model m, msg::MetaMsg mm) {
             // worth preserving while the wire is keeping up; once it
             // gets ahead by a paragraph or more, the latency cost
             // dominates the aesthetic benefit.
+            // Wire-quiescence flush. The smoothing pacer only earns its
+            // keep while bytes are ACTIVELY flowing — it hides the visual
+            // jump of a chunky multi-KB content_block_delta by revealing
+            // it over a few frames. The moment the wire goes quiet (model
+            // paused between bursts, finished a paragraph and is thinking,
+            // or the render path was briefly backpressured and is now
+            // catching up) there is nothing left to smooth AGAINST:
+            // continuing to dribble the buffered tail at kBytesPerSec is
+            // exactly the "it pauses, then slowly scrolls in the text it
+            // already had" symptom. last_event_at is bumped on every SSE
+            // event (text/json delta AND heartbeats), so a gap here means
+            // the wire is genuinely idle — reveal the whole backlog now.
+            bool wire_quiet = false;
+            if (const auto* a = active_ctx(m.s.phase)) {
+                if (a->last_event_at.time_since_epoch().count() != 0)
+                    wire_quiet = (now - a->last_event_at)
+                               > std::chrono::milliseconds(90);
+            }
+
             if (!m.d.current.messages.empty()
                 && m.d.current.messages.back().role == Role::Assistant)
             {
@@ -145,8 +164,11 @@ Step meta_update(Model m, msg::MetaMsg mm) {
                     constexpr std::size_t kBurstFlushBytes = 8192;
 
                     std::size_t drip;
-                    if (msg.pending_stream.size() >= kBurstFlushBytes) {
-                        // Backlog dominates — flush it all this tick.
+                    if (msg.pending_stream.size() >= kBurstFlushBytes
+                        || wire_quiet) {
+                        // Backlog dominates, OR the wire has gone quiet so
+                        // there's nothing left to smooth against — flush
+                        // it all this tick.
                         drip = msg.pending_stream.size();
                     } else {
                         auto target = static_cast<std::size_t>(
