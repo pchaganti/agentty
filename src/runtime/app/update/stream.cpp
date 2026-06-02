@@ -920,10 +920,30 @@ maya::Cmd<Msg> finalize_turn(Model& m, StopReason stop_reason) {
         // On long sessions that's the dominant per-frame cost — the
         // canvas resizes to fit total transcript height and every
         // render clears + paints all of it.
+        //
+        // Either way, absorb the freeze-seam height delta with
+        // commit_scrollback_overflow. At this instant the live tail's
+        // last run loses its reserved indicator/spacer slot
+        // (reserve_slot = active() && is_last_run flips false now that
+        // phase==Idle) AND its markdown just settled via finish() above,
+        // so the run's row count differs from the previous (streaming)
+        // frame by ±N rows. maya's inline diff compares new-vs-prev: a
+        // row-count change in the live tail shifts every row below it and
+        // the visible viewport gets re-emitted — the "whole scrollback
+        // re-renders at turn end" flicker. commit_scrollback_overflow
+        // re-bases prev_cells (drops max(0, prev_rows - term_h), zero
+        // wire bytes) so the next diff measures the settled frame against
+        // a clean baseline instead of scrolling on-screen rows. The
+        // trim path already issues it; the non-trim path needs it too
+        // because the seam delta exists whether or not we trimmed. Fold
+        // it into `kp` here so the post-turn auto-compaction check below
+        // still runs.
         if (auto trim = trim_frozen_if_oversized(m); !trim.is_none()) {
-            auto rest = std::move(kp);
-            return Cmd<Msg>::batch(std::vector<Cmd<Msg>>{
-                std::move(trim), std::move(rest)});
+            kp = Cmd<Msg>::batch(std::vector<Cmd<Msg>>{
+                std::move(trim), std::move(kp)});
+        } else {
+            kp = Cmd<Msg>::batch(std::vector<Cmd<Msg>>{
+                maya::Cmd<Msg>::commit_scrollback_overflow(), std::move(kp)});
         }
     }
 
