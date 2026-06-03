@@ -79,17 +79,6 @@ void accumulate_grep_hits(const std::string& output, GrepHits& out) {
 // final card renders everything.
 constexpr std::size_t kStreamTailLines = 64;
 
-// Live-tail window budget for line-oriented bodies (FileRead,
-// CodeBlock, GitDiff, Json, web_fetch). With show_all=false and
-// tail_only=true (maya's defaults for these kinds) the widget renders
-// only the last max(head,tail) lines — so feeding the full body makes
-// split_lines/elide walk O(file) every frame for a fixed-size preview.
-// A tail slice generous enough to cover every renderer's tail budget
-// keeps the visible output byte-identical while bounding per-frame cost
-// to O(window). The frozen snapshot (built under FrozenBuildScope) still
-// gets the full body — painted once, then blitted.
-constexpr std::size_t kLiveTailLines = 64;
-
 [[nodiscard]] std::string tail_window(std::string_view s,
                                       std::size_t keep_lines) {
     if (s.empty()) return {};
@@ -106,14 +95,20 @@ constexpr std::size_t kLiveTailLines = 64;
     return std::string{s.substr(start)};
 }
 
-// Body for a terminal line-oriented tool sitting in the LIVE tail.
-// Frozen builds keep the full body (full content, painted once); the
-// live path elides to a bounded tail window so per-frame split_lines
-// stays O(window) instead of O(file). Cheap no-op for short bodies
-// (tail_window returns the whole string when it has <= keep_lines).
+// Body for a terminal line-oriented tool (FileRead, GitDiff, Json,
+// CodeBlock, Failure). These callsites all gate on tc.is_done(), so the
+// output is FINAL — it arrives whole when the tool completes, never
+// streamed line-by-line like a write `content`. Render the full body
+// whether or not we're building the frozen snapshot: the live card and
+// the frozen card key on the same Turn hash_id, so a windowed live card
+// (last N lines) vs a full-body frozen card is a seam mismatch — the
+// rows the live card already committed to native scrollback won't match
+// the full-body frozen card that replaces them on freeze (the duplicated
+// / wiped card). maya's tail_only renderer still elides the DISPLAY to
+// its head/tail budget; feeding the full body just keeps the live and
+// frozen inputs identical so the elided output is byte-for-byte the same.
 [[nodiscard]] std::string live_tail_body(std::string_view body) {
-    if (building_frozen()) return std::string{body};
-    return tail_window(body, kLiveTailLines);
+    return std::string{body};
 }
 
 } // namespace
@@ -314,14 +309,16 @@ maya::ToolBodyPreview::Config tool_body_preview_config(
             // scrollback — only the settled show_all render reaches
             // scrollback, and it's painted once.
             out.is_streaming = streaming_now;
-            // show_all (full head-anchored render) is for the FROZEN
-            // snapshot only. The live tail — streaming OR a settled-but-
-            // not-yet-frozen card — stays compact (tail window, maya
-            // elides to code_tail) so its height never jumps while its
-            // position is still mutable, the source of the duplicated
-            // write card. The full body lands in scrollback exactly once,
-            // via the frozen snapshot.
-            out.show_all     = !streaming_now && building_frozen();
+            // Settled write renders the FULL body (show_all) in the live
+            // tail too — NOT only the frozen snapshot. The freeze handoff
+            // keys both renders on the same Turn hash_id, so they MUST be
+            // byte-identical or the rows the live card already committed
+            // to native scrollback won't match the full-body frozen card
+            // that replaces them (the duplicated / wiped card). A windowed
+            // live card (3-line code_tail) vs a full-body frozen card is
+            // exactly that mismatch. Only STREAMING stays windowed: the
+            // body is still growing, would balloon height every frame.
+            out.show_all = !streaming_now;
             if (streaming_now) {
                 // Small tail slice → O(window) per frame and a fixed
                 // compact card height. show_all=false above makes maya
@@ -331,26 +328,15 @@ maya::ToolBodyPreview::Config tool_body_preview_config(
                 // it returns with the true total the instant we settle.
                 out.text = tail_window(content, kStreamTailLines);
                 out.show_footer_stats = false;
-            } else if (building_frozen()) {
-                // Terminal frozen snapshot: full body, painted once then
-                // blitted. This is the ONLY write render that reaches
-                // native scrollback, and it does so exactly once.
-                out.text = std::move(content);
             } else {
-                // Terminal but still LIVE (run can't freeze yet — e.g. a
-                // sibling tool in the same batch is still Running). Keep
-                // it compact (same window as the streaming preview) so
-                // the card height is stable from stream through settle
-                // until the freeze swaps in the full frozen snapshot.
-                // Rendering the full body here would overflow the
-                // viewport top while the card's position is still
-                // mutable, stranding a scrollback copy on freeze.
-                out.text = tail_window(content, kStreamTailLines);
-                // Footer line/byte totals are computed off cfg_.text;
-                // on the windowed slice they'd read 64 lines, not the
-                // file's true length. Suppress until the frozen snapshot
-                // (full body) carries the real totals.
-                out.show_footer_stats = false;
+                // Terminal: full body, show_all. Identical bytes whether
+                // this is the live-but-unfrozen card or the frozen
+                // snapshot, so the freeze handoff is seamless — the rows
+                // the live card committed to scrollback match the frozen
+                // card exactly, no stranded duplicate. Per-frame cost over
+                // a STABLE settled body for the one-or-two frames before
+                // the freeze is negligible (split_lines on final bytes).
+                out.text = std::move(content);
             }
         } else if (tc.is_running()) {
             out.kind = Kind::FileWrite;

@@ -535,21 +535,30 @@ static void test_single_write_stream_to_freeze() {
               "scrollback -> duplicated write card)");
     }
 
-    // The FROZEN snapshot (frame_c) must carry the WHOLE file — first
-    // AND last line both present — so the user sees the complete write
-    // in scrollback. (frame_b, the pre-freeze live render, is compact
-    // by design and need not show line 0.)
+    // The FROZEN snapshot (frame_c) must carry the WHOLE file. So must
+    // frame_b: once the write SETTLES (terminal) the live card renders
+    // the full body too, byte-identical to the frozen card that replaces
+    // it. A windowed live card vs a full-body frozen card is the seam
+    // mismatch that stranded the duplicate — the rows the live card
+    // committed to scrollback must equal what the freeze re-presents.
     {
         auto joined = [](const std::vector<std::string>& rows) {
             std::string s;
             for (const auto& r : rows) { s += r; s.push_back('\n'); }
             return s;
         };
+        const std::string b = joined(frame_b);
         const std::string c = joined(frame_c);
         CHECK(c.find("line 0: some plausible") != std::string::npos,
               "frozen write snapshot missing the FIRST line of the file");
         CHECK(c.find("line 169: some plausible") != std::string::npos,
               "frozen write snapshot missing the LAST line of the file");
+        CHECK(b.find("line 0: some plausible") != std::string::npos,
+              "settled-live write card missing the FIRST line — a windowed "
+              "live card diverges from the full-body frozen card at the "
+              "freeze seam (stranded duplicate)");
+        CHECK(b.find("line 169: some plausible") != std::string::npos,
+              "settled-live write card missing the LAST line of the file");
     }
 
     int d_ab = first_committed_divergence(frame_a, frame_b, kTermH);
