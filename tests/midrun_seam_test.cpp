@@ -81,6 +81,22 @@ static ToolUse settled_edit(const std::string& tag) {
     return t;
 }
 
+// A unified diff payload the edit tool emits into tc.output(), wrapped in
+// the ```diff fence the terminal-state renderer parses. n hunks of `rows`
+// changed lines each — enough body to span past a viewport top.
+static std::string edit_diff_output(const std::string& tag, int rows) {
+    std::string d = "```diff\n";
+    d += "--- a/src/" + tag + ".cpp\n";
+    d += "+++ b/src/" + tag + ".cpp\n";
+    d += "@@ -1," + std::to_string(rows) + " +1," + std::to_string(rows) + " @@\n";
+    for (int i = 0; i < rows; ++i) {
+        d += "-    auto x = compute(" + std::to_string(i) + "); // was\n";
+        d += "+    auto x = compute(" + std::to_string(i) + ") + offset; // now\n";
+    }
+    d += "```\n";
+    return d;
+}
+
 // Render the CONVERSATION region only (frozen + live tail), one row per
 // line, ASCII-folded, trailing blanks stripped.
 static std::vector<std::string> render_rows(const Model& m,
@@ -219,6 +235,120 @@ static void test_incremental_freeze_prefix_stable() {
     }
     CHECK(worst_divergence < 0,
           "committed prefix mutated across an incremental freeze");
+}
+
+// THE single-tool transition the incremental test above never exercises:
+// ONE edit streamed through Running (args only, no output) -> Done (diff
+// fence in tc.output()) -> mid-run freeze. The renderer SWITCHES shape
+// across this transition (streaming EditDiff-from-args, elided, ->
+// terminal GitDiff-from-fence, full). The seam contract says: any row
+// that already overflowed the viewport top while streaming must render
+// byte-identical after the settle+freeze, or the committed scrollback
+// copy is orphaned and the card duplicates below it.
+//
+// To make the transition actually commit rows we sandwich the streaming
+// edit between a block of already-frozen edits (so its early rows are
+// pushed above the kTermH viewport top). Then we snapshot:
+//   frame A: edit Running (args preview)
+//   frame B: edit Done    (terminal GitDiff body)
+//   frame C: edit Done + freeze_settled_subturns fired
+// and assert the committed prefix is stable A->B and B->C.
+static void test_single_edit_stream_to_freeze() {
+    constexpr int kTermH = 40;
+
+    Model m;
+    m.d.current.id = agentty::ThreadId{"single"};
+    Message u; u.role = Role::User; u.text = "edit one file";
+    m.d.current.messages.push_back(std::move(u));
+    agentty::app::detail::clear_frozen(m);
+    agentty::app::detail::freeze_through(m, 1);
+
+    // Lead-in: a run of settled edits, frozen, so plenty of rows sit
+    // above the viewport top before the edit-under-test even appears.
+    for (int e = 0; e < 20; ++e) {
+        Message a; a.role = Role::Assistant;
+        a.tool_calls.push_back(settled_edit("lead" + std::to_string(e)));
+        m.d.current.messages.push_back(std::move(a));
+    }
+    // A streaming placeholder keeps the run active so the lead-in freezes.
+    Message ph; ph.role = Role::Assistant; ph.streaming_text = "working";
+    m.d.current.messages.push_back(std::move(ph));
+    m.s.phase = agentty::phase::Streaming{agentty::phase::Active{}};
+    agentty::app::detail::freeze_settled_subturns(m);
+    m.d.current.messages.pop_back();   // drop placeholder
+
+    const std::string tag = "target";
+    constexpr int kRows = 30;
+
+    // ── frame A: the edit is RUNNING. Args carry the hunk; no output yet.
+    {
+        Message a; a.role = Role::Assistant;
+        ToolUse t;
+        t.id   = ToolCallId{"edit_" + tag};
+        t.name = ToolName{"edit"};
+        nlohmann::json edits = nlohmann::json::array();
+        // Hunk text mirrors the diff body so widths line up.
+        std::string ot, nt;
+        for (int i = 0; i < kRows; ++i) {
+            ot += "    auto x = compute(" + std::to_string(i) + "); // was\n";
+            nt += "    auto x = compute(" + std::to_string(i) + ") + offset; // now\n";
+        }
+        edits.push_back({{"old_text", ot}, {"new_text", nt}});
+        t.args = {{"path", "src/" + tag + ".cpp"}, {"edits", edits}};
+        t.status = ToolUse::Running{steady_clock::now(), ""};
+        a.tool_calls.push_back(std::move(t));
+        // Active placeholder behind it so freeze_settled stays valid.
+        Message ph2; ph2.role = Role::Assistant; ph2.streaming_text = "...";
+        m.d.current.messages.push_back(std::move(a));
+        m.d.current.messages.push_back(std::move(ph2));
+    }
+    auto frame_a = render_rows(m);
+
+    // ── frame B: the edit SETTLES. Same args; status -> Done with the
+    //    ```diff fence the terminal renderer parses (renderer SWAPS here).
+    {
+        // Locate the live edit and flip it to Done.
+        agentty::app::detail::with_live_tool(
+            m, ToolCallId{"edit_" + tag}, [&](ToolUse& t) {
+                auto now = steady_clock::now();
+                t.status = ToolUse::Done{now - milliseconds{5}, now,
+                                         edit_diff_output(tag, kRows)};
+            });
+    }
+    auto frame_b = render_rows(m);
+
+    // ── frame C: mid-run freeze fires (ToolExecOutput cadence).
+    agentty::app::detail::freeze_settled_subturns(m);
+    auto frame_c = render_rows(m);
+
+    int d_ab = first_committed_divergence(frame_a, frame_b, kTermH);
+    int d_bc = first_committed_divergence(frame_b, frame_c, kTermH);
+
+    if (d_ab >= 0) {
+        std::fprintf(stderr,
+            "  single-edit Running->Done committed-row divergence at %d\n", d_ab);
+        for (int y = d_ab; y < std::min<int>(d_ab + 3,
+                 (int)std::max(frame_a.size(), frame_b.size())); ++y) {
+            std::fprintf(stderr, "    row %2d A |%s|\n", y,
+                         y < (int)frame_a.size() ? frame_a[y].c_str() : "<none>");
+            std::fprintf(stderr, "    row %2d B |%s|\n", y,
+                         y < (int)frame_b.size() ? frame_b[y].c_str() : "<none>");
+        }
+    }
+    if (d_bc >= 0) {
+        std::fprintf(stderr,
+            "  single-edit Done->freeze committed-row divergence at %d\n", d_bc);
+        for (int y = d_bc; y < std::min<int>(d_bc + 3,
+                 (int)std::max(frame_b.size(), frame_c.size())); ++y) {
+            std::fprintf(stderr, "    row %2d B |%s|\n", y,
+                         y < (int)frame_b.size() ? frame_b[y].c_str() : "<none>");
+            std::fprintf(stderr, "    row %2d C |%s|\n", y,
+                         y < (int)frame_c.size() ? frame_c[y].c_str() : "<none>");
+        }
+    }
+
+    CHECK(d_ab < 0, "single edit Running->Done rewrote a committed scrollback row");
+    CHECK(d_bc < 0, "single edit Done->freeze rewrote a committed scrollback row");
 }
 
 // Reassemble the full assistant body the user should see from the
@@ -512,6 +642,7 @@ static void test_giant_fence_prefix_freeze() {
 int main() {
     std::printf("midrun_seam_test\n");
     test_incremental_freeze_prefix_stable();
+    test_single_edit_stream_to_freeze();
     test_streaming_text_prefix_freeze();
     test_giant_fence_prefix_freeze();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
