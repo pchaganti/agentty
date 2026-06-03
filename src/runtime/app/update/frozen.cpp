@@ -445,14 +445,39 @@ void freeze_settled_subturns(Model& m) {
         cut = i + 1;
     }
 
-    // Never freeze the entire run here — the last sub-turn is the active
-    // one (streaming tail / pending continuation) and must stay live so
-    // freeze_through (at idle) does the final, turn-completing freeze
-    // with the correct turn-number advance. Leaving >=1 sub-turn live
-    // also means there's always a live remainder to render as the
-    // continuation, so the header (painted in the frozen prefix) is
-    // never duplicated.
-    if (cut >= run_end) cut = run_end - 1;
+    // agent_session roll-up parity. In agent_session a settled tool
+    // BATCH is folded into the assistant body and cleared from the
+    // live `m.tools` the instant the next block starts OR at
+    // MessageStop — it NEVER lingers as a live, full-body card that
+    // can overflow the viewport while still mutable. agentty's
+    // equivalent is freezing it here.
+    //
+    // The clamp below kept the LAST sub-turn live so there's always a
+    // continuation remainder and the active prose tail isn't frozen
+    // mid-stream. But for a TOOL-batch last sub-turn that is fully
+    // terminal, keeping it live is exactly the bug: a single big
+    // `write`/`edit` settles, sits in the live tail re-rendering its
+    // full body every frame, overflows native scrollback while
+    // mutable, then freezes — leaving one copy stranded in scrollback
+    // and a second in the frozen prefix (the duplicated card the user
+    // sees). When the stream is still ACTIVE a continuation is coming,
+    // so freezing the whole settled run now is safe: frozen_midrun
+    // makes the next message render as a header-suppressed continuation
+    // (no duplicate glyph/label), and the big body lands in the
+    // zero-copy, paint-once frozen prefix instead of churning live.
+    //
+    // We only lift the clamp when the LAST sub-turn is a terminal
+    // TOOL batch (not a settled-text-only block, which could be the
+    // active prose tail freeze_streaming_text_prefix just carved and
+    // whose successor bytes may still be streaming). A text-only last
+    // sub-turn keeps the old clamp so the live prose edge stays
+    // animating.
+    const bool last_is_terminal_tool_batch =
+        cut == run_end
+        && run_end > run_start
+        && !msgs[run_end - 1].tool_calls.empty()
+        && m.s.active();
+    if (cut >= run_end && !last_is_terminal_tool_batch) cut = run_end - 1;
     if (cut <= run_start) return;   // nothing freezable yet
 
     // The frozen entry is a CONTINUATION iff this run's header was

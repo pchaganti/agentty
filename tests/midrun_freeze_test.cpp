@@ -220,12 +220,64 @@ static void test_split_preserves_content() {
     CHECK(both == N, "split and whole renders disagree on content presence");
 }
 
+// 5. agent_session roll-up parity: a settled tool batch that is the
+//    LAST message in an active run (the state right after
+//    ToolExecOutput, before any continuation message is appended) must
+//    NOT linger in the live tail re-rendering its full body. It freezes
+//    immediately, so the big write/edit card lands in the zero-copy
+//    frozen prefix instead of overflowing scrollback while mutable —
+//    the duplicated-card bug. Mirrors agent_session clearing m.tools
+//    into assistant_body the instant the batch settles.
+static void test_trailing_tool_batch_freezes() {
+    Model m;
+    m.d.current.id = agentty::ThreadId{"trailing"};
+    Message u; u.role = Role::User; u.text = "write a file";
+    m.d.current.messages.push_back(std::move(u));
+    // ONE assistant sub-turn with a settled tool, and NO continuation
+    // message yet — exactly the live tail at ToolExecOutput time.
+    Message a; a.role = Role::Assistant;
+    a.tool_calls.push_back(settled_edit("only"));
+    m.d.current.messages.push_back(std::move(a));
+    m.s.phase = agentty::phase::Streaming{agentty::phase::Active{}};
+
+    agentty::app::detail::clear_frozen(m);
+    agentty::app::detail::freeze_through(m, 1);          // User frozen
+    agentty::app::detail::freeze_settled_subturns(m);    // should freeze the tool batch
+
+    CHECK(m.ui.frozen_through == m.d.current.messages.size(),
+          "trailing settled tool batch did NOT freeze — it lingers live "
+          "and will overflow scrollback (the duplicated-card bug)");
+    CHECK(m.ui.frozen_midrun,
+          "frozen_midrun not set — the coming continuation would repaint a header");
+    // The body must still be present (frozen, not dropped).
+    auto txt = render_dump(m);
+    CHECK(txt.find("src/only.cpp") != std::string::npos,
+          "frozen tool batch body vanished from the render");
+
+    // When the stream is NOT active, the clamp must still hold (no
+    // continuation is coming, so freeze_through owns the final freeze).
+    Model idle;
+    idle.d.current.id = agentty::ThreadId{"idle"};
+    Message u2; u2.role = Role::User; u2.text = "write a file";
+    idle.d.current.messages.push_back(std::move(u2));
+    Message a2; a2.role = Role::Assistant;
+    a2.tool_calls.push_back(settled_edit("only"));
+    idle.d.current.messages.push_back(std::move(a2));
+    idle.s.phase = agentty::phase::Idle{};
+    agentty::app::detail::clear_frozen(idle);
+    agentty::app::detail::freeze_through(idle, 1);
+    agentty::app::detail::freeze_settled_subturns(idle);
+    CHECK(idle.ui.frozen_through == 1,
+          "idle run froze the last sub-turn via the active-only path");
+}
+
 int main() {
     std::printf("midrun_freeze_test\n");
     test_live_bounded();
     test_all_content_present();
     test_single_turn_header();
     test_split_preserves_content();
+    test_trailing_tool_batch_freezes();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures) { std::printf("FAILED\n"); return 1; }
     std::printf("PASSED\n");
