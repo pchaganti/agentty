@@ -39,15 +39,18 @@ namespace agentty::ui {
 
 namespace {
 
-// One-row divider used as the seam between every pair of adjacent
-// turns — same row frozen.cpp pushes before each settled turn, same
-// row build_live_tail pushes between live-tail turns, and same row
-// at the frozen↔live boundary. Symmetry across all three sites is
-// the invariant: any height delta at a freeze instant would shift
-// rows already scrolled into native scrollback against the live
-// re-layout, producing a ghost at the scrollback↔viewport seam.
+// Inter-turn seam between every pair of adjacent turns — a blank row,
+// the dim ─ rule, then another blank row. MUST stay byte-identical to
+// frozen.cpp's gap_row(): the same seam is pushed before each settled
+// turn, between live-tail turns, and at the frozen↔live boundary. Any
+// height/shape delta at a freeze instant would shift rows already
+// scrolled into native scrollback against the live re-layout,
+// producing a ghost at the scrollback↔viewport seam.
 maya::Element gap_row() {
-    return maya::Conversation::divider();
+    using namespace maya::dsl;
+    return v(blank(),
+             maya::Conversation::divider(),
+             blank()).build();
 }
 
 // Sentinel-check: assistant message whose only content is tool_calls

@@ -99,11 +99,18 @@ std::size_t frozen_row_budget() {
     return static_cast<std::size_t>(std::max(48, (h * 3) / 2));
 }
 
-// Thin dim ─ rule between turns. Pushed before each fresh-speaker
-// turn so settled turns are visually separated.
+// Inter-turn gap: a blank row, the thin dim ─ rule, then another
+// blank row. Pushed before each fresh-speaker turn so settled turns
+// are visually separated with breathing room — the bare rule alone
+// reads as cramped, fused to the previous answer and the next header.
+// Three rows; keep push_frozen's row count in sync.
 maya::Element gap_row() {
-    return maya::Conversation::divider();
+    using namespace maya::dsl;
+    return v(blank(),
+             maya::Conversation::divider(),
+             blank()).build();
 }
+constexpr int kGapRows = 3;
 
 // Compaction-boundary divider Element. Single-line `≡ Conversation
 // compacted` rule, identical chrome to the inline-built version that
@@ -334,7 +341,7 @@ void freeze_range(Model& m, std::size_t from, std::size_t to) {
             m.ui.frozen_midrun && i == m.ui.frozen_through
             && m.d.current.messages[i].role == Role::Assistant;
         if (!first_overall && !completing_midrun) {
-            push_frozen(m, gap_row(), 1);
+            push_frozen(m, gap_row(), kGapRows);
         }
 
         const Message& head = m.d.current.messages[i];
@@ -460,7 +467,7 @@ void freeze_settled_subturns(Model& m) {
     // (continuations have no inter-turn seam; the header turn owns the
     // gap above it).
     if (!m.ui.frozen.empty() && !entry_continuation) {
-        push_frozen(m, gap_row(), 1);
+        push_frozen(m, gap_row(), kGapRows);
     }
 
     // Turn number mirrors what the live tail showed for this run
