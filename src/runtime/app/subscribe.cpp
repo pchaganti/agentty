@@ -40,6 +40,27 @@ bool running_over_ssh() {
     return remote;
 }
 
+} // namespace
+
+// The single definition of the streaming Tick cadence. See the
+// declaration in subscribe.hpp for the full rationale. Computed once
+// per session — the inputs are immutable — and shared verbatim by both
+// subscribe() (the timer interval) and Program::visual_hash() (the
+// phase-locked animation bucket).
+std::chrono::milliseconds streaming_tick_period() noexcept {
+    static const std::chrono::milliseconds period = [] {
+        auto base = maya::ansi::env_supports_synchronized_output()
+            ? std::chrono::milliseconds(33)
+            : std::chrono::milliseconds(100);
+        if (running_over_ssh())
+            return std::max(base, std::chrono::milliseconds(80));
+        return base;
+    }();
+    return period;
+}
+
+namespace {
+
 // ── Per-modal key handlers — return std::nullopt to fall through ──────────
 
 std::optional<Msg> on_permission(const KeyEvent& ev) {
@@ -524,15 +545,7 @@ Sub<Msg> subscribe(const Model& m) {
     // prose fills at the same wall-clock rate, just in fewer, larger
     // frames.
     if (m.s.active()) {
-        static const auto tick_period = [] {
-            auto base = maya::ansi::env_supports_synchronized_output()
-                ? std::chrono::milliseconds(33)
-                : std::chrono::milliseconds(100);
-            if (running_over_ssh())
-                return std::max(base, std::chrono::milliseconds(80));
-            return base;
-        }();
-        auto tick = Sub<Msg>::every(tick_period, Tick{});
+        auto tick = Sub<Msg>::every(streaming_tick_period(), Tick{});
         return Sub<Msg>::batch(std::move(key_sub), std::move(paste_sub), std::move(tick));
     }
     return Sub<Msg>::batch(std::move(key_sub), std::move(paste_sub));

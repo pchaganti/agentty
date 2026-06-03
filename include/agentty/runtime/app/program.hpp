@@ -8,7 +8,6 @@
 #include <cstdint>
 
 #include <maya/maya.hpp>
-#include <maya/terminal/ansi.hpp>   // env_supports_synchronized_output()
 
 #include "agentty/runtime/app/deps.hpp"
 #include "agentty/runtime/app/subscribe.hpp"
@@ -222,13 +221,15 @@ struct AgenttyApp {
         // freeze-until-keypress bug. Bias toward animating.
         constexpr std::int64_t kBlinkHalfMs = 265;
         const bool caret_blinking = !m.s.active();
-        // Fine-animation bucket period, matched to the Tick subscription's
-        // cadence (subscribe.cpp) so the hash advances exactly once per
-        // loop wake. 33 ms on DEC-2026 terminals (atomic frames, smooth),
-        // 100 ms otherwise (one torn repaint per tick instead of ~3).
-        // Detected once — the capability is immutable for the session.
-        static const std::int64_t kFineAnimMs =
-            maya::ansi::env_supports_synchronized_output() ? 33 : 100;
+        // Fine-animation bucket period. PHASE-LOCKED to the Tick
+        // subscription by construction: it is the SAME value
+        // streaming_tick_period() hands subscribe.cpp for the
+        // `Sub::every(period, Tick{})` interval, so the hash advances
+        // exactly once per loop wake (33 ms sync / 100 ms non-sync /
+        // ≥ 80 ms SSH). Sharing the one function eliminates the old
+        // hand-maintained duplicate heuristic here — which silently
+        // omitted the SSH floor and could beat against the real tick.
+        const std::int64_t kFineAnimMs = streaming_tick_period().count();
         if (fine_anim_live) {
             mix(static_cast<std::uint64_t>(now_ms / kFineAnimMs));
         } else if (caret_blinking) {
