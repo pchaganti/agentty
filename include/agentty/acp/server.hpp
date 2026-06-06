@@ -30,6 +30,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -111,10 +112,18 @@ private:
 
     Session* find_session(const std::string& id);
 
+    // Wire tool list, built once from the static tools::registry(). The
+    // registry never changes at runtime, so we snapshot it on first use
+    // instead of rebuilding the vector every completion.
+    const std::vector<provider::ToolSpec>& wire_tools();
+
     rpc::Peer&       peer_;
     StreamFn         stream_;
     auth::AuthHeader auth_;
     std::string      model_id_;
+
+    std::once_flag                  tools_once_;
+    std::vector<provider::ToolSpec> wire_tools_;
 
     std::mutex                                   session_mtx_;
     std::unordered_map<std::string, Session>     sessions_;

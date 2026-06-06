@@ -160,6 +160,17 @@ Session* AgentServer::find_session(const std::string& id) {
     return it == sessions_.end() ? nullptr : &it->second;
 }
 
+const std::vector<provider::ToolSpec>& AgentServer::wire_tools() {
+    std::call_once(tools_once_, [this] {
+        const auto& reg = tools::registry();
+        wire_tools_.reserve(reg.size());
+        for (const auto& t : reg)
+            wire_tools_.push_back({t.name.value, t.description, t.input_schema,
+                                   t.eager_input_streaming});
+    });
+    return wire_tools_;
+}
+
 rpc::Outcome AgentServer::handle_request(const std::string& method,
                                          const json& params,
                                          const json& id) {
@@ -325,9 +336,7 @@ StopReason AgentServer::stream_completion(Session& sess, bool& out_cancelled,
     req.cancel        = sess.cancel;
     req.auth          = auth_;
     req.messages      = sess.thread.messages;
-    for (const auto& t : tools::registry())
-        req.tools.push_back({t.name.value, t.description, t.input_schema,
-                             t.eager_input_streaming});
+    req.tools         = wire_tools();
 
     // A fresh assistant message accumulates this completion's text + tools.
     Message assistant;
