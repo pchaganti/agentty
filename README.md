@@ -250,8 +250,29 @@ Add this to Zed's `settings.json` (`zed: open settings`):
 Then open the agent panel (`cmd-?` / `ctrl-?`), pick **agentty** from the agent
 list, and prompt. Auth is whatever `agentty login` already set up — the ACP
 process reads the same `~/.config/agentty/credentials.json`, so there's nothing
-extra to configure. Set the model once with `agentty -m claude-sonnet-4-5` (it's
-saved to settings) and the ACP agent picks it up.
+extra to configure. Set the model per-subprocess in the `args` (it does *not*
+clobber your TUI's saved model):
+
+```json
+{
+  "agent_servers": {
+    "agentty": {
+      "command": "agentty",
+      "args": ["acp", "-m", "claude-haiku-4-5", "--profile", "ask"]
+    }
+  }
+}
+```
+
+`--profile` picks how eagerly Zed prompts you before a tool runs:
+
+- **`ask`** (default) — prompt for `write` / `edit` / `bash` / network; read-only
+  inspection (`read` / `grep` / `glob` / `list_dir`) runs without a dialog so the
+  loop stays fluid.
+- **`minimal`** — prompt for *everything* that touches the outside world, reads
+  included. Tightest leash.
+- **`write`** — same write/exec/net prompts as `ask`, but never prompts for
+  reads.
 
 What works over ACP:
 
@@ -261,9 +282,12 @@ What works over ACP:
   (pending → running → done/failed).
 - **Inline diffs** — `write` and `edit` emit ACP `diff` content, so Zed renders
   the file change inline and lets you review it in place.
+- **Follow-along** — read/edit/write/grep tool calls carry the file path as an
+  ACP `location`, so Zed can open and highlight the file the agent is touching
+  in real time.
 - **Permission prompts** — side-effecting tools (`bash`, `write`, `edit`,
-  network) trigger Zed's native allow/reject dialog before they run; read-only
-  inspection runs without prompting so the loop stays fluid.
+  network) trigger Zed's native allow/reject dialog before they run; the
+  `--profile` flag (above) tunes exactly which tools prompt.
 - **Cancellation** — stop a turn from Zed and the in-flight stream tears down.
 - **Workspace sandbox** — file tools stay inside the session's `cwd` (the
   folder you opened in Zed); `bash` is wrapped in bwrap/sandbox-exec exactly

@@ -87,6 +87,30 @@ std::string tool_title(const ToolUse& tc) {
     return tc.name.value;
 }
 
+// File locations a tool call touches, for Zed's "follow-along" (it can open /
+// highlight the file as the agent works). Empty array when the tool has no
+// obvious file argument. Returns an ACP ToolCallLocation[] ({path, line?}).
+json tool_locations(const ToolUse& tc) {
+    json locs = json::array();
+    const auto& a = tc.args;
+    auto add = [&](const char* key) {
+        if (a.contains(key) && a[key].is_string()) {
+            const std::string p = a[key].get<std::string>();
+            if (!p.empty()) {
+                json loc{{"path", p}};
+                if (a.contains("line") && a["line"].is_number_integer())
+                    loc["line"] = a["line"].get<int>();
+                locs.push_back(std::move(loc));
+            }
+        }
+    };
+    const std::string& n = tc.name.value;
+    if (n == "read" || n == "edit" || n == "write"
+     || n == "list_dir" || n == "git_diff" || n == "diagnostics")
+        add("path");
+    return locs;
+}
+
 // Build the prompt text from the ACP ContentBlock[] of a session/prompt. We
 // support text + resource_link (the ACP baseline). Embedded resources and
 // images are flattened to their text where present, else a short marker.
@@ -137,11 +161,13 @@ const char* acp_stop_reason(StopReason r, bool cancelled, bool errored) {
 AgentServer::AgentServer(rpc::Peer&       peer,
                          StreamFn         stream,
                          auth::AuthHeader auth,
-                         std::string      model_id)
+                         std::string      model_id,
+                         Profile          profile)
     : peer_(peer),
       stream_(std::move(stream)),
       auth_(std::move(auth)),
-      model_id_(std::move(model_id)) {}
+      model_id_(std::move(model_id)),
+      profile_(profile) {}
 
 int AgentServer::serve() {
     peer_.on_request([this](const std::string& m, const json& p, const json& id) {
@@ -393,6 +419,7 @@ StopReason AgentServer::stream_completion(Session& sess, bool& out_cancelled,
                                 {"toolCallId", tc.id.value},
                                 {"title", tool_title(tc)},
                                 {"rawInput", tc.args},
+                                {"locations", tool_locations(tc)},
                             });
                         }
                     } else if constexpr (std::is_same_v<E, StreamFinished>) {
@@ -432,11 +459,15 @@ bool AgentServer::run_tools(Session& sess, bool& out_cancelled) {
     // (reading tc.output() / tc.is_failed() / tc.is_rejected()), so there is
     // nothing to append separately — the wire pairing is automatic.
     //
-    // In ACP mode the CLIENT (Zed) owns the approval UI, so we always ask it
-    // before a side-effecting tool runs. Profile::Ask is the right policy:
-    // prompt for Exec / WriteFs / Net, auto-run ReadFs / Pure inspection so an
-    // agent loop's read/grep/glob don't spam a permission dialog per step.
-    const Profile profile = Profile::Ask;
+    // In ACP mode the CLIENT (Zed) owns the approval UI. The profile decides
+    // which tools we gate behind a session/request_permission round-trip:
+    //   Ask (default) — prompt for Exec / WriteFs / Net; auto-run reads so an
+    //                    agent loop's read/grep/glob don't spam dialogs.
+    //   Minimal       — prompt for everything that touches the outside world,
+    //                    reads included.
+    //   Write         — same side-effect prompts as Ask (Exec/WriteFs/Net
+    //                    still prompt) but never prompts for reads.
+    const Profile profile = profile_;
 
     for (auto& tc : last.tool_calls) {
         if (sess.cancel && sess.cancel->is_cancelled()) {
@@ -543,6 +574,7 @@ bool AgentServer::ask_permission(const std::string& session_id, const ToolUse& t
             {"title", tool_title(tc)},
             {"kind", acp_tool_kind(tc.name.value)},
             {"rawInput", tc.args},
+            {"locations", tool_locations(tc)},
         }},
         {"options", std::move(options)},
     };

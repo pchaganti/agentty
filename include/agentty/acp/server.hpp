@@ -37,6 +37,7 @@
 #include "agentty/acp/jsonrpc.hpp"
 #include "agentty/auth/auth.hpp"
 #include "agentty/domain/conversation.hpp"
+#include "agentty/domain/profile.hpp"
 #include "agentty/io/http.hpp"
 #include "agentty/provider/provider.hpp"
 
@@ -66,7 +67,8 @@ public:
     AgentServer(rpc::Peer&        peer,
                 StreamFn          stream,
                 auth::AuthHeader  auth,
-                std::string       model_id);
+                std::string       model_id,
+                Profile           profile = Profile::Ask);
 
     // Install handlers and block on peer.run() until the client disconnects.
     // Returns a process exit code.
@@ -121,6 +123,7 @@ private:
     StreamFn         stream_;
     auth::AuthHeader auth_;
     std::string      model_id_;
+    Profile          profile_;
 
     std::once_flag                  tools_once_;
     std::vector<provider::ToolSpec> wire_tools_;

@@ -43,6 +43,7 @@
 #include "agentty/acp/jsonrpc.hpp"
 #include "agentty/acp/server.hpp"
 #include "agentty/airgap/airgap.hpp"
+#include "agentty/domain/profile.hpp"
 #include "agentty/runtime/app/deps.hpp"
 #include "agentty/runtime/app/program.hpp"
 #include "agentty/auth/auth.hpp"
@@ -92,6 +93,10 @@ void print_usage() {
         "                      MODE = auto (default: use if available),\n"
         "                             on  (require backend; fail otherwise),\n"
         "                             off (disable wrapping).\n"
+        "  -p, --profile MODE  ACP permission tier (Zed shows the prompts):\n"
+        "                             ask     (default: prompt write/exec/net),\n"
+        "                             minimal (also prompt reads),\n"
+        "                             write   (never prompt reads).\n"
         "  -V, --version       Print the agentty version and exit.\n"
         "  -h, --help          Show this message.\n"
         "\n",
@@ -104,6 +109,7 @@ struct Args {
     std::string cli_model;
     std::string cli_workspace;
     std::string cli_sandbox;   // "auto" | "on" | "off"; empty = auto default
+    std::string cli_profile;   // "write" | "ask" | "minimal"; ACP only
     int         airgap_argc = 0;
     char**      airgap_argv = nullptr;   // borrowed from main's argv
     bool        bad = false;
@@ -132,6 +138,8 @@ Args parse_args(int argc, char** argv) {
             out.cli_workspace = argv[++i];
         } else if (a == "--sandbox" && i + 1 < argc) {
             out.cli_sandbox = argv[++i];
+        } else if ((a == "-p" || a == "--profile") && i + 1 < argc) {
+            out.cli_profile = argv[++i];
         } else if (a == "-h" || a == "--help") {
             out.subcommand = "help";
         } else if (a == "-V" || a == "--version" || a == "version") {
@@ -287,6 +295,21 @@ int main(int argc, char** argv) {
         // handshake. The TUI does the same before launching maya.
         auth::prewarm_anthropic();
 
+        // Permission profile gates which tools trigger a Zed approval prompt.
+        // Default Ask: prompt for write/exec/net, auto-run reads. `minimal`
+        // also prompts for reads; `write` never prompts for reads.
+        Profile profile = Profile::Ask;
+        if      (args.cli_profile == "write")   profile = Profile::Write;
+        else if (args.cli_profile == "minimal") profile = Profile::Minimal;
+        else if (args.cli_profile == "ask" || args.cli_profile.empty())
+                                                profile = Profile::Ask;
+        else {
+            std::fprintf(stderr,
+                "agentty: --profile must be write, ask, or minimal (got '%s')\n",
+                args.cli_profile.c_str());
+            return 2;
+        }
+
         acp::rpc::Peer peer(std::cin, std::cout);
         acp::AgentServer server(
             peer,
@@ -294,8 +317,10 @@ int main(int argc, char** argv) {
                 provider.stream(std::move(req), std::move(sink));
             },
             auth::make_auth_header(creds),
-            std::move(model_id));
-        std::fprintf(stderr, "agentty: ACP agent ready on stdio\n");
+            std::move(model_id),
+            profile);
+        std::fprintf(stderr, "agentty: ACP agent ready on stdio (profile=%s)\n",
+                     std::string(to_string(profile)).c_str());
         int rc = server.serve();
         persistence::flush_pending_saves();
         return rc;
