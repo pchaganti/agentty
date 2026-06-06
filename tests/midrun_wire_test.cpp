@@ -916,6 +916,160 @@ static void test_overflowed_shrink_stays_synced() {
     close(rfd);
 }
 
+// MID-RUN TRIM at the wire. A long active run accumulates a tall frozen
+// prefix dominated by OUTPUT-ELIDED tools (bash / read / grep) whose maya
+// renderers collapse a huge output to a few rows. trim_frozen_above_
+// viewport drops the off-screen front and emits commit_scrollback(N).
+// The corruption this guards: if estimate_msg_rows OVER-counts those
+// elided cards, the keep-loop drops an entry still on screen and the
+// commit boundary lands below the real off-screen rows — frame B then
+// rewrites a committed scrollback row (the bash-card ghost band). Drive
+// real compose across the trim and assert no committed row is rewritten
+// AND the commit count was not clamped (no under-commit).
+static ToolUse settled_bash(const std::string& tag, int n_lines) {
+    ToolUse t;
+    t.id = ToolCallId{"bash_" + tag}; t.name = ToolName{"bash"};
+    t.args = {{"command", "grep -rn x src # " + tag}};
+    std::string out;
+    for (int i = 0; i < n_lines; ++i)
+        out += "src/file" + std::to_string(i) + ".cpp:" + std::to_string(i)
+             + ": a matching line of plausible source text here\n";
+    auto now = steady_clock::now();
+    t.status = ToolUse::Done{now - milliseconds{5}, now, std::move(out)};
+    return t;
+}
+
+static void test_midrun_trim_output_heavy_no_rewrite() {
+    constexpr int kWidth = 100;
+    constexpr int kTermH = 30;
+
+    Model m;
+    m.d.current.id = agentty::ThreadId{"wiretrim"};
+    Message u; u.role = Role::User; u.text = "do a lot of noisy work";
+    m.d.current.messages.push_back(std::move(u));
+    // Many assistant sub-turns, each a bash card with a HUGE output that
+    // elides to ~4 rows. Pre-fix these over-counted ~120 rows each, so a
+    // handful tripped the keep-loop's drop-an-on-screen-entry path.
+    for (int e = 0; e < 16; ++e) {
+        Message a; a.role = Role::Assistant;
+        a.tool_calls.push_back(
+            settled_bash("t" + std::to_string(e), 120));
+        m.d.current.messages.push_back(std::move(a));
+    }
+    Message ph; ph.role = Role::Assistant; ph.streaming_text = "continuing";
+    m.d.current.messages.push_back(std::move(ph));
+    m.s.phase = agentty::phase::Streaming{agentty::phase::Active{}};
+
+    agentty::app::detail::clear_frozen(m);
+    agentty::app::detail::freeze_through(m, 1);
+    agentty::app::detail::freeze_settled_subturns(m);
+
+    StylePool pool;
+    auto [writer, rfd] = make_pipe_writer();
+
+    // frame A: render the tall frozen prefix + live placeholder.
+    Canvas ca = paint(build_root(m), kWidth, pool);
+    auto oa = InlineFrame<Empty>{}.seed().render(
+        ca, content_rows(ca), term_rows_for_test(kTermH), pool, writer, false);
+    (void)drain(rfd);
+    InlineFrame<Synced> sa = std::visit(
+        [](auto&& arm) -> InlineFrame<Synced> {
+            using T = std::decay_t<decltype(arm)>;
+            if constexpr (std::is_same_v<T, InlineFrame<Synced>>)
+                return std::move(arm);
+            else { std::fprintf(stderr, "  trim frame A not Synced\n");
+                   std::abort(); }
+        }, std::move(oa));
+
+    const int rows_a = sa.rows();
+    const int committed_a = rows_a > kTermH ? rows_a - kTermH : 0;
+    CHECK(committed_a > 0,
+          "trim setup: prefix must overflow the viewport");
+
+    // ── The trim. Drops the off-screen front, emits commit_scrollback(N).
+    auto cmd = agentty::app::detail::trim_frozen_above_viewport(m);
+    using Cmd = maya::Cmd<agentty::Msg>;
+    const auto* exact = std::get_if<Cmd::CommitScrollback>(&cmd.inner);
+    CHECK(exact != nullptr,
+          "trim did not fire on a tall output-heavy prefix (estimate may "
+          "now UNDER-count badly, or the keep margin changed)");
+    if (!exact) { close(rfd); return; }
+
+    const int commit_n = exact->rows;
+    // The commit count must NOT exceed what maya can safely commit
+    // (rows_a - kTermH). An over-count here means the model dropped more
+    // frozen rows than maya commits — the under-commit that strands a
+    // ghost. This is the core invariant of the whole fix.
+    CHECK(commit_n <= committed_a,
+          "trim's commit count exceeds the safe maximum (rows_a - term_h) "
+          "— maya's clamp would under-commit and strand a scrollback ghost");
+
+    // Apply the commit exactly as commit_inline_prefix does (clamp +
+    // commit), then render frame B against the trimmed tree.
+    const int safe_max = rows_a > kTermH ? rows_a - kTermH : 0;
+    const int safe_n = std::min(commit_n, safe_max);
+    // No clamp should have bitten: the model dropped exactly commit_n
+    // rows, and maya can commit all of them. If safe_n < commit_n the
+    // frozen tree shrank more than the wire committed — the under-commit
+    // that strands a ghost.
+    CHECK(safe_n == commit_n,
+          "maya clamped the trim commit below the dropped row count — "
+          "under-commit, the frozen tree is now ahead of the wire boundary");
+    InlineFrame<Synced> sb =
+        std::move(sa).commit(sa.scrollback_marker(safe_n));
+
+    Canvas cb = paint(build_root(m), kWidth, pool);
+    // AUTHORITATIVE proof check: after the trim, the REAL rendered height
+    // of the kept frozen tree (+ live tail) must still be >= term_h. The
+    // trim's correctness rests on keeping >= a viewport on screen so every
+    // dropped row provably overflowed. If estimate_msg_rows OVER-counts an
+    // output-elided card, the keep-loop stops early and the REAL kept rows
+    // fall below term_h — the dropped entry was still on screen and its
+    // committed copy strands as the ghost band. This catches the bug even
+    // when maya's clamp happens to absorb the byte delta.
+    const int kept_real_rows = cb.max_content_row() + 1;
+    std::fprintf(stderr, "  [trim] kept_real_rows=%d term_h=%d\n",
+                 kept_real_rows, kTermH);
+    CHECK(kept_real_rows >= kTermH,
+          "trim left FEWER than a viewport of REAL rows on screen — the "
+          "estimate over-counted and dropped an on-screen entry (ghost band)");
+
+    auto wit = sb.verify();
+    CHECK(wit.has_value(), "trim: shadow verify failed after commit");
+    std::string bytes_b;
+    if (wit) {
+        auto ob = std::move(sb).render(
+            cb, content_rows(cb), term_rows_for_test(kTermH), pool, writer,
+            std::move(*wit), false);
+        bytes_b = drain(rfd);
+        bool synced_b = std::visit([](auto&& arm) {
+            using T = std::decay_t<decltype(arm)>;
+            return std::is_same_v<T, InlineFrame<Synced>>;
+        }, std::move(ob));
+        // Staying Synced is the core wire invariant: a demote here means
+        // maya hit the overflow-while-poisoned recovery (commit + soft
+        // repaint), which is exactly what re-emits the committed bash
+        // rows below the boundary as the ghost band.
+        CHECK(synced_b,
+              "trim freeze demoted out of Synced — recovery path hit "
+              "(the ghost-band symptom)");
+    }
+
+    // Frame B must emit a BOUNDED incremental diff, not a full-viewport
+    // repaint. A repaint (large byte count) means the boundary was wrong
+    // and maya re-serialized the viewport from content top, overlapping
+    // the committed scrollback rows — the visible corruption.
+    std::fprintf(stderr,
+        "  [trim] rows_a=%d commit_n=%d emitted_bytes=%zu\n",
+        rows_a, commit_n, bytes_b.size());
+    CHECK(bytes_b.size() < 8192,
+          "trim render emitted a full-viewport repaint — the commit "
+          "boundary was wrong and committed scrollback rows were re-emitted "
+          "(the ghost band)");
+
+    close(rfd);
+}
+
 int main() {
     std::printf("midrun_wire_test\n");
     test_write_freeze_no_rewrite();
@@ -924,6 +1078,7 @@ int main() {
     test_write_idle_finalize_freeze();
     test_text_turn_finish_shrink();
     test_overflowed_shrink_stays_synced();
+    test_midrun_trim_output_heavy_no_rewrite();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures) { std::printf("FAILED\n"); return 1; }
     std::printf("PASSED\n");

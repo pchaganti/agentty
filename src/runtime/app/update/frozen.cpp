@@ -218,13 +218,80 @@ std::size_t tool_output_render_cap(std::string_view name) {
     return 0;   // 0 ⇒ no cap (render full output)
 }
 
+// Wrapped-row count for PROSE rendered as markdown, accounting for the
+// frozen build's auto-fold of long code blocks. cached_markdown_for
+// folds any fenced code block longer than kFoldLineThreshold (40) lines
+// to ~1 row in the SETTLED (frozen) render. A plain wrapped_rows() would
+// count every line of such a block — a 100-line code block in a reply
+// estimates ~100 rows but renders ~1 folded, OVER-counting by ~99 and
+// tripping the mid-run keep-loop into a scrollback ghost (same class as
+// the bash output cap). Walk the text: outside a fence count wrapped
+// rows normally; inside a fence buffer the line count and, on close,
+// add min(real_rows, fold_cap) so a long block collapses to the folded
+// height. Mirrors maya's fold (markdown.hpp auto_fold_long_blocks).
+std::size_t prose_rows(std::string_view body, int cols) {
+    if (body.empty()) return 0;
+    constexpr std::size_t kFoldLineThreshold = 40;
+    std::size_t rows = 0;
+    std::size_t line_start = 0;
+    bool in_fence = false;
+    std::size_t fence_lines = 0;
+    std::size_t fence_wrapped = 0;
+    std::size_t open_fence_rows = 0;
+    const std::size_t w = static_cast<std::size_t>(cols < 1 ? 1 : cols);
+    while (true) {
+        const std::size_t nl = body.find('\n', line_start);
+        const std::size_t line_end =
+            (nl == std::string_view::npos) ? body.size() : nl;
+        std::string_view line = body.substr(line_start, line_end - line_start);
+        // Detect a fence delimiter: a line whose first non-space run is
+        // ``` or ~~~ (info string allowed after the opening fence).
+        std::string_view trimmed = line;
+        while (!trimmed.empty() && trimmed.front() == ' ')
+            trimmed.remove_prefix(1);
+        const bool is_fence =
+            trimmed.rfind("```", 0) == 0 || trimmed.rfind("~~~", 0) == 0;
+        const std::size_t line_rows =
+            line.empty() ? 1 : (line.size() + w - 1) / w;
+        if (is_fence) {
+            if (!in_fence) {
+                in_fence = true;
+                fence_lines = 0;
+                fence_wrapped = 0;
+                open_fence_rows = line_rows;
+            } else {
+                in_fence = false;
+                // A folded block (body > threshold) collapses the WHOLE
+                // block — open fence + body + close fence — to a single
+                // "▸ N lines hidden" stub row (maya build.cpp). An
+                // unfolded block renders open + body + close.
+                rows += (fence_lines > kFoldLineThreshold)
+                            ? 1
+                            : open_fence_rows + fence_wrapped + line_rows;
+            }
+        } else if (in_fence) {
+            ++fence_lines;
+            fence_wrapped += line_rows;
+        } else {
+            rows += line_rows;
+        }
+        if (nl == std::string_view::npos) break;
+        line_start = nl + 1;
+    }
+    // Unterminated fence (streaming snapshot) — count its buffered body
+    // uncapped: it isn't folded until the block closes + settles.
+    if (in_fence) rows += open_fence_rows + fence_wrapped;
+    return rows == 0 ? 1 : rows;
+}
+
 std::size_t estimate_msg_rows(const Message& mm) {
     const int cols = estimate_wrap_cols();
 
-    // Prose body: count real wrapped rows (newline-aware), not bytes/60.
+    // Prose body: count real wrapped rows (newline-aware), folding long
+    // code blocks to match the frozen render's auto-fold.
     std::size_t rows = 0;
-    if (!mm.text.empty())           rows += wrapped_rows(mm.text, cols);
-    if (!mm.streaming_text.empty()) rows += wrapped_rows(mm.streaming_text, cols);
+    if (!mm.text.empty())           rows += prose_rows(mm.text, cols);
+    if (!mm.streaming_text.empty()) rows += prose_rows(mm.streaming_text, cols);
 
     for (const auto& tc : mm.tool_calls) {
         // The RENDERED body of a tool card is one ROW PER SOURCE LINE
