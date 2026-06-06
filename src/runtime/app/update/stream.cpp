@@ -5,6 +5,7 @@
 // easy to read.
 
 #include "agentty/runtime/app/update/internal.hpp"
+#include "agentty/runtime/app/update/param_tag_repair.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -432,6 +433,18 @@ void update_stream_preview(ToolUse& tc) {
 bool guard_truncated_tool_args(ToolUse& tc) {
     auto missing = missing_required_field(tc.name.value, tc.args);
     if (missing.empty()) return false;
+    // A required field is absent — before failing, try to recover a mixed
+    // XML/JSON tool input that buried the field inside a stray string
+    // value. Gating on the already-failing path is the safety guarantee:
+    // a well-formed edit/write whose content legitimately contains the
+    // literal `<parameter name="…">` marker (e.g. editing this very file)
+    // has its required fields present, so we never reach here and never
+    // rewrite it.
+    if (repair_param_tag_leak(tc.name.value, tc.args)) {
+        tc.mark_args_dirty();
+        missing = missing_required_field(tc.name.value, tc.args);
+        if (missing.empty()) return false;
+    }
     auto now = std::chrono::steady_clock::now();
     tc.status = ToolUse::Failed{
         tc.started_at(),
@@ -1088,18 +1101,35 @@ Step stream_update(Model m, msg::StreamMsg sm) {
                     msg.streaming_text.size() + msg.pending_stream.size();
                 if (in_flight < kMaxStreamingBytes) {
                     const auto room = kMaxStreamingBytes - in_flight;
-                    if (e.text.size() <= room) msg.pending_stream += e.text;
-                    else                       msg.pending_stream.append(e.text, 0, room);
+                    // Head-of-stream fast path: while the message has no
+                    // visible content yet, append the first bytes DIRECTLY
+                    // to streaming_text so they paint on this delta's own
+                    // render (fps=0 → every Msg renders). Without this the
+                    // first word sits in pending_stream until the next
+                    // Tick fires — up to one full tick period (33 ms on
+                    // sync terminals, 100 ms elsewhere, more over SSH) —
+                    // which reads as "the first word sticks" before the
+                    // rest flows. Once there's visible text to smooth
+                    // against, subsequent bytes go through the pacer.
+                    constexpr std::size_t kHeadReveal = 512;
+                    if (msg.streaming_text.empty()
+                        && msg.pending_stream.empty()) {
+                        const auto head = std::min({e.text.size(), room, kHeadReveal});
+                        msg.streaming_text.append(e.text, 0, head);
+                        if (head < e.text.size() && head < room) {
+                            const auto rest = std::min(e.text.size() - head,
+                                                       room - head);
+                            msg.pending_stream.append(e.text, head, rest);
+                        }
+                    } else if (e.text.size() <= room) {
+                        msg.pending_stream += e.text;
+                    } else {
+                        msg.pending_stream.append(e.text, 0, room);
+                    }
                 }
-                // All bytes flow through the Tick pacer in meta.cpp —
-                // no head-reveal special case. The pacer's drip_min
-                // already empties small first-deltas in one tick, so
-                // time-to-first-paint is bounded by the next tick (≤33 ms
-                // on DEC-2026, ≤100 ms elsewhere), not by SSE arrival
-                // racing the pacer cadence. Uniform code path means
-                // every assistant message has identical height-delta
-                // cadence; no risk of byte 256 vs byte 257 landing
-                // through different reveal mechanics.
+                // After the head, all bytes flow through the Tick pacer
+                // in meta.cpp so server bursts reveal smoothly instead of
+                // jumping in.
             }
             return done(std::move(m));
         },
@@ -1565,9 +1595,25 @@ Step stream_update(Model m, msg::StreamMsg sm) {
                 // path so the user gets the actionable login hint.
             }
 
+            // Mid-stream signal for the per-class retry cap. A failure is
+            // "mid-stream" if the wire proved itself alive this turn before
+            // dying: the stall watchdog fired (it only fires after a healthy
+            // connect), OR this ctx had already seen a content delta
+            // (first_delta_at set). Those get a SHORT retry budget (see
+            // provider::max_retries_for) because a wire that keeps cutting
+            // out after reaching us is a real outage, not a reconnect blip
+            // — re-hammering it 6× just spams the banner. A clean connect
+            // failure (no delta, no stall) keeps the full budget since a
+            // fresh connection almost always succeeds.
+            const bool mid_stream =
+                m.s.in_stall_fired()
+                || (err_ctx
+                    && err_ctx->first_delta_at.time_since_epoch().count() != 0);
+            const int retry_cap = provider::max_retries_for(klass, mid_stream);
+
             bool can_retry = (klass == provider::ErrorClass::Transient
                            || klass == provider::ErrorClass::RateLimit)
-                          && prior_transient < provider::kMaxRetries
+                          && prior_transient < retry_cap
                           && !has_committed
                           && err_ctx;   // can't retry from Idle (no ctx)
 
@@ -1587,7 +1633,7 @@ Step stream_update(Model m, msg::StreamMsg sm) {
                 m.s.status = std::string{provider::to_string(klass)}
                            + " — retrying in " + std::to_string(secs) + "s"
                            + " (attempt " + std::to_string(attempt + 1)
-                           + "/" + std::to_string(provider::kMaxRetries) + ")…";
+                           + "/" + std::to_string(retry_cap) + ")…";
                 m.s.status_until = std::chrono::steady_clock::now()
                                  + delay + std::chrono::milliseconds{1500};
                 auto ctx = take_active_ctx(std::move(m.s.phase)).value();

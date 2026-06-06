@@ -60,6 +60,15 @@ struct Request {
     // Optional cancellation handle. Tripping the token from the UI thread
     // tears down the in-flight stream within ~200 ms. Null means uncancellable.
     http::CancelTokenPtr cancel;
+
+    // 0-based count of prior failed attempts for THIS turn (the source
+    // ctx's transient_retries). Surfaced on the wire as
+    // x-stainless-retry-count, exactly like the Anthropic SDK / Zed
+    // increment it on each retry. Anthropic's edge reads it for routing
+    // and to avoid penalising retried traffic; a hard-coded "0" makes
+    // every retry look like a fresh first attempt and can land us on the
+    // same overloaded pop. Cheap to set correctly.
+    int retry_count = 0;
 };
 
 using EventSink = std::function<void(Msg)>;

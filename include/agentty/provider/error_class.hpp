@@ -206,6 +206,39 @@ backoff_with_jitter(ErrorClass kind, int attempt) noexcept {
 // long outages. Esc still breaks the loop at any point.
 inline constexpr int kMaxRetries = 6;
 
+// Per-error-class retry caps. A single global kMaxRetries treats every
+// transient the same, which is why a flaky wire that keeps cutting out
+// mid-stream spammed the retry banner up to 6×. Zed's agent loop
+// (crates/agent/src/thread.rs::retry_strategy_for) instead tunes the cap
+// per error shape: rate-limit / overload get the full budget (the server
+// will recover and told us so via Retry-After), but a stream that ended
+// unexpectedly mid-body gets very few attempts because re-hammering a
+// wire that drops mid-stream rarely helps and just looks broken to the
+// user. We mirror that shape.
+//
+//   RateLimit (429 / overloaded / 529) ....... kMaxRetries (6) — server
+//       is shedding load and usually hands a Retry-After; ride it out.
+//   Transient connect/dial blips (no content) . kMaxRetries (6) — cheap
+//       to reconnect, almost always recovers on a fresh connection.
+//   Mid-stream stall / unexpected EOF ......... 2 — the wire reached us
+//       and then died; if it keeps dying mid-body the outage is real,
+//       so converge fast instead of stuttering through 6 attempts.
+//
+// `mid_stream` is set by the caller when the failure happened AFTER the
+// stream had proven itself alive this turn (a stall-watchdog fire, or a
+// reset after first delta). The classifier can't see that from the
+// message alone, so it's passed in.
+[[nodiscard]] inline int max_retries_for(ErrorClass k, bool mid_stream) noexcept {
+    switch (k) {
+        case ErrorClass::RateLimit: return kMaxRetries;
+        case ErrorClass::Transient: return mid_stream ? 2 : kMaxRetries;
+        case ErrorClass::Auth:      return kMaxRetries;  // one refresh + slack
+        case ErrorClass::Cancelled:
+        case ErrorClass::Terminal:  return 0;
+    }
+    return kMaxRetries;
+}
+
 // Budget-decay window. transient_retries is a per-turn counter, but a
 // long session sees unrelated brown-outs accrue into it. If the prior
 // failure was longer ago than this, the connection has been healthy in

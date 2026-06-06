@@ -304,6 +304,16 @@ Cmd<Msg> launch_stream(Model& m) {
     auto cancel = std::make_shared<http::CancelToken>();
     if (auto* a = active_ctx(m.s.phase)) a->cancel = cancel;
 
+    // Snapshot the per-turn retry counter so the worker can stamp it on
+    // the wire as x-stainless-retry-count. Reflecting the real attempt
+    // number (instead of a hard-coded 0) is what the Anthropic SDK / Zed
+    // do; the edge uses it for routing and to avoid penalising retried
+    // traffic.
+    const int retry_count = [&] {
+        if (const auto* a = active_ctx(m.s.phase)) return a->transient_retries;
+        return 0;
+    }();
+
     // Capture the snapshot the worker needs. The Thread copy is the
     // one unavoidable cost; everything else is small.
     Thread thread_snapshot = m.d.current;
@@ -314,7 +324,7 @@ Cmd<Msg> launch_stream(Model& m) {
 
     return Cmd<Msg>::task(
         [thread = std::move(thread_snapshot),
-         compacting, context_max,
+         compacting, context_max, retry_count,
          model_id = std::move(model_id),
          auth = std::move(auth),
          cancel]
@@ -325,6 +335,7 @@ Cmd<Msg> launch_stream(Model& m) {
         req.system_prompt = provider::anthropic::default_system_prompt();
         req.cancel        = cancel;
         req.auth          = std::move(auth);
+        req.retry_count   = retry_count;
 
         // Wire payload diverges on compaction kickoff:
         //   normal turn  → wire_messages_for(thread) substitutes any

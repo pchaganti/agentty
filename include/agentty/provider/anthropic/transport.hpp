@@ -49,6 +49,10 @@ struct Request {
     // build_request_headers does std::visit and the two arms emit
     // different header names.
     AuthHeader auth;
+
+    // Per-turn retry attempt count, copied from provider::Request.
+    // Stamped on the wire as x-stainless-retry-count. Default 0.
+    int retry_count = 0;
 };
 
 using EventSink = std::function<void(Msg)>;

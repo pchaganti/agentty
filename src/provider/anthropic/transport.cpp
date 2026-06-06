@@ -694,7 +694,8 @@ std::string select_betas(std::string_view model, bool is_oauth,
 http::Headers build_request_headers(const AuthHeader& auth,
                                     std::string_view beta_value,
                                     int timeout_seconds,
-                                    bool streaming = false) {
+                                    bool streaming = false,
+                                    int retry_count = 0) {
     http::Headers h;
     h.push_back({"accept",         "application/json"});
     h.push_back({"content-type",   "application/json"});
@@ -710,7 +711,7 @@ http::Headers build_request_headers(const AuthHeader& auth,
     h.push_back({"x-stainless-arch",            stainless_arch()});
     h.push_back({"x-stainless-runtime",         "node"});
     h.push_back({"x-stainless-runtime-version", headers::node_runtime_ver});
-    h.push_back({"x-stainless-retry-count",     "0"});
+    h.push_back({"x-stainless-retry-count",     std::to_string(retry_count < 0 ? 0 : retry_count)});
     h.push_back({"x-stainless-timeout",         std::to_string(timeout_seconds)});
     if (streaming) {
         // .stream() helpers in cli.js always set helper-method=stream; the
@@ -1594,7 +1595,8 @@ void run_stream_sync(Request req, EventSink sink, http::CancelTokenPtr cancel) {
     hreq.headers = build_request_headers(req.auth,
                                          select_betas(req.model, is_oauth, any_eager),
                                          /*timeout_seconds=*/300,
-                                         /*streaming=*/true);
+                                         /*streaming=*/true,
+                                         /*retry_count=*/req.retry_count);
     hreq.body    = std::move(body_str);
 
     // We split on HTTP status: 2xx → feed SSE chunks straight to the parser;
