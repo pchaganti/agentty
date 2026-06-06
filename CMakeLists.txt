@@ -1073,4 +1073,19 @@ if(AGENTTY_BUILD_TESTS)
             "-framework CoreFoundation")
     endif()
     add_test(NAME visual_hash_coverage_test COMMAND visual_hash_coverage_test)
+
+    # Aggregate target so CI can build every ctest-registered binary in one
+    # shot. The individual test targets are EXCLUDE_FROM_ALL (kept out of the
+    # default `cmake --build` so a plain build stays lean), which means
+    # `ctest` would otherwise find nothing built. `cmake --build build
+    # --target tests` forces them all.
+    add_custom_target(tests DEPENDS
+        long_session_bench
+        fuzzy_match_smoke
+        param_tag_repair_test
+        midrun_freeze_test
+        midrun_seam_test
+        midrun_wire_test
+        table_render_test
+        visual_hash_coverage_test)
 endif()

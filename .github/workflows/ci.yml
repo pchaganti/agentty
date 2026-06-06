@@ -54,5 +54,10 @@ jobs:
       - name: Build
         run: cmake --build build -j"$(nproc)"
 
+      - name: Build tests
+        # Test binaries are EXCLUDE_FROM_ALL; the `tests` aggregate target
+        # pulls them all in so ctest has something to run.
+        run: cmake --build build -j"$(nproc)" --target tests
+
       - name: Test
         run: ctest --test-dir build --output-on-failure
