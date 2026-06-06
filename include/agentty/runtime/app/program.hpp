@@ -243,7 +243,32 @@ struct AgenttyApp {
         // hand-maintained duplicate heuristic here — which silently
         // omitted the SSH floor and could beat against the real tick.
         const std::int64_t kFineAnimMs = streaming_tick_period().count();
-        if (fine_anim_live) {
+
+        // Typewriter-reveal override. The streaming-text reveal
+        // (cached_markdown_for's revealed_size cursor) is a genuine
+        // ~60 fps animation advanced from wall-clock INSIDE view().
+        // Unlike the spinner it is NOT phase-locked to the Tick — it
+        // wants a render on every RAF wake (16 ms). If we bucket it at
+        // the tick period (100 ms on non-sync terminals) the render
+        // gate SKIPS the intervening RAF wakes, so view() never runs,
+        // revealed_size never advances, and the text sits STUCK until
+        // the 100 ms bucket finally flips — then a ~22-char chunk pops
+        // in at once (the "stuck then flicker at md stream start"
+        // symptom). While an assistant message is actively streaming
+        // text, step the bucket at the RAF interval so each 16 ms wake
+        // renders one smooth reveal step. The spinner-only case (tool
+        // running, no streaming_text) keeps the calmer tick-period
+        // bucket so non-sync terminals don't tear the chrome at 60 fps.
+        const bool revealing_text =
+            m.s.active()
+            && !m.d.current.messages.empty()
+            && m.d.current.messages.back().role == Role::Assistant
+            && !m.d.current.messages.back().streaming_text.empty();
+        const std::int64_t kRevealBucketMs = 16;   // == kAnimationFrameInterval
+
+        if (revealing_text) {
+            mix(static_cast<std::uint64_t>(now_ms / kRevealBucketMs));
+        } else if (fine_anim_live) {
             mix(static_cast<std::uint64_t>(now_ms / kFineAnimMs));
         } else if (caret_blinking) {
             // Phase-locked: feed the blink PARITY, not a time bucket, so

@@ -134,6 +134,19 @@ maya::Element cached_markdown_for(const Message& msg, const Model& m) {
     } else {
         if (cache.last_reveal_tick.time_since_epoch().count() == 0) {
             cache.last_reveal_tick = now;
+            // FIRST reveal frame. Prime the cursor to a small starter
+            // chunk instead of leaving it at 0. With advance==0 the
+            // first frame feeds an EMPTY prefix, so the in-flight turn
+            // renders the "thinking" ActivityIndicator (≈2 rows), then
+            // the NEXT frame drops the indicator AND shows the first
+            // bytes — two height transitions back-to-back at the live
+            // seam, which on a terminal without atomic frames reads as a
+            // flicker right at stream start. Revealing a starter chunk
+            // now makes the indicator→content swap a SINGLE step (the
+            // body already has real text the moment the indicator drops).
+            constexpr std::size_t kRevealStarter = 24;
+            cache.revealed_size =
+                std::min(source.size(), kRevealStarter);
         }
         // Advance by elapsed time × rate (rounded down).
         const auto elapsed =
