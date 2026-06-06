@@ -281,6 +281,17 @@ struct StreamCtx {
     StreamHandler*      handler = nullptr;  // non-null for stream()
     bool                handler_aborted = false;
     bool                headers_delivered = false;
+    // True once a real response DATA chunk has been handed to the caller
+    // (on_chunk fired with body bytes). This is the *semantic* commit
+    // point for a stream — distinct from headers_delivered, which only
+    // means the :status + header block arrived. A stream that received
+    // its :status but was then RST_STREAMed / GOAWAY'd before any SSE
+    // payload is still replay-safe: no content_block reached the reducer,
+    // so re-dialing can't duplicate tool_use blocks or text. The stream
+    // retry loop keys off this instead of headers_delivered so a stale
+    // pooled connection that the edge RSTs right after the header block
+    // gets a transparent re-dial rather than a user-visible error.
+    bool                data_delivered = false;
 
     // Lifecycle
     int32_t stream_id = -1;
@@ -326,6 +337,16 @@ public:
     [[nodiscard]] socket_t fd() const { return fd_; }
     [[nodiscard]] nghttp2_session* session() { return session_; }
     [[nodiscard]] const Endpoint& endpoint() const { return endpoint_; }
+
+    // True if this Connection was just handed out from the pool (a reused
+    // socket) rather than freshly dialed. The stream retry loop reads this
+    // to decide whether an early RST/GOAWAY is a stale-pool artifact worth
+    // a free transparent re-dial, vs. a genuine fresh-dial failure that
+    // should count against the budget. Set by Pool::acquire, cleared on
+    // release (a connection going back to the pool starts "fresh" again
+    // from the next acquirer's perspective).
+    [[nodiscard]] bool was_pooled() const noexcept { return was_pooled_; }
+    void set_pooled(bool v) noexcept { was_pooled_ = v; }
 
     // Liveness for pool reuse. Two stages:
     //   (1) nghttp2 thinks the session has work to do or is at least
@@ -408,6 +429,9 @@ private:
     // gate consults it on every reuse.
     bool             goaway_received_       = false;
     int32_t          goaway_last_stream_id_ = 0;
+    // Reuse marker — see was_pooled(). Defaults false (fresh dial);
+    // Pool::acquire flips it true before handing the connection out.
+    bool             was_pooled_            = false;
 };
 
 // -----------------------------------------------------------------------
@@ -450,6 +474,11 @@ static int on_data_chunk(nghttp2_session* s, uint8_t /*flags*/,
         // return from on_chunk aborts the stream; we close it below so
         // nghttp2 stops pumping data.
         if (sc->handler->on_chunk) {
+            // A non-empty chunk handed to the caller is the semantic
+            // commit point: SSE content (message_start / content_block)
+            // is now in the reducer's hands and replaying would duplicate
+            // it. Empty chunks (shouldn't happen, but defend) don't commit.
+            if (len > 0) sc->data_delivered = true;
             if (!sc->handler->on_chunk(
                     std::string_view{reinterpret_cast<const char*>(data), len})) {
                 sc->handler_aborted = true;
@@ -1523,6 +1552,7 @@ public:
             if (now - p.released_at > idle_ttl())   continue;
             if (!p.conn->is_alive())                continue;
             if (!socket_is_alive(p.conn->fd()))     continue;
+            p.conn->set_pooled(true);   // reused socket — see was_pooled()
             return std::move(p.conn);
         }
         return nullptr;
@@ -1530,6 +1560,7 @@ public:
 
     void release(std::unique_ptr<Connection> c) {
         if (!c || !c->is_alive()) return;
+        c->set_pooled(false);   // back in the pool — next acquirer re-marks
         std::lock_guard<std::mutex> lk(mu_);
         auto& stack = map_[c->endpoint()];
         if (stack.size() >= kMaxPoolEntriesPerEndpoint) {
@@ -1682,22 +1713,36 @@ Client::stream(const Request& req, StreamHandler handler, Timeouts tos,
     // a real one) carries whatever metadata the *last* attempt did collect.
     int     last_status  = 0;
     Headers last_headers;
-    bool    any_bytes    = false;   // true once a chunk / header reaches caller
+    bool    committed    = false;   // true once real SSE DATA reaches caller
+
+    // The retry budget is split: a *reused* pooled connection that RSTs
+    // before delivering any data is overwhelmingly a stale-pool corpse
+    // (the edge half-closed it while it sat idle, and our acquire-time
+    // liveness peek raced the FIN/GOAWAY). Those re-dials must NOT count
+    // against the small transport budget, or a session that pools a dead
+    // conn would burn all 3 attempts on the same fresh dial and surface
+    // the error anyway. We allow extra attempts specifically for the
+    // "reused conn died before data" case, capped so a genuinely dead
+    // endpoint still converges instead of looping.
+    constexpr int kMaxStalePoolRedials = 2;
+    int stale_pool_redials = 0;
 
     for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
         if (is_cancelled(cancel)) { last_err = HttpError::cancelled(); break; }
         if (!backoff_sleep(attempt, cancel)) { last_err = HttpError::cancelled(); break; }
 
-        auto conn_or = (attempt == 0)
+        const bool from_pool = (attempt == 0 && stale_pool_redials == 0);
+        auto conn_or = from_pool
             ? acquire_or_dial(impl_->pool, ep, tos, cancel)
             : dial_new(ep, tos, cancel);
         if (!conn_or) { last_err = std::move(conn_or).error(); continue; }
         auto conn = std::move(*conn_or);
+        const bool was_reused = from_pool && conn->was_pooled();
 
         StreamCtx sctx{};
         sctx.handler = &handler;
         auto ok = conn->run(req, sctx, tos, cancel);
-        if (sctx.headers_delivered) any_bytes = true;
+        if (sctx.data_delivered) committed = true;
         last_status  = sctx.status;
         last_headers = std::move(sctx.headers);
         if (ok) {
@@ -1706,16 +1751,31 @@ Client::stream(const Request& req, StreamHandler handler, Timeouts tos,
         }
         last_err = std::move(ok).error();
 
-        // Once we've started delivering data to the caller, the stream is
-        // committed — retrying would produce duplicate SSE events and a
-        // second pass at the reducer's tool_use state machine.
-        if (any_bytes) break;
+        // Once a real SSE DATA chunk reached the caller, the stream is
+        // semantically committed — retrying would produce duplicate
+        // content_block events and a second pass at the reducer's
+        // tool_use state machine. Headers-only (no data) is still
+        // replay-safe, so we do NOT break merely on headers_delivered.
+        if (committed) break;
         if (is_cancelled(cancel)) break;
+
+        // Transparent stale-pool recovery: a reused connection that died
+        // before delivering data (RST_STREAM / GOAWAY / socket hangup /
+        // peer-closed) is a corpse the acquire-time liveness checks
+        // couldn't catch — the FIN/GOAWAY raced our MSG_PEEK. Re-dial
+        // FRESH without charging the transport attempt budget so the
+        // user never sees a banner for what is purely a pool-staleness
+        // artifact. dial_new() bypasses the pool, so the redial gets a
+        // guaranteed-fresh socket.
+        if (was_reused && stale_pool_redials < kMaxStalePoolRedials) {
+            ++stale_pool_redials;
+            --attempt;   // don't consume a transport-budget slot
+        }
     }
 
-    // If we never got headers, synthesise one so the caller's on_headers
+    // If we never delivered data, synthesise an on_headers so the caller's
     // contract ("fires at least once") still holds.
-    if (!any_bytes && handler.on_headers) {
+    if (!committed && handler.on_headers) {
         handler.on_headers(last_status, last_headers);
     }
     return std::unexpected(std::move(last_err));
