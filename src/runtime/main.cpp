@@ -200,7 +200,10 @@ int main(int argc, char** argv) {
     // creds in the Deps without requiring a process restart.
     auto creds = auth::resolve(args.cli_key);
 
-    if (!args.cli_model.empty()) {
+    // Persist -m as the new default — but NOT in ACP mode, where the model
+    // is an ephemeral per-subprocess override (handled below) that must not
+    // clobber the TUI's saved model.
+    if (!args.cli_model.empty() && args.subcommand != "acp") {
         auto s = persistence::load_settings();
         s.model_id = ModelId{args.cli_model};
         persistence::save_settings(s);
@@ -271,8 +274,18 @@ int main(int argc, char** argv) {
     // clean. Reuses the same provider/tools/sandbox wired above.
     if (args.subcommand == "acp") {
         auto settings = persistence::load_settings();
-        std::string model_id = settings.model_id.empty()
-            ? std::string{"claude-opus-4-5"} : settings.model_id.value;
+        // -m wins for this subprocess WITHOUT persisting to settings (an ACP
+        // agent shouldn't clobber the TUI's saved model). Otherwise fall back
+        // to the saved model, then the built-in default.
+        std::string model_id =
+            !args.cli_model.empty()    ? args.cli_model
+          : !settings.model_id.empty() ? settings.model_id.value
+          :                              std::string{"claude-opus-4-5"};
+
+        // Prewarm TLS/DNS to api.anthropic.com so the first prompt reuses the
+        // SSL session + connection cache instead of paying the ~150–300 ms
+        // handshake. The TUI does the same before launching maya.
+        auth::prewarm_anthropic();
 
         acp::rpc::Peer peer(std::cin, std::cout);
         acp::AgentServer server(
