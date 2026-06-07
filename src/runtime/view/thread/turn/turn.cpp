@@ -220,7 +220,22 @@ maya::Element cached_markdown_for(const Message& msg, const Model& m) {
         // already match before this call. finish() is kept because it's
         // idempotent (no-op once committed_ == source_.size()) and still
         // the correct place to flush any OTHER trailing-block kind.
-        if (settled && cache.revealed_size == source.size()) {
+        //
+        // At settle we kick off the finalize ramp FIRST — the widget
+        // glides its reveal cursor to the live edge over ~200 ms and
+        // flips live_ off itself when the cursor catches up. We defer
+        // finish() (which forces live_=false) until that ramp completes,
+        // so the reveal animation isn't cut short and dump its backlog
+        // in one frame.
+        if (settled) {
+            cache.streaming->request_finalize(200);
+        } else {
+            cache.streaming->set_live(true);
+        }
+        if (settled
+            && cache.revealed_size == source.size()
+            && !cache.streaming->is_finalizing())
+        {
             cache.streaming->finish();
             cache.last_settled_size = source.size();
 
@@ -238,9 +253,8 @@ maya::Element cached_markdown_for(const Message& msg, const Model& m) {
         }
     }
 
-    // Live mode: while streaming (msg not settled). reveal_fx animates
-    // the live edge while live_; the settled build is static.
-    cache.streaming->set_live(!settled);
+    // (Live/finalize transitions are handled above, before the finish()
+    // gate that depends on them.)
 
     // Track when `source` last grew so we can tell "actively streaming"
     // (bytes flowing) from "streaming but stalled" (e.g. a 60–120 s
@@ -309,6 +323,7 @@ maya::Element cached_markdown_for(const Message& msg, const Model& m) {
     // adopted the instant the worker finishes.
     if (stream_in_motion
         || (!settled && cache.streaming->reveal_in_progress())
+        || cache.streaming->is_finalizing()
         || cache.streaming->is_parsing()) {
         ::maya::request_animation_frame();
     }
