@@ -62,6 +62,7 @@ const char* acp_tool_kind(std::string_view tool_name) {
         case sp::Kind::Remember:       return "other";
         case sp::Kind::Forget:         return "other";
         case sp::Kind::Wipe:           return "other";
+        case sp::Kind::Task:           return "think";
     }
     return "other";
 }

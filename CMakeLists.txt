@@ -398,6 +398,8 @@ set(AGENTTY_TOOL_SOURCES
     src/tool/tools/remember.cpp
     src/tool/tools/forget.cpp
     src/tool/tools/wipe.cpp
+    src/tool/tools/task.cpp
+    src/tool/subagent.cpp
     src/tool/memory_store.cpp
 )
 

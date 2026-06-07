@@ -51,6 +51,7 @@
 #include "agentty/provider/anthropic/provider.hpp"
 #include "agentty/tool/util/fs_helpers.hpp"
 #include "agentty/tool/util/sandbox.hpp"
+#include "agentty/tool/subagent.hpp"
 
 namespace {
 
@@ -276,6 +277,20 @@ int main(int argc, char** argv) {
     provider::anthropic::AnthropicProvider provider;
     io::FsStore                            store;
     app::install(provider, store, auth::make_auth_header(creds));
+
+    // ── Wire the subagent (`task` tool) seam ────────────────────────────
+    // Process-global config the `task` tool reads to spin up an isolated
+    // sub-agent loop. Resolve the model the same way the TUI / ACP paths
+    // do (-m override → saved setting → built-in default).
+    {
+        auto sa_settings = persistence::load_settings();
+        std::string sa_model =
+            !args.cli_model.empty()       ? args.cli_model
+          : !sa_settings.model_id.empty() ? sa_settings.model_id.value
+          :                                 std::string{"claude-opus-4-5"};
+        tools::subagent::install(tools::subagent::Config{
+            auth::make_auth_header(creds), std::move(sa_model), true});
+    }
 
     // ── ACP mode: run as a headless agent over stdio (Zed et al.) ───────
     // No maya, no terminal UI. stdin/stdout carry newline-delimited

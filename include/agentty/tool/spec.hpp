@@ -152,6 +152,7 @@ enum class Kind : std::uint8_t {
     Remember,
     Forget,
     Wipe,
+    Task,
 };
 
 inline constexpr std::array kCatalog = {
@@ -180,6 +181,15 @@ inline constexpr std::array kCatalog = {
     ToolSpec{"remember",        Kind::Remember,       {Effect::WriteFs},                    false,   detail::sec{5},    2000,   ToolSpec::TruncStrategy::Head},
     ToolSpec{"forget",          Kind::Forget,         {Effect::WriteFs},                    false,   detail::sec{5},    2000,   ToolSpec::TruncStrategy::Head},
     ToolSpec{"wipe_memory",     Kind::Wipe,           {Effect::WriteFs},                    false,   detail::sec{5},    2000,   ToolSpec::TruncStrategy::Head},
+    // Subagent dispatch. Spawns an isolated agent loop (own context,
+    // own tool budget, depth-capped) that runs to completion and
+    // returns ONE condensed result. Carries Effect::Exec: a subagent
+    // can run bash/write/etc., so it is at least as powerful as bash
+    // and must gate identically. Owns its own wall-clock budget inside
+    // the loop (bounded turn count) like the subprocess tools, so the
+    // overlay watchdog is 0. HeadTail: the subagent's final summary
+    // carries signal at both ends.
+    ToolSpec{"task",            Kind::Task,           {Effect::Exec},                       false,   detail::sec{0},    40000,  ToolSpec::TruncStrategy::HeadTail},
 };
 
 // Wire-string → Kind. `std::nullopt` for names not in the catalog so the
@@ -260,6 +270,7 @@ consteval bool kinds_bijective() {
         Kind::GitLog, Kind::GitCommit,
         Kind::Remember, Kind::Forget,
         Kind::Wipe,
+        Kind::Task,
     };
     if (std::size(kAll) != kCatalog.size()) return false;
     for (auto k : kAll) {
@@ -299,14 +310,15 @@ static_assert(lookup("nonexistent") == nullptr);
 consteval bool only_known_exec_tools() {
     for (const auto& s : kCatalog) {
         if (!s.effects.has(Effect::Exec)) continue;
-        if (s.name != "bash" && s.name != "diagnostics") return false;
+        if (s.name != "bash" && s.name != "diagnostics" && s.name != "task")
+            return false;
     }
     return true;
 }
 static_assert(only_known_exec_tools(),
-              "Only `bash` and `diagnostics` may carry Effect::Exec — adding "
-              "another Exec tool requires a separate review and updating this "
-              "static_assert");
+              "Only `bash`, `diagnostics`, and `task` may carry Effect::Exec — "
+              "adding another Exec tool requires a separate review and updating "
+              "this static_assert");
 
 // Tools that mutate the filesystem must NOT also be Exec — those are
 // strictly more dangerous and would belong in the bash family if they
@@ -376,13 +388,17 @@ static_assert(subprocess_tools_have_no_overlay_timeout(),
 consteval bool other_tools_have_bounded_timeout() {
     using std::chrono::seconds;
     for (const auto& s : kCatalog) {
-        if (s.name == "bash" || s.name == "diagnostics") continue;
+        // bash/diagnostics own their subprocess timeout; `task` owns its
+        // budget via a bounded sub-agent turn count (no single syscall to
+        // watchdog). All three set max_seconds=0 deliberately.
+        if (s.name == "bash" || s.name == "diagnostics" || s.name == "task")
+            continue;
         if (s.max_seconds < seconds{1} || s.max_seconds > seconds{300}) return false;
     }
     return true;
 }
 static_assert(other_tools_have_bounded_timeout(),
-              "non-subprocess tools need a max_seconds in [1, 300]");
+              "non-subprocess tools (except `task`) need a max_seconds in [1, 300]");
 
 // `web_fetch` cannot wait longer than the underlying http total
 // timeout, otherwise the watchdog fires while the client is still
@@ -413,6 +429,14 @@ consteval bool truncation_matches_effect_shape() {
         if (s.max_output_chars == 0) continue;
 
         if (s.effects.has(Effect::Exec)) {
+            // `task` is Exec-class but its output is a structured subagent
+            // summary, not a log stream — HeadTail keeps both the
+            // opening framing and the final result. bash/diagnostics
+            // stay Tail (latest log line wins).
+            if (s.name == "task") {
+                if (s.trunc_strategy == ToolSpec::TruncStrategy::Tail) return false;
+                continue;
+            }
             if (s.trunc_strategy != ToolSpec::TruncStrategy::Tail) return false;
             continue;
         }

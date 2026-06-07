@@ -172,6 +172,10 @@ std::string_view missing_required_field(std::string_view tool_name,
             // Defer the gate to the tool layer; the `confirm` two-step
             // protects against accidental wipes regardless.
             return {};
+        case K::Task:
+            // task requires a `prompt`/`description` for the subagent.
+            if (!is_nonempty_string("prompt")) return "prompt";
+            return {};
         // `path` is nice-to-have but not strictly required for these
         // (list_dir/glob default to cwd; read without path is already
         // a tool error — surfacing it from the tool itself preserves

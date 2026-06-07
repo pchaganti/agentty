@@ -111,6 +111,10 @@ std::vector<ToolDef> build_registry() {
     r.push_back(tool_remember());
     r.push_back(tool_forget());
     r.push_back(tool_wipe_memory());
+    // Subagent dispatch — last so the model's recall bias stays on the
+    // direct working tools. The system-prompt + tool description steer
+    // when delegation is appropriate.
+    r.push_back(tool_task());
     return r;
 }
 
