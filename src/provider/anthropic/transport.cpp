@@ -596,6 +596,13 @@ void dispatch_event(StreamCtx& ctx, std::string_view name, const std::string& da
 }
 
 void feed_sse(StreamCtx& ctx, const char* data, size_t len) {
+    // Per-network-read boundary marker. The verbose `<< event=...` lines
+    // alone can't tell a bursty wire (many text_deltas delivered in ONE
+    // read after a gap) from a render-loop stall (deltas drip steadily but
+    // the screen lags). This line stamps each read with its byte length so
+    // the count of `<< event=` lines that follow before the NEXT `-- chunk`
+    // is exactly the number of SSE events that arrived together.
+    if (debug_log()) dbg("-- chunk len=%zu\n", len);
     ctx.sse.buf.append(data, len);
     auto& read_pos = ctx.sse.read_pos;
     // Treat the buffer as a string_view so per-line work doesn't allocate.
