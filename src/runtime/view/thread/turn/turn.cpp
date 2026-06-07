@@ -294,8 +294,22 @@ maya::Element cached_markdown_for(const Message& msg, const Model& m) {
     // fall to the Tick cadence and the cursor would jump on the next wake
     // (the "bursts, not continuous" symptom). build() advanced the cursor
     // just above, so reveal_in_progress() reflects this frame's state.
+    //
+    // Third condition — a background parse in flight (is_parsing()):
+    // set_content_async hands a large divergent prefix to a worker and
+    // keeps returning the PREVIOUS element tree until the result lands.
+    // maybe_apply_async_ (which adopts the landed result) runs ONLY from
+    // build(), i.e. only when view() runs, i.e. only when the visual hash
+    // advances. If bytes pause mid-parse (a wire burst-then-quiet), the
+    // hash stops advancing, build() stops being called, and the finished
+    // parse sits unapplied — the tail freezes until the next delta or the
+    // 100 ms Tick happens to wake the loop (the "md gets stuck then
+    // bursts" stutter on big pastes / large reflows). Keeping the frame
+    // armed while parsing makes build() keep polling so the result is
+    // adopted the instant the worker finishes.
     if (stream_in_motion
-        || (!settled && cache.streaming->reveal_in_progress())) {
+        || (!settled && cache.streaming->reveal_in_progress())
+        || cache.streaming->is_parsing()) {
         ::maya::request_animation_frame();
     }
 
