@@ -426,8 +426,78 @@ void update_stream_preview(ToolUse& tc) {
     else if (n == "web_search")      { try_set("query");  pull_desc(); }
     else if (n == "diagnostics")     { try_set("command"); pull_desc(); }
     else if (n == "git_status" || n == "git_diff"
-          || n == "git_log"    || n == "git_commit"
-          || n == "todo")        { if (n == "git_commit") try_set("message"); pull_desc(); }
+          || n == "git_log"    || n == "git_commit") {
+        if (n == "git_commit") try_set("message");
+        pull_desc();
+    }
+    else if (n == "todo") {
+        pull_desc();
+        // Mirror the partial todos[] array into tc.args["todos"] as it
+        // streams so the inline plan card fills in row-by-row (and the
+        // persistent plan state below tracks the in-progress item) the
+        // moment each item lands -- not only once the full array arrives
+        // at StreamToolUseEnd. Mirrors Zed's live update_plan element.
+        const auto& parsed = get_parsed();
+        if (parsed) {
+            if (auto it = parsed->find("todos");
+                it != parsed->end() && it->is_array() && !it->empty())
+            {
+                json arr = json::array();
+                for (const auto& td : *it) {
+                    if (!td.is_object()) continue;
+                    auto c = td.find("content");
+                    if (c == td.end() || !c->is_string()) continue;
+                    json item = json::object();
+                    item["content"] = c->get<std::string>();
+                    if (auto s = td.find("status");
+                        s != td.end() && s->is_string())
+                        item["status"] = s->get<std::string>();
+                    else
+                        item["status"] = "pending";
+                    arr.push_back(std::move(item));
+                }
+                if (!arr.empty()) {
+                    if (!tc.args.is_object()) tc.args = json::object();
+                    auto& cur = tc.args["todos"];
+                    bool changed = !cur.is_array() || cur.size() != arr.size();
+                    if (!changed) {
+                        for (std::size_t i = 0; i < arr.size(); ++i) {
+                            if (arr[i].value("content", std::string{})
+                                    != cur[i].value("content", std::string{})
+                             || arr[i].value("status", std::string{})
+                                    != cur[i].value("status", std::string{})) {
+                                changed = true; break;
+                            }
+                        }
+                    }
+                    if (changed) { cur = std::move(arr); tc.mark_args_dirty(); }
+                }
+            }
+        }
+    }
+}
+
+void sync_todo_state_from_args(Model& m, const nlohmann::json& args) {
+    if (!args.is_object()) return;
+    auto it = args.find("todos");
+    if (it == args.end() || !it->is_array() || it->empty()) return;
+
+    std::vector<TodoItem> items;
+    items.reserve(it->size());
+    for (const auto& td : *it) {
+        if (!td.is_object()) continue;
+        auto c = td.find("content");
+        if (c == td.end() || !c->is_string()) continue;
+        TodoItem item;
+        item.content = c->get<std::string>();
+        auto st = td.value("status", std::string{"pending"});
+        item.status = st == "completed"   ? TodoStatus::Completed
+                    : st == "in_progress" ? TodoStatus::InProgress
+                                           : TodoStatus::Pending;
+        items.push_back(std::move(item));
+    }
+    if (items.empty()) return;
+    m.ui.todo.items = std::move(items);
 }
 
 bool guard_truncated_tool_args(ToolUse& tc) {
@@ -1192,6 +1262,13 @@ Step stream_update(Model m, msg::StreamMsg sm) {
                     || now2 - tc.last_preview_at >= kPreviewInterval) {
                     update_stream_preview(tc);
                     tc.last_preview_at = now2;
+                    // Live plan sync: a `todo` call mirrors its partial
+                    // todos[] into tc.args during the preview above; push
+                    // that into the persistent plan state so the modal /
+                    // global indicator track the in-progress item the
+                    // instant the model writes it, not only at exec output.
+                    if (tc.name == "todo")
+                        sync_todo_state_from_args(m, tc.args);
                 }
             }
             return done(std::move(m));

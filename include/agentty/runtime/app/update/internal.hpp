@@ -63,6 +63,13 @@ bool guard_truncated_tool_args(ToolUse& tc);
 nlohmann::json salvage_args(const ToolUse& tc);
 maya::Cmd<Msg> finalize_turn(Model& m, StopReason stop_reason = StopReason::Unspecified);
 
+// Sync the persistent plan state (m.ui.todo.items) from a `todo` tool
+// call's args["todos"] array. Called live during arg streaming AND at
+// tool-exec output so the modal + any global indicator track the
+// in-progress item the instant the model writes it. No-op when args
+// carries no todos array (partial early stream).
+void sync_todo_state_from_args(Model& m, const nlohmann::json& args);
+
 // ── update/modal.cpp helpers ─────────────────────────────────────────────
 Step           submit_message(Model m);
 void           persist_settings(const Model& m);

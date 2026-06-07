@@ -198,25 +198,15 @@ Step tool_update(Model m, msg::ToolMsg tm) {
 
         // ── Tool execution result ───────────────────────────────────────
         [&](ToolExecOutput& e) -> Step {
-            // todo's side effect on the UI's todo modal — runs only when
-            // the call actually succeeded; failures don't synthesise a
-            // todo list.
+            // todo's side effect on the UI's plan state — runs only
+            // when the call actually succeeded; failures don't synthesise
+            // a plan. The final exact state lands here even if the live
+            // streaming sync (stream.cpp) raced a partial array.
             if (e.result) {
                 for (const auto& msg_ : m.d.current.messages)
                     for (const auto& tc : msg_.tool_calls)
-                        if (tc.id == e.id && tc.name == "todo") {
-                            auto todos = tc.args.value("todos", json::array());
-                            m.ui.todo.items.clear();
-                            for (const auto& td : todos) {
-                                TodoItem item;
-                                item.content = td.value("content", "");
-                                auto st = td.value("status", "pending");
-                                item.status = st == "completed"   ? TodoStatus::Completed
-                                            : st == "in_progress" ? TodoStatus::InProgress
-                                                                  : TodoStatus::Pending;
-                                m.ui.todo.items.push_back(std::move(item));
-                            }
-                        }
+                        if (tc.id == e.id && tc.name == "todo")
+                            sync_todo_state_from_args(m, tc.args);
             }
             apply_tool_output(m, e.id, std::move(e.result));
             // Mid-run incremental freeze: this tool settling may have
