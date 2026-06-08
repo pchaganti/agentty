@@ -62,6 +62,20 @@ maya::Element cached_markdown_for(const Message& msg, const Model& m) {
         // caret on the streaming edge (maya reveal_fx). Only animates while
         // the widget is live_; the settled build is untouched.
         cache.streaming->set_reveal_fx(true);
+        // Reveal pacing. floor_cps is a CEILING under sparse arrival and a
+        // FLOOR otherwise: the cursor walks at max(backlog/drain_secs,
+        // floor_cps). The model's OPENING tokens arrive sparsely — a tiny
+        // first delta (~9 bytes) then a ~230 ms gap before the next. At
+        // the default 120 cps the cursor types those 9 bytes in 2 frames
+        // then sits idle the whole gap: the "stuck at the beginning"
+        // stutter (proven via the reveal-cursor trace — cp pins while
+        // inprog=0 until the next delta lands). A lower floor spreads the
+        // sparse opening across the gap so the typewriter glides from
+        // byte 0. Steady-state speed is unaffected: once tokens flow,
+        // backlog accumulates and burst_cps (backlog/drain_secs) takes
+        // over, pacing the cursor well above the floor.
+        cache.streaming->set_reveal_pacing(/*floor_cps=*/45.0,
+                                           /*drain_secs=*/0.8);
     }
 
     // Pick the source bytes for THIS frame. The reveal cursor must see
