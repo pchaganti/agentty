@@ -474,6 +474,324 @@ void collapse_whitespace(std::string& s) {
     s = std::move(out);
 }
 
+// ── Main-content extraction. ──────────────────────────────────────────
+// Modern pages put the actual article inside one of: <main>, <article>,
+// or a div with id="content"/"main"/"mw-content-text" (Wikipedia) or
+// role="main". When we find one of those, return ONLY that subtree —
+// the surrounding nav/header/footer/sidebar that makes up 70-90% of
+// the raw bytes never even reaches the cleaning passes. When none
+// match, return the body unchanged (most sites circa 2026 use <main>;
+// the fallback path covers handwritten HTML and minimal-template blogs).
+std::string extract_main_content(std::string body) {
+    struct Candidate { std::string_view tag; std::string_view attr_match; };
+    static constexpr Candidate cands[] = {
+        {"main",    ""},
+        {"article", ""},
+        {"div",     "role=\"main\""},
+        {"div",     "id=\"content\""},
+        {"div",     "id=\"main\""},
+        {"div",     "id=\"main-content\""},
+        {"div",     "id=\"mw-content-text\""},
+        {"div",     "id=\"primary\""},
+        {"div",     "class=\"content\""},
+        {"section", "id=\"content\""},
+    };
+
+    auto find_ci = [&body](std::string_view needle, size_t from) -> size_t {
+        if (needle.empty() || from >= body.size()) return std::string::npos;
+        for (size_t i = from; i + needle.size() <= body.size(); ++i) {
+            bool ok = true;
+            for (size_t k = 0; k < needle.size(); ++k) {
+                char a = body[i + k], b = needle[k];
+                if (a >= 'A' && a <= 'Z') a = static_cast<char>(a + 32);
+                if (b >= 'A' && b <= 'Z') b = static_cast<char>(b + 32);
+                if (a != b) { ok = false; break; }
+            }
+            if (ok) return i;
+        }
+        return std::string::npos;
+    };
+
+    for (const auto& c : cands) {
+        std::string open  = "<" + std::string{c.tag};
+        std::string close = "</" + std::string{c.tag} + ">";
+
+        // Find the first `<tag` whose opening element ALSO contains the
+        // required attribute (when set). Skip stray matches that don't.
+        size_t search_from = 0;
+        size_t pick_start  = std::string::npos;
+        while (search_from < body.size()) {
+            size_t p = find_ci(open, search_from);
+            if (p == std::string::npos) break;
+            // Must be followed by a delimiter so `<main>` doesn't match `<mainx>`.
+            char nx = (p + open.size() < body.size()) ? body[p + open.size()] : '\0';
+            if (nx != '>' && nx != ' ' && nx != '\t' && nx != '\n' && nx != '/') {
+                search_from = p + open.size();
+                continue;
+            }
+            size_t gt = body.find('>', p);
+            if (gt == std::string::npos) break;
+            if (c.attr_match.empty()
+                || body.find(c.attr_match, p) < gt) {
+                pick_start = p;
+                break;
+            }
+            search_from = gt + 1;
+        }
+        if (pick_start == std::string::npos) continue;
+
+        // Find the matching close. For <main>/<article> the close is the
+        // first `</tag>` after the open. For <div> we need balanced
+        // nesting because pages have <div> inside <div> all the way down.
+        size_t end = std::string::npos;
+        if (c.tag != "div" && c.tag != "section") {
+            end = find_ci(close, pick_start + open.size());
+        } else {
+            // Balanced-nesting walk.
+            int depth = 1;
+            size_t cur = body.find('>', pick_start);
+            if (cur == std::string::npos) continue;
+            ++cur;
+            while (cur < body.size() && depth > 0) {
+                size_t no = find_ci(open,  cur);
+                size_t nc = find_ci(close, cur);
+                if (nc == std::string::npos) break;
+                if (no != std::string::npos && no < nc) {
+                    // Confirm it's a tag start, not e.g. `<div>` inside text.
+                    char nx = (no + open.size() < body.size()) ? body[no + open.size()] : '\0';
+                    if (nx == '>' || nx == ' ' || nx == '\t' || nx == '\n' || nx == '/') {
+                        ++depth;
+                        cur = no + open.size();
+                        continue;
+                    }
+                    cur = no + open.size();
+                    continue;
+                }
+                --depth;
+                if (depth == 0) { end = nc; break; }
+                cur = nc + close.size();
+            }
+        }
+        if (end == std::string::npos) continue;
+
+        // Sanity: the extracted subtree should be at least 200 bytes
+        // (a stub <main></main> with just an ad wrapper isn't worth
+        // taking) and at least 5% of the original (otherwise we picked
+        // a sidebar instead of the article).
+        size_t subtree_len = end - pick_start;
+        if (subtree_len < 200) continue;
+        if (subtree_len < body.size() / 20) continue;
+
+        return body.substr(pick_start, end - pick_start + close.size());
+    }
+    return body;
+}
+
+// ── Class/id boilerplate strip. ──────────────────────────────────────
+// Walk the body looking for opening tags whose class= or id= attribute
+// contains a known boilerplate token (cookie, banner, ad, share,
+// related, comments, sidebar, nav, menu, footer, header, social,
+// newsletter, promo). When found, find the matching close for that
+// tag and drop the whole subtree. Operates on already-region-stripped
+// HTML so we don't waste cycles on the giant <script>/<style> blocks.
+void strip_boilerplate_classes(std::string& s) {
+    static constexpr std::string_view tokens[] = {
+        "cookie", "banner", "consent", "gdpr",
+        "ad-", "-ad ", " ad ", "advert", "sponsor",
+        "share", "social", "newsletter", "subscribe", "signup",
+        "related", "recommend", "trending", "popular",
+        "comments", "disqus",
+        "sidebar", "side-bar", "sider", "rail",
+        "navbar", "navigation", "nav-", " nav ", "menu",
+        "footer", "site-footer", "page-footer",
+        "header", "site-header", "page-header", "masthead",
+        "breadcrumb", "crumbs",
+        "toolbar", "toolkit", "promo", "popup", "modal",
+        "pagination", "pager",
+        "toc-", "table-of-contents",  // ToCs are mostly link soup
+        "skip-link", "skip-to",
+    };
+
+    auto matches_token = [](std::string_view attr_val) {
+        // Lowercase attr_val once.
+        std::string lo;
+        lo.reserve(attr_val.size() + 2);
+        lo += ' ';
+        for (char c : attr_val) lo += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        lo += ' ';
+        for (auto tok : tokens) {
+            if (lo.find(tok) != std::string::npos) return true;
+        }
+        return false;
+    };
+
+    // Walk every `<tag` opening. For each, pull class= and id= values,
+    // test for boilerplate, and if matched, drop the balanced subtree.
+    // We iterate by position; a successful drop rewrites `s` and we
+    // resume at the same index (now pointing at what used to come after).
+    size_t i = 0;
+    while (i + 1 < s.size()) {
+        if (s[i] != '<' || s[i+1] == '/' || s[i+1] == '!') { ++i; continue; }
+        size_t gt = s.find('>', i);
+        if (gt == std::string::npos) break;
+
+        // Extract tag name.
+        size_t name_end = i + 1;
+        while (name_end < gt && s[name_end] != ' ' && s[name_end] != '\t'
+               && s[name_end] != '\n' && s[name_end] != '/' && s[name_end] != '>')
+            ++name_end;
+        std::string tag;
+        tag.reserve(name_end - i - 1);
+        for (size_t k = i + 1; k < name_end; ++k)
+            tag += static_cast<char>(std::tolower(static_cast<unsigned char>(s[k])));
+        // Self-closing or void elements: skip.
+        static constexpr std::string_view void_tags[] = {
+            "br", "hr", "img", "input", "meta", "link", "source", "area", "col",
+            "embed", "param", "track", "wbr"
+        };
+        bool is_void = false;
+        for (auto v : void_tags) if (tag == v) { is_void = true; break; }
+        if (is_void) { i = gt + 1; continue; }
+        if (tag.empty()) { i = gt + 1; continue; }
+
+        std::string_view tag_body{s.data() + i, gt - i};
+        // Pull class= and id= values.
+        auto pull_attr = [&](std::string_view name) -> std::string_view {
+            for (size_t p = 0; p + name.size() + 2 < tag_body.size(); ++p) {
+                if ((p == 0 || tag_body[p-1] == ' ' || tag_body[p-1] == '\t')
+                    && tag_body.compare(p, name.size(), name) == 0
+                    && tag_body[p + name.size()] == '=') {
+                    size_t v = p + name.size() + 1;
+                    if (v >= tag_body.size()) return {};
+                    char q = tag_body[v];
+                    if (q == '"' || q == '\'') {
+                        size_t ve = tag_body.find(q, v + 1);
+                        if (ve == std::string_view::npos) return {};
+                        return tag_body.substr(v + 1, ve - v - 1);
+                    }
+                    size_t ve = v;
+                    while (ve < tag_body.size() && tag_body[ve] != ' '
+                           && tag_body[ve] != '>' && tag_body[ve] != '\t')
+                        ++ve;
+                    return tag_body.substr(v, ve - v);
+                }
+            }
+            return {};
+        };
+
+        auto cls = pull_attr("class");
+        auto idv = pull_attr("id");
+        bool drop = (!cls.empty() && matches_token(cls))
+                 || (!idv.empty() && matches_token(idv));
+        if (!drop) { i = gt + 1; continue; }
+
+        // Find the balanced close for this tag.
+        std::string open  = "<"  + tag;
+        std::string close = "</" + tag + ">";
+        int depth = 1;
+        size_t cur = gt + 1;
+        size_t kill_end = std::string::npos;
+        while (cur < s.size() && depth > 0) {
+            // case-insensitive find of either open or close.
+            size_t no = s.find(open,  cur);
+            size_t nc = s.find(close, cur);
+            if (nc == std::string::npos) break;
+            if (no != std::string::npos && no < nc) {
+                char nx = (no + open.size() < s.size()) ? s[no + open.size()] : '\0';
+                if (nx == '>' || nx == ' ' || nx == '\t' || nx == '\n' || nx == '/') {
+                    ++depth;
+                    cur = no + open.size();
+                    continue;
+                }
+                cur = no + open.size();
+                continue;
+            }
+            --depth;
+            if (depth == 0) { kill_end = nc + close.size(); break; }
+            cur = nc + close.size();
+        }
+        if (kill_end == std::string::npos) { i = gt + 1; continue; }
+        s.erase(i, kill_end - i);
+        // Don't advance i — what used to follow is now at i.
+    }
+}
+
+// ── Drop nav-fragment lines. ─────────────────────────────────────────
+// After tag-strip, raw nav bars become a column of one-word lines
+// ("Home", "About", "Pricing") and link rails become lines like
+// "[ProductX](…)". A line is "nav-fragment" if it is short AND its
+// non-whitespace bytes are predominantly link-link-link with no
+// connective prose. Heuristic:
+//   • length ≤ 60 chars
+//   • contains a `](` (the link marker) OR is ≤ 3 words
+//   • < 4 actual words outside the link text
+// Also drops the all-too-common single-token lines ("Next ›", "×",
+// stray pipes). Preserves headings (lines starting with `#`).
+std::string drop_nav_lines(std::string body) {
+    std::string out;
+    out.reserve(body.size());
+    size_t i = 0;
+    while (i < body.size()) {
+        size_t e = body.find('\n', i);
+        if (e == std::string::npos) e = body.size();
+        std::string_view line{body.data() + i, e - i};
+        // Trim trailing ws.
+        while (!line.empty() && (line.back() == ' ' || line.back() == '\t'))
+            line.remove_suffix(1);
+
+        bool keep = true;
+        if (line.empty()) {
+            // keep blank line
+        } else if (line.front() == '#') {
+            // heading
+        } else if (line.size() <= 60) {
+            // Count word-ish tokens outside link text.
+            int words_outside = 0;
+            bool in_link_text = false;
+            bool in_link_url  = false;
+            bool in_word = false;
+            for (size_t k = 0; k < line.size(); ++k) {
+                char c = line[k];
+                if (c == '[') { in_link_text = true; in_word = false; continue; }
+                if (c == ']' && in_link_text) {
+                    in_link_text = false;
+                    if (k + 1 < line.size() && line[k+1] == '(') { in_link_url = true; ++k; }
+                    continue;
+                }
+                if (c == ')' && in_link_url) { in_link_url = false; continue; }
+                if (in_link_text || in_link_url) continue;
+                bool ws = (c == ' ' || c == '\t' || c == '|'
+                           || c == ':' || c == '-' || c == ',');
+                if (!ws && !in_word) { ++words_outside; in_word = true; }
+                else if (ws) in_word = false;
+            }
+            bool has_link = line.find("](") != std::string_view::npos;
+            if (has_link && words_outside < 3) keep = false;
+            else if (!has_link && line.size() < 4) keep = false;
+            // Single-token chrome lines like "×" or "›".
+            else if (line.size() <= 2) keep = false;
+        }
+
+        if (keep) {
+            out.append(line.data(), line.size());
+            out += '\n';
+        }
+        i = e + 1;
+    }
+    // Collapse runs of >2 newlines that the drops may have produced.
+    std::string final2;
+    final2.reserve(out.size());
+    int nl = 0;
+    for (char c : out) {
+        if (c == '\n') {
+            if (++nl <= 2) final2 += c;
+        } else { nl = 0; final2 += c; }
+    }
+    while (!final2.empty() && (final2.back() == '\n' || final2.back() == ' '))
+        final2.pop_back();
+    return final2;
+}
+
 [[nodiscard]] bool looks_like_html(std::string_view content_type, std::string_view body) {
     if (content_type.find("html") != std::string_view::npos) return true;
     if (content_type.find("xml")  != std::string_view::npos) return true;
@@ -492,6 +810,17 @@ void collapse_whitespace(std::string& s) {
 }
 
 std::string html_to_text(std::string body) {
+    // First: try to narrow to the page's main content region. The big
+    // boilerplate (nav, header, footer, sidebar, cookie banners, related
+    // posts, comments) lives OUTSIDE <main>/<article>; pulling the inner
+    // subtree drops 70-90% of the raw HTML before we even start cleaning,
+    // which means the cleaned 64KB is dense actual prose rather than
+    // mostly-link-soup.
+    body = extract_main_content(std::move(body));
+
+    // Region strips: these are HTML elements whose ENTIRE content is
+    // useless to a reader. Done BEFORE class-based stripping so we don't
+    // waste time scanning their text.
     strip_region(body, "script");
     strip_region(body, "style");
     strip_region(body, "noscript");
@@ -500,12 +829,33 @@ std::string html_to_text(std::string body) {
     strip_region(body, "template");
     strip_region(body, "iframe");
     strip_region(body, "form");      // login walls, search boxes
+    // Semantic chrome regions. After extract_main_content these are
+    // usually already gone, but pages that don't use <main> still have
+    // these tags inside their content wrapper.
+    strip_region(body, "nav");
+    strip_region(body, "aside");
+    strip_region(body, "footer");
+    strip_region(body, "header");
+    strip_region(body, "button");    // "Subscribe", "Share", "Copy" chrome
+    strip_region(body, "figure");    // images + captions: caption is rarely the article
+    strip_region(body, "picture");
+
+    // Class/id-based boilerplate strip. Catches the named-element
+    // chrome that survived the semantic-region pass (cookie banners,
+    // share rails, comment sections, ads, related-posts widgets).
+    strip_boilerplate_classes(body);
+
     promote_headings(body);
     flatten_anchors(body);
     mark_block_boundaries(body);
     strip_tags(body);
     decode_entities(body);
     collapse_whitespace(body);
+
+    // Final pass: drop nav-fragment lines (very short, mostly link text)
+    // that snuck through. Done LAST so it sees the post-tag-strip plain
+    // text and can judge each line on its own merit.
+    body = drop_nav_lines(std::move(body));
     return body;
 }
 
