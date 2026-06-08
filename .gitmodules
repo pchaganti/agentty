@@ -2,3 +2,6 @@
 	path = maya
 	url = git@github.com:1ay1/maya.git
 	branch = master
+[submodule "acp-cpp"]
+	path = acp-cpp
+	url = git@github.com:1ay1/acp-cpp.git

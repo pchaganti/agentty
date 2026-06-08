@@ -1,9 +1,9 @@
 // agentty::acp::AgentServer — implementation. See server.hpp for the design.
 //
-// This is the headless analogue of the TUI turn loop in
-// src/runtime/app/cmd_factory.cpp. It reuses the SAME provider, tools, wire
-// shaping, and permission policy, but drives them synchronously on a worker
-// thread and translates every step into ACP session/update notifications.
+// Headless analogue of the TUI turn loop (src/runtime/app/cmd_factory.cpp).
+// Reuses the SAME provider, tools, wire shaping, and permission policy, driven
+// synchronously on a worker thread and translated into acp-cpp SessionUpdate
+// notifications via the acp-cpp ClientConnection.
 
 #include "agentty/acp/server.hpp"
 
@@ -35,49 +35,52 @@ namespace agentty::acp {
 namespace {
 
 using nlohmann::json;
+namespace a = ::acp;
 
-// agentty spec::Kind → ACP ToolKind string. ACP kinds drive icon/UI choice
-// on the client; "other" is the safe default.
-const char* acp_tool_kind(std::string_view tool_name) {
-    namespace sp = tools::spec;
-    const auto* s = sp::lookup(tool_name);
-    if (!s) return "other";
-    switch (s->kind) {
-        case sp::Kind::Read:           return "read";
-        case sp::Kind::Edit:           return "edit";
-        case sp::Kind::Write:          return "edit";
-        case sp::Kind::Bash:           return "execute";
-        case sp::Kind::Diagnostics:    return "execute";
-        case sp::Kind::GitCommit:      return "execute";
-        case sp::Kind::Grep:           return "search";
-        case sp::Kind::Glob:           return "search";
-        case sp::Kind::FindDefinition: return "search";
-        case sp::Kind::ListDir:        return "read";
-        case sp::Kind::GitStatus:      return "read";
-        case sp::Kind::GitDiff:        return "read";
-        case sp::Kind::GitLog:         return "read";
-        case sp::Kind::WebFetch:       return "fetch";
-        case sp::Kind::WebSearch:      return "fetch";
-        case sp::Kind::Todo:           return "think";
-        case sp::Kind::Remember:       return "other";
-        case sp::Kind::Forget:         return "other";
-        case sp::Kind::Wipe:           return "other";
-        case sp::Kind::Task:           return "think";
-        case sp::Kind::Skill:          return "read";
-    }
-    return "other";
+// Construct a text ContentBlock.
+a::ContentBlock text_block(std::string s) {
+    return a::ContentBlock{a::TextContent{std::move(s), a::Nothing, json::object()}};
 }
 
-// One-line human title for a tool call card. Keeps the model's raw args out
-// of the headline; the rawInput field carries the full args.
+// agentty spec::Kind → acp::ToolKind.
+a::ToolKind acp_tool_kind(std::string_view tool_name) {
+    namespace sp = tools::spec;
+    const auto* s = sp::lookup(tool_name);
+    if (!s) return a::ToolKind::Other;
+    switch (s->kind) {
+        case sp::Kind::Read:           return a::ToolKind::Read;
+        case sp::Kind::Edit:           return a::ToolKind::Edit;
+        case sp::Kind::Write:          return a::ToolKind::Edit;
+        case sp::Kind::Bash:           return a::ToolKind::Execute;
+        case sp::Kind::Diagnostics:    return a::ToolKind::Execute;
+        case sp::Kind::GitCommit:      return a::ToolKind::Execute;
+        case sp::Kind::Grep:           return a::ToolKind::Search;
+        case sp::Kind::Glob:           return a::ToolKind::Search;
+        case sp::Kind::FindDefinition: return a::ToolKind::Search;
+        case sp::Kind::ListDir:        return a::ToolKind::Read;
+        case sp::Kind::GitStatus:      return a::ToolKind::Read;
+        case sp::Kind::GitDiff:        return a::ToolKind::Read;
+        case sp::Kind::GitLog:         return a::ToolKind::Read;
+        case sp::Kind::WebFetch:       return a::ToolKind::Fetch;
+        case sp::Kind::WebSearch:      return a::ToolKind::Fetch;
+        case sp::Kind::Todo:           return a::ToolKind::Think;
+        case sp::Kind::Remember:       return a::ToolKind::Other;
+        case sp::Kind::Forget:         return a::ToolKind::Other;
+        case sp::Kind::Wipe:           return a::ToolKind::Other;
+        case sp::Kind::Task:           return a::ToolKind::Think;
+        case sp::Kind::Skill:          return a::ToolKind::Read;
+    }
+    return a::ToolKind::Other;
+}
+
+// One-line human title for a tool call card.
 std::string tool_title(const ToolUse& tc) {
-    const auto& a = tc.args;
+    const auto& args = tc.args;
     auto str = [&](const char* k) -> std::string {
-        if (a.contains(k) && a[k].is_string()) return a[k].get<std::string>();
+        if (args.contains(k) && args[k].is_string()) return args[k].get<std::string>();
         return {};
     };
-    if (tc.name.value == "read"  || tc.name.value == "edit"
-     || tc.name.value == "write") {
+    if (tc.name.value == "read" || tc.name.value == "edit" || tc.name.value == "write") {
         std::string p = str("path");
         if (!p.empty()) return tc.name.value + " " + p;
     }
@@ -92,19 +95,18 @@ std::string tool_title(const ToolUse& tc) {
     return tc.name.value;
 }
 
-// File locations a tool call touches, for Zed's "follow-along" (it can open /
-// highlight the file as the agent works). Empty array when the tool has no
-// obvious file argument. Returns an ACP ToolCallLocation[] ({path, line?}).
-json tool_locations(const ToolUse& tc) {
-    json locs = json::array();
-    const auto& a = tc.args;
+// File locations a tool call touches, for Zed's follow-along.
+a::List<a::ToolCallLocation> tool_locations(const ToolUse& tc) {
+    a::List<a::ToolCallLocation> locs;
+    const auto& args = tc.args;
     auto add = [&](const char* key) {
-        if (a.contains(key) && a[key].is_string()) {
-            const std::string p = a[key].get<std::string>();
+        if (args.contains(key) && args[key].is_string()) {
+            const std::string p = args[key].get<std::string>();
             if (!p.empty()) {
-                json loc{{"path", p}};
-                if (a.contains("line") && a["line"].is_number_integer())
-                    loc["line"] = a["line"].get<int>();
+                a::ToolCallLocation loc;
+                loc.path = p;
+                if (args.contains("line") && args["line"].is_number_integer())
+                    loc.line = a::Just<std::int64_t>(args["line"].get<std::int64_t>());
                 locs.push_back(std::move(loc));
             }
         }
@@ -116,72 +118,105 @@ json tool_locations(const ToolUse& tc) {
     return locs;
 }
 
-// Build the prompt text from the ACP ContentBlock[] of a session/prompt. We
-// support text + resource_link (the ACP baseline). Embedded resources and
-// images are flattened to their text where present, else a short marker.
-std::string prompt_text_from_blocks(const json& blocks) {
+// Build the prompt text from acp ContentBlock[].
+std::string prompt_text_from_blocks(const a::List<a::ContentBlock>& blocks) {
     std::string out;
-    if (!blocks.is_array()) return out;
     for (const auto& b : blocks) {
-        const std::string type = b.value("type", "");
-        if (type == "text") {
-            out += b.value("text", "");
-            out += "\n";
-        } else if (type == "resource_link") {
-            // A pointer to a workspace file. Surface the uri so the model
-            // can read it with the `read` tool.
-            std::string uri = b.value("uri", "");
-            std::string name = b.value("name", "");
-            out += "[resource: " + (name.empty() ? uri : name) + " (" + uri + ")]\n";
-        } else if (type == "resource") {
-            // Embedded resource: inline its text contents if present.
-            if (b.contains("resource") && b["resource"].is_object()) {
-                const auto& r = b["resource"];
-                if (r.contains("text") && r["text"].is_string()) {
-                    out += r["text"].get<std::string>();
-                    out += "\n";
-                }
-            }
-        }
+        a::match(b,
+            [&](const a::TextContent& t) { out += t.text; out += "\n"; },
+            [&](const a::ResourceLinkContent& l) {
+                out += "[resource: " + (l.name.empty() ? l.uri : l.name)
+                     + " (" + l.uri + ")]\n";
+            },
+            [&](const a::ResourceContent& r) {
+                a::match(r.resource,
+                    [&](const a::TextResource& tr) { out += tr.text; out += "\n"; },
+                    [&](const a::BlobResource&)    {});
+            },
+            [&](const a::ImageContent&) {},
+            [&](const a::AudioContent&) {});
     }
     return out;
 }
 
-// agentty StopReason → ACP stopReason string.
-const char* acp_stop_reason(StopReason r, bool cancelled, bool errored) {
-    if (cancelled) return "cancelled";
-    if (errored)   return "refusal";  // surfaced as a non-clean end
+// agentty StopReason → acp::StopReason.
+a::StopReason acp_stop_reason(StopReason r, bool cancelled, bool errored) {
+    if (cancelled) return a::StopReason::Cancelled;
+    if (errored)   return a::StopReason::Refusal;
     switch (r) {
-        case StopReason::EndTurn:      return "end_turn";
-        case StopReason::MaxTokens:    return "max_tokens";
-        case StopReason::ToolUse:      return "end_turn";  // shouldn't surface here
-        case StopReason::StopSequence: return "end_turn";
-        case StopReason::Unspecified:  return "end_turn";
+        case StopReason::MaxTokens:    return a::StopReason::MaxTokens;
+        case StopReason::EndTurn:
+        case StopReason::ToolUse:
+        case StopReason::StopSequence:
+        case StopReason::Unspecified:  return a::StopReason::EndTurn;
     }
-    return "end_turn";
+    return a::StopReason::EndTurn;
+}
+
+// Helper: a ToolCall (announcement) from a pending ToolUse.
+a::ToolCall make_tool_call(const ToolUse& tc, a::ToolCallStatus status) {
+    a::ToolCall out;
+    out.toolCallId = a::ToolCallId{tc.id.value};
+    out.title      = tool_title(tc);
+    out.kind       = acp_tool_kind(tc.name.value);
+    out.status     = status;
+    if (!tc.args.is_null()) out.rawInput = a::Just<json>(tc.args);
+    out.locations  = tool_locations(tc);
+    return out;
 }
 
 } // namespace
 
-AgentServer::AgentServer(rpc::Peer&       peer,
-                         StreamFn         stream,
-                         auth::AuthHeader auth,
-                         std::string      model_id,
-                         Profile          profile)
-    : peer_(peer),
+AgentServer::AgentServer(a::StdioTransport& transport,
+                         StreamFn          stream,
+                         auth::AuthHeader  auth,
+                         std::string       model_id,
+                         Profile           profile)
+    : transport_(transport),
+      conn_(transport.sink(), make_handlers()),
       stream_(std::move(stream)),
       auth_(std::move(auth)),
       model_id_(std::move(model_id)),
       profile_(profile) {}
 
+a::AgentHandlers AgentServer::make_handlers() {
+    a::AgentHandlers h;
+    h.on_initialize  = [this](const a::InitializeParams& p)  { return on_initialize(p); };
+    h.on_session_new = [this](const a::NewSessionParams& p)  { return on_new_session(p); };
+    h.on_session_cancel = [this](const a::CancelParams& p)   { on_cancel(p); };
+    h.on_session_prompt_async =
+        [this](const a::PromptParams& p, Responder r) { on_prompt(p, std::move(r)); };
+
+    h.on_session_load = [this](const a::LoadSessionParams& p) -> a::Unit {
+        on_load_session(p); return a::Unit{};
+    };
+    h.on_session_resume = [this](const a::ResumeSessionParams& p) { return on_resume_session(p); };
+    h.on_session_list   = [this](const a::ListSessionsParams& p)  { return on_list_sessions(p); };
+    h.on_session_close  = [this](const a::CloseSessionParams& p) -> a::Unit {
+        on_close_session(p); return a::Unit{};
+    };
+    h.on_session_delete = [this](const a::DeleteSessionParams& p) -> a::Unit {
+        on_delete_session(p); return a::Unit{};
+    };
+    h.on_session_set_mode = [this](const a::SetModeParams& p) -> a::Unit {
+        on_set_mode(p); return a::Unit{};
+    };
+    h.on_session_set_config_option =
+        [this](const a::SetConfigOptionParams& p) { return on_set_config_option(p); };
+
+    h.on_authenticate = [this](const a::AuthenticateParams&) -> a::Unit {
+        if (auth::is_empty(auth_))
+            throw a::RpcError(a::errc::AuthRequired,
+                "agentty has no credentials — run `agentty login` first");
+        return a::Unit{};
+    };
+    h.on_logout = [this]() -> a::Unit { on_logout(); return a::Unit{}; };
+    return h;
+}
+
 int AgentServer::serve() {
-    peer_.on_request([this](const std::string& m, const json& p, const json& id) {
-        return handle_request(m, p, id);
-    });
-    peer_.on_notification([this](const std::string& m, const json& p) {
-        handle_notification(m, p);
-    });
-    peer_.run();   // blocks until the client disconnects
+    transport_.start(conn_.engine());
+    transport_.join();   // blocks until EOF on stdin
     return 0;
 }
 
@@ -203,245 +238,129 @@ const std::vector<provider::ToolSpec>& AgentServer::wire_tools() {
 }
 
 void AgentServer::persist(const Session& sess) {
-    // Same on-disk format the TUI writes (threads_dir()/<id>.json), so the
-    // session survives a subprocess restart, is loadable via session/load,
-    // and shows up in the TUI's thread picker. Cheap even for a 0-message
-    // stub written right after session/new.
     persistence::save_thread(sess.thread);
 }
 
-void AgentServer::replay_history(const std::string& session_id,
-                                 const Thread& thread) {
-    // Reconstruct the conversation as session/update notifications, in order,
-    // exactly as the client would have seen them live. User turns replay as
-    // user_message_chunk; assistant text as agent_message_chunk; each tool
-    // call as a completed tool_call card (announce + final state in one).
+void AgentServer::send_update(const std::string& session_id, a::SessionUpdate update) {
+    a::SessionUpdateMsg msg;
+    msg.sessionId = a::SessionId{session_id};
+    msg.update    = std::move(update);
+    conn_.session_update(msg);
+}
+
+void AgentServer::replay_history(const std::string& session_id, const Thread& thread) {
     for (const auto& m : thread.messages) {
         if (m.role == Role::User) {
             if (m.text.empty()) continue;
-            send_update(session_id, json{
-                {"sessionUpdate", "user_message_chunk"},
-                {"messageId", m.id.value},
-                {"content", {{"type", "text"}, {"text", m.text}}},
-            });
+            send_update(session_id, a::SU_UserMessageChunk{
+                text_block(m.text), a::Just(a::MessageId{m.id.value})});
         } else if (m.role == Role::Assistant) {
             const std::string body = m.text.empty() ? m.streaming_text : m.text;
-            if (!body.empty()) {
-                send_update(session_id, json{
-                    {"sessionUpdate", "agent_message_chunk"},
-                    {"messageId", m.id.value},
-                    {"content", {{"type", "text"}, {"text", body}}},
-                });
-            }
+            if (!body.empty())
+                send_update(session_id, a::SU_AgentMessageChunk{
+                    text_block(body), a::Just(a::MessageId{m.id.value})});
+
             for (const auto& tc : m.tool_calls) {
-                // Announce the call with its final input.
-                send_update(session_id, json{
-                    {"sessionUpdate", "tool_call"},
-                    {"toolCallId", tc.id.value},
-                    {"title", tool_title(tc)},
-                    {"kind", acp_tool_kind(tc.name.value)},
-                    {"status", "pending"},
-                    {"rawInput", tc.args},
-                    {"locations", tool_locations(tc)},
-                });
-                // Then its terminal status + output, so the card renders
-                // complete on reload.
-                const char* status = tc.is_failed()   ? "failed"
-                                   : tc.is_rejected()  ? "failed"
-                                   :                     "completed";
+                send_update(session_id, a::SU_ToolCall{
+                    make_tool_call(tc, a::ToolCallStatus::Pending)});
+
+                const auto status = (tc.is_failed() || tc.is_rejected())
+                                  ? a::ToolCallStatus::Failed : a::ToolCallStatus::Completed;
+                a::ToolCallUpdate upd;
+                upd.toolCallId = a::ToolCallId{tc.id.value};
+                upd.status     = a::Just(status);
                 const std::string out = tc.output();
-                json update{
-                    {"sessionUpdate", "tool_call_update"},
-                    {"toolCallId", tc.id.value},
-                    {"status", status},
-                };
                 if (!out.empty()) {
-                    update["content"] = json::array({
-                        json{{"type", "content"},
-                             {"content", {{"type", "text"}, {"text", out}}}},
-                    });
-                    update["rawOutput"] = json{{"text", out}};
+                    a::List<a::ToolCallContent> content;
+                    content.push_back(a::ToolCallContent{a::TCC_Content{text_block(out), json::object()}});
+                    upd.content   = a::Just(std::move(content));
+                    upd.rawOutput = a::Just<json>(json{{"text", out}});
                 }
-                send_update(session_id, update);
+                send_update(session_id, a::SU_ToolCallUpdate{std::move(upd)});
             }
         }
     }
 }
 
-rpc::Outcome AgentServer::handle_request(const std::string& method,
-                                         const json& params,
-                                         const json& id) {
-    try {
-        if (method == "initialize")
-            return rpc::Outcome::ok(on_initialize(params));
-        if (method == "authenticate") {
-            // We authenticate ourselves from ~/.config/agentty. If we have no
-            // usable credential, tell the client auth is required.
-            if (auth::is_empty(auth_))
-                return rpc::Outcome::fail(rpc::code::kAuthRequired,
-                    "agentty has no credentials — run `agentty login` first");
-            return rpc::Outcome::ok(json::object());
-        }
-        if (method == "logout")
-            return rpc::Outcome::ok(on_logout(params));
-        if (method == "session/new")
-            return rpc::Outcome::ok(on_new_session(params));
-        if (method == "session/load")
-            return rpc::Outcome::ok(on_load_session(params));
-        if (method == "session/resume")
-            return rpc::Outcome::ok(on_resume_session(params));
-        if (method == "session/list")
-            return rpc::Outcome::ok(on_list_sessions(params));
-        if (method == "session/close")
-            return rpc::Outcome::ok(on_close_session(params));
-        if (method == "session/delete")
-            return rpc::Outcome::ok(on_delete_session(params));
-        if (method == "session/set_mode")
-            return rpc::Outcome::ok(on_set_mode(params));
-        if (method == "session/set_config_option")
-            return rpc::Outcome::ok(on_set_config_option(params));
-        if (method == "session/prompt") {
-            // Long-running: kick off the turn on a worker and reply later via
-            // Peer::respond(id, ...). Tell the peer not to reply synchronously.
-            on_prompt(id, params);
-            return rpc::deferred();
-        }
-        if (method == "session/cancel") {  // some clients send it as a request
-            on_cancel(params);
-            return rpc::Outcome::ok(json::object());
-        }
-        return rpc::Outcome::fail(rpc::code::kMethodNotFound,
-                                  "unknown method: " + method);
-    } catch (const std::exception& e) {
-        return rpc::Outcome::fail(rpc::code::kInternalError, e.what());
-    }
+a::InitializeResult AgentServer::on_initialize(const a::InitializeParams& p) {
+    a::InitializeResult r;
+    r.protocolVersion = (p.protocolVersion >= 1) ? a::kProtocolVersion : p.protocolVersion;
+
+    r.agentInfo = a::Just<a::ImplementationInfo>(
+        {"agentty", a::Nothing, a::Just<std::string>(AGENTTY_VERSION)});
+
+    auto& caps = r.agentCapabilities;
+    caps.loadSession = true;
+    caps.promptCapabilities.embeddedContext = true;
+    caps.auth.logout = a::Just(a::Unit{});
+    caps.sessionCapabilities.list      = a::Just(a::Unit{});
+    caps.sessionCapabilities.resume    = a::Just(a::Unit{});
+    caps.sessionCapabilities.close     = a::Just(a::Unit{});
+    caps.sessionCapabilities.deleteCap = a::Just(a::Unit{});
+    return r;
 }
 
-void AgentServer::handle_notification(const std::string& method,
-                                      const json& params) {
-    if (method == "session/cancel") on_cancel(params);
-    // Other notifications (e.g. initialized) are ignored.
-}
-
-json AgentServer::on_initialize(const json& params) {
-    // Echo the client's protocol version if we support it (we support v1).
-    int client_version = params.value("protocolVersion", 1);
-    int negotiated = client_version >= 1 ? 1 : client_version;
-
-    return json{
-        {"protocolVersion", negotiated},
-        {"agentInfo", {
-            {"name", "agentty"},
-            {"version", AGENTTY_VERSION},
-        }},
-        {"agentCapabilities", {
-            // session/load is gated by this top-level flag (v1 quirk).
-            {"loadSession", true},
-            {"promptCapabilities", {
-                {"image", false},
-                {"audio", false},
-                {"embeddedContext", true},
-            }},
-            // We don't connect to MCP servers ourselves.
-            {"mcpCapabilities", {
-                {"http", false},
-                {"sse", false},
-            }},
-            // We authenticate ourselves from ~/.config/agentty, and support
-            // dropping that credential via the `logout` method.
-            {"auth", {
-                {"logout", json::object()},
-            }},
-            // The full optional session surface. `{}` for each = "supported".
-            {"sessionCapabilities", {
-                {"list",   json::object()},
-                {"resume", json::object()},
-                {"close",  json::object()},
-                {"delete", json::object()},
-            }},
-        }},
-        // We authenticate ourselves; advertise no client-driven auth methods.
-        {"authMethods", json::array()},
-    };
-}
-
-json AgentServer::on_new_session(const json& params) {
-    std::string cwd = params.value("cwd", "");
+a::NewSessionResult AgentServer::on_new_session(const a::NewSessionParams& p) {
     std::lock_guard<std::mutex> lk(session_mtx_);
-    // Use a real ThreadId as the session id so the session is loadable from
-    // the on-disk thread store (threads_dir()/<id>.json) after a restart and
-    // shows up in the TUI's thread picker.
     ThreadId tid = persistence::new_id();
     std::string sid = tid.value;
     Session s;
     s.id  = sid;
-    s.cwd = cwd;
-    s.profile = profile_;   // inherit the server-wide default tier
+    s.cwd = p.cwd;
+    s.profile = profile_;
     s.thread.id = tid;
-    s.thread.title = cwd.empty() ? std::string{"ACP session"}
-                                 : std::string{"ACP "} + cwd;
+    s.thread.title = p.cwd.empty() ? std::string{"ACP session"}
+                                   : std::string{"ACP "} + p.cwd;
     const Session& stored = sessions_.emplace(sid, std::move(s)).first->second;
     persist(stored);
     index_session(stored);
-    return json{
-        {"sessionId", sid},
-        {"modes", mode_state(stored.profile)},
-    };
+
+    a::NewSessionResult r;
+    r.sessionId = a::SessionId{sid};
+    r.modes     = a::Just(mode_state(stored.profile));
+    return r;
 }
 
-json AgentServer::on_load_session(const json& params) {
-    std::string sid = params.value("sessionId", "");
-    std::string cwd = params.value("cwd", "");
-    if (sid.empty())
-        throw std::runtime_error("session/load: missing sessionId");
+void AgentServer::on_load_session(const a::LoadSessionParams& p) {
+    std::string sid = p.sessionId.value;
+    std::string cwd = p.cwd;
+    if (sid.empty()) throw std::runtime_error("session/load: missing sessionId");
 
     Thread thread;
     bool   from_memory = false;
     Profile profile = profile_;
 
-    // If this subprocess already has the session live in memory, use that —
-    // it's authoritative and sidesteps any not-yet-flushed async disk write.
     {
         std::lock_guard<std::mutex> lk(session_mtx_);
         if (auto it = sessions_.find(sid); it != sessions_.end()) {
             if (!cwd.empty()) it->second.cwd = cwd;
-            thread      = it->second.thread;   // copy under lock
+            thread      = it->second.thread;
             profile     = it->second.profile;
             from_memory = true;
         }
     }
 
     if (!from_memory) {
-        // Cross-restart path: restore the persisted Thread from disk (same
-        // store the TUI writes), then register it as a live session.
         auto path = persistence::threads_dir() / (sid + ".json");
         auto loaded = persistence::load_thread_file(path);
-        if (!loaded)
-            throw std::runtime_error("session/load: no such session: " + sid);
+        if (!loaded) throw std::runtime_error("session/load: no such session: " + sid);
         thread = std::move(*loaded);
 
         std::lock_guard<std::mutex> lk(session_mtx_);
         Session s;
-        s.id      = sid;
-        s.cwd     = cwd;
-        s.profile = profile;
-        s.thread  = thread;
+        s.id = sid; s.cwd = cwd; s.profile = profile; s.thread = thread;
         sessions_.insert_or_assign(sid, std::move(s));
     }
 
-    // Replay the full conversation so the client rebuilds the transcript,
-    // THEN resolve with the current mode state.
     replay_history(sid, thread);
-    return json{{"modes", mode_state(profile)}};
 }
 
-void AgentServer::on_cancel(const json& params) {
-    std::string sid = params.value("sessionId", "");
-    if (Session* s = find_session(sid); s && s->cancel)
+void AgentServer::on_cancel(const a::CancelParams& p) {
+    if (Session* s = find_session(p.sessionId.value); s && s->cancel)
         s->cancel->cancel();
 }
 
-// ── Session modes ─────────────────────────────────────────────────────────
+// ── Session modes ───────────────────────────────────────────────────────────
 const char* AgentServer::mode_id_for(Profile p) {
     switch (p) {
         case Profile::Ask:     return "ask";
@@ -451,78 +370,53 @@ const char* AgentServer::mode_id_for(Profile p) {
     return "ask";
 }
 
-Profile AgentServer::profile_from_mode_id(const std::string& mode_id,
-                                          Profile fallback) {
+Profile AgentServer::profile_from_mode_id(const std::string& mode_id, Profile fallback) {
     if (mode_id == "ask")     return Profile::Ask;
     if (mode_id == "write")   return Profile::Write;
     if (mode_id == "minimal") return Profile::Minimal;
     return fallback;
 }
 
-json AgentServer::mode_state(Profile current) {
-    // agentty's three permission tiers as ACP SessionMode[]. The client
-    // (Zed) renders these in its mode picker and calls session/set_mode with
-    // the chosen id.
-    return json{
-        {"currentModeId", mode_id_for(current)},
-        {"availableModes", json::array({
-            json{{"id", "ask"},     {"name", "Ask"},
-                 {"description", "Prompt before edits, commands, and network access"}},
-            json{{"id", "write"},   {"name", "Write"},
-                 {"description", "Edit files and run commands without prompting; still prompt for risky ops"}},
-            json{{"id", "minimal"}, {"name", "Minimal"},
-                 {"description", "Prompt for everything, including file reads"}},
-        })},
+a::SessionModeState AgentServer::mode_state(Profile current) {
+    a::SessionModeState st;
+    st.currentModeId = a::SessionModeId{mode_id_for(current)};
+    st.availableModes = {
+        a::SessionMode{a::SessionModeId{"ask"}, "Ask",
+            a::Just<std::string>("Prompt before edits, commands, and network access")},
+        a::SessionMode{a::SessionModeId{"write"}, "Write",
+            a::Just<std::string>("Edit files and run commands without prompting; still prompt for risky ops")},
+        a::SessionMode{a::SessionModeId{"minimal"}, "Minimal",
+            a::Just<std::string>("Prompt for everything, including file reads")},
     };
+    return st;
 }
 
-json AgentServer::on_set_mode(const json& params) {
-    std::string sid    = params.value("sessionId", "");
-    std::string modeId = params.value("modeId", "");
-    Session* s = find_session(sid);
-    if (!s) throw std::runtime_error("session/set_mode: unknown sessionId: " + sid);
-    s->profile = profile_from_mode_id(modeId, s->profile);
-    // Echo the change back so the client's mode indicator stays in sync even
-    // if it didn't initiate the switch (per the current_mode_update contract).
-    send_update(sid, json{
-        {"sessionUpdate", "current_mode_update"},
-        {"currentModeId", mode_id_for(s->profile)},
-    });
-    return json::object();
+void AgentServer::on_set_mode(const a::SetModeParams& p) {
+    Session* s = find_session(p.sessionId.value);
+    if (!s) throw std::runtime_error("session/set_mode: unknown sessionId: " + p.sessionId.value);
+    s->profile = profile_from_mode_id(p.modeId.value, s->profile);
+    send_update(p.sessionId.value,
+        a::SU_CurrentMode{a::SessionModeId{mode_id_for(s->profile)}, json::object()});
 }
 
-// ── Session config options ───────────────────────────────────────────
-json AgentServer::on_set_config_option(const json& params) {
-    std::string sid      = params.value("sessionId", "");
-    std::string configId = params.value("configId", "");
-    std::string value    = params.value("value", "");
-    Session* s = find_session(sid);
-    if (!s) throw std::runtime_error("session/set_config_option: unknown sessionId: " + sid);
-    // The only config option we expose is the model selector; the value is a
-    // model id string. Empty value resets to the server default.
-    if (configId == "model")
-        s->model = value;
-    return json{{"configOptions", json::array()}};
+a::SetConfigOptionResult AgentServer::on_set_config_option(const a::SetConfigOptionParams& p) {
+    Session* s = find_session(p.sessionId.value);
+    if (!s) throw std::runtime_error("session/set_config_option: unknown sessionId: " + p.sessionId.value);
+    if (p.configId == "model") s->model = p.value;
+    return a::SetConfigOptionResult{{}, json::object()};
 }
 
-// ── Authentication ───────────────────────────────────────────────
-json AgentServer::on_logout(const json& /*params*/) {
-    // Drop the in-process credential and wipe the on-disk store so a
-    // subsequent prompt reports authentication-required.
+void AgentServer::on_logout() {
     auth::clear_credentials();
-    auth_ = auth::ApiKeyHeader{""};   // empty arm → auth::is_empty() == true
-    return json::object();
+    auth_ = auth::ApiKeyHeader{""};
 }
 
-// ── Session lifecycle: list / resume / close / delete ───────────────────
+// ── Session lifecycle: list / resume / close / delete ────────────────────────
 json AgentServer::load_session_index() {
     std::lock_guard<std::mutex> lk(index_mtx_);
     std::ifstream ifs(persistence::threads_dir() / "acp_sessions.json");
     if (!ifs) return json::object();
-    try {
-        json j; ifs >> j;
-        if (j.is_object()) return j;
-    } catch (...) {}
+    try { json j; ifs >> j; if (j.is_object()) return j; } catch (...) {}
     return json::object();
 }
 
@@ -553,128 +447,95 @@ void AgentServer::unindex_session(const std::string& id) {
     if (ofs) ofs << j.dump();
 }
 
-json AgentServer::on_list_sessions(const json& params) {
-    // Filter by cwd if the client asks. Pagination (cursor/nextCursor) is
-    // unnecessary at our scale — we return the whole set in one page.
-    std::string filter_cwd = params.value("cwd", "");
+a::ListSessionsResult AgentServer::on_list_sessions(const a::ListSessionsParams& p) {
+    std::string filter_cwd = p.cwd.value_or("");
     json index = load_session_index();
 
-    // Fold in any live, not-yet-indexed sessions (defensive: index_session
-    // runs on creation, but keep the two views consistent).
     {
         std::lock_guard<std::mutex> lk(session_mtx_);
-        for (const auto& [id, s] : sessions_) {
+        for (const auto& [id, s] : sessions_)
             if (!index.contains(id))
                 index[id] = json{{"cwd", s.cwd}, {"title", s.thread.title}};
-        }
     }
 
-    json sessions = json::array();
+    a::ListSessionsResult result;
     for (auto it = index.begin(); it != index.end(); ++it) {
         const std::string& id = it.key();
         const json& meta = it.value();
         std::string cwd = meta.value("cwd", "");
         if (!filter_cwd.empty() && cwd != filter_cwd) continue;
-        // SessionInfo requires a cwd; if we never recorded one, skip rather
-        // than emit an invalid entry.
         if (cwd.empty()) continue;
-        json info{{"sessionId", id}, {"cwd", cwd}};
+        a::SessionInfo info;
+        info.sessionId = a::SessionId{id};
+        info.cwd       = cwd;
         if (meta.contains("title") && meta["title"].is_string())
-            info["title"] = meta["title"];
-        sessions.push_back(std::move(info));
+            info.title = a::Just<std::string>(meta["title"].get<std::string>());
+        result.sessions.push_back(std::move(info));
     }
-    return json{{"sessions", std::move(sessions)}};
+    return result;
 }
 
-json AgentServer::on_resume_session(const json& params) {
-    // Resume is load + a richer response (mode/config state). Reuse the load
-    // path to restore + replay, then resolve with the mode state.
-    std::string sid = params.value("sessionId", "");
-    (void)on_load_session(params);   // restores, registers, replays history
+a::ResumeSessionResult AgentServer::on_resume_session(const a::ResumeSessionParams& p) {
+    on_load_session(p);   // restore + replay
     Profile profile = profile_;
-    if (Session* s = find_session(sid)) profile = s->profile;
-    return json{
-        {"modes", mode_state(profile)},
-        {"configOptions", json::array()},
-    };
+    if (Session* s = find_session(p.sessionId.value)) profile = s->profile;
+
+    a::ResumeSessionResult r;
+    r.modes = a::Just(mode_state(profile));
+    return r;
 }
 
-json AgentServer::on_close_session(const json& params) {
-    // Drop the session from memory (free its Thread + cancel token) but leave
-    // it on disk so it can be loaded/resumed/listed again later.
-    std::string sid = params.value("sessionId", "");
+void AgentServer::on_close_session(const a::CloseSessionParams& p) {
     std::lock_guard<std::mutex> lk(session_mtx_);
-    sessions_.erase(sid);
-    return json::object();
+    sessions_.erase(p.sessionId.value);
 }
 
-json AgentServer::on_delete_session(const json& params) {
-    // Permanent removal: drop from memory, delete the on-disk thread, and
-    // remove the sidecar index entry.
-    std::string sid = params.value("sessionId", "");
-    { std::lock_guard<std::mutex> lk(session_mtx_); sessions_.erase(sid); }
-    persistence::delete_thread(ThreadId{sid});
-    unindex_session(sid);
-    return json::object();
+void AgentServer::on_delete_session(const a::DeleteSessionParams& p) {
+    { std::lock_guard<std::mutex> lk(session_mtx_); sessions_.erase(p.sessionId.value); }
+    persistence::delete_thread(ThreadId{p.sessionId.value});
+    unindex_session(p.sessionId.value);
 }
 
-void AgentServer::send_update(const std::string& session_id, json update) {
-    peer_.notify("session/update", json{
-        {"sessionId", session_id},
-        {"update", std::move(update)},
-    });
-}
-
-void AgentServer::on_prompt(const json& id, const json& params) {
-    std::string sid = params.value("sessionId", "");
-    std::string text = prompt_text_from_blocks(params.value("prompt", json::array()));
+// ── Prompt + turn loop ───────────────────────────────────────────────────────
+void AgentServer::on_prompt(const a::PromptParams& p, Responder resp) {
+    std::string sid  = p.sessionId.value;
+    std::string text = prompt_text_from_blocks(p.prompt);
 
     {
         std::lock_guard<std::mutex> lk(session_mtx_);
         auto it = sessions_.find(sid);
         if (it == sessions_.end()) {
-            peer_.respond(id, rpc::Outcome::fail(rpc::code::kInvalidParams,
-                "unknown sessionId: " + sid));
+            resp.error(a::errc::InvalidParams, "unknown sessionId: " + sid);
             return;
         }
         if (auth::is_empty(auth_)) {
-            peer_.respond(id, rpc::Outcome::fail(rpc::code::kAuthRequired,
-                "agentty has no credentials — run `agentty login` first"));
+            resp.error(a::errc::AuthRequired,
+                "agentty has no credentials — run `agentty login` first");
             return;
         }
         Message um;
         um.role = Role::User;
         um.text = std::move(text);
-        // Give the session a meaningful title from its first user message
-        // (the "ACP <cwd>" placeholder is only useful before any prompt).
         if (it->second.thread.messages.empty() && !um.text.empty())
-            it->second.thread.title =
-                persistence::title_from_first_message(um.text);
+            it->second.thread.title = persistence::title_from_first_message(um.text);
         it->second.thread.messages.push_back(std::move(um));
         it->second.cancel = std::make_shared<http::CancelToken>();
     }
 
-    // Run the whole turn off the reader thread so the peer keeps servicing
-    // inbound traffic (session/cancel, our own permission responses).
-    std::thread([this, id, sid]() mutable {
-        run_turn(std::move(id), std::move(sid));
+    // Run the whole turn off the reader thread; the engine stays free to
+    // deliver our outbound permission responses. The Responder resolves the
+    // deferred session/prompt when the turn settles.
+    std::thread([this, sid = std::move(sid), r = std::move(resp)]() mutable {
+        run_turn(std::move(sid), std::move(r));
     }).detach();
 }
 
-void AgentServer::run_turn(json prompt_id, std::string session_id) {
+void AgentServer::run_turn(std::string session_id, Responder resp) {
     bool cancelled = false;
     bool errored = false;
     std::string error_msg;
     StopReason last_stop = StopReason::EndTurn;
 
-    // The agent loop: stream a completion, run any tools it requested, repeat
-    // until the model stops asking for tools (or we cancel / error).
-    //
-    // We do NOT hold session_mtx_ across the blocking stream / tool execution:
-    // session/cancel must be able to trip the cancel token concurrently, and
-    // only one turn ever runs per session, so the Session* stays valid for the
-    // turn's lifetime (sessions are never erased mid-turn). The lock only
-    // guards the sessions_ map structure, taken briefly inside find_session.
     for (int turn = 0; turn < 64; ++turn) {
         Session* s = find_session(session_id);
         if (!s) { errored = true; error_msg = "session vanished"; break; }
@@ -683,30 +544,26 @@ void AgentServer::run_turn(json prompt_id, std::string session_id) {
         last_stop = stop;
         if (!error_msg.empty()) { errored = true; break; }
         if (cancelled) break;
-
-        if (stop != StopReason::ToolUse) break;  // model is done
+        if (stop != StopReason::ToolUse) break;
 
         bool ran = run_tools(*s, cancelled);
         if (cancelled || !ran) break;
-        // Loop: feed tool results back to the model.
     }
 
     if (Session* s = find_session(session_id)) {
         s->cancel.reset();
-        // Persist the updated transcript so the session survives a restart
-        // and can be reloaded via session/load.
         persist(*s);
-        index_session(*s);   // refresh title/updatedAt in the cwd sidecar
+        index_session(*s);
     }
 
-    json result{{"stopReason", acp_stop_reason(last_stop, cancelled, errored)}};
-    if (errored && !error_msg.empty()) result["_meta"] = json{{"error", error_msg}};
-    peer_.respond(prompt_id, rpc::Outcome::ok(std::move(result)));
+    a::PromptResult result;
+    result.stopReason = acp_stop_reason(last_stop, cancelled, errored);
+    if (errored && !error_msg.empty()) result.meta = json{{"error", error_msg}};
+    resp.ok(result);
 }
 
 StopReason AgentServer::stream_completion(Session& sess, bool& out_cancelled,
                                           std::string& out_error) {
-    // ── Build the wire request, mirroring launch_stream ──────────────────
     provider::Request req;
     req.model         = sess.model.empty() ? model_id_ : sess.model;
     req.system_prompt = provider::anthropic::default_system_prompt();
@@ -715,19 +572,16 @@ StopReason AgentServer::stream_completion(Session& sess, bool& out_cancelled,
     req.messages      = sess.thread.messages;
     req.tools         = wire_tools();
 
-    // A fresh assistant message accumulates this completion's text + tools.
     Message assistant;
     assistant.role = Role::Assistant;
 
     StopReason stop = StopReason::Unspecified;
-    std::string cur_tool_json;   // accumulates input_json_delta for the open tool
-    bool any_text_streamed = false;
-    StreamUsage last_usage;      // most recent usage frame this completion
+    std::string cur_tool_json;
+    StreamUsage last_usage;
     bool have_usage = false;
     const std::string sid = sess.id;
     const std::string msg_id = assistant.id.value;
 
-    // Translate each provider Msg event into ACP session/update.
     auto sink = [&](agentty::Msg m) {
         std::visit([&](auto&& domain) {
             using D = std::decay_t<decltype(domain)>;
@@ -736,27 +590,19 @@ StopReason AgentServer::stream_completion(Session& sess, bool& out_cancelled,
                     using E = std::decay_t<decltype(ev)>;
                     if constexpr (std::is_same_v<E, StreamTextDelta>) {
                         assistant.text += ev.text;
-                        any_text_streamed = true;
-                        send_update(sid, json{
-                            {"sessionUpdate", "agent_message_chunk"},
-                            {"messageId", msg_id},
-                            {"content", {{"type", "text"}, {"text", ev.text}}},
-                        });
+                        send_update(sid, a::SU_AgentMessageChunk{
+                            text_block(ev.text), a::Just(a::MessageId{msg_id})});
                     } else if constexpr (std::is_same_v<E, StreamToolUseStart>) {
                         ToolUse tc;
-                        tc.id   = ev.id;
-                        tc.name = ev.name;
+                        tc.id = ev.id; tc.name = ev.name;
                         assistant.tool_calls.push_back(std::move(tc));
                         cur_tool_json.clear();
-                        // Announce the pending tool call so the client shows a
-                        // card immediately (args fill in on completion).
-                        send_update(sid, json{
-                            {"sessionUpdate", "tool_call"},
-                            {"toolCallId", ev.id.value},
-                            {"title", ev.name.value},
-                            {"kind", acp_tool_kind(ev.name.value)},
-                            {"status", "pending"},
-                        });
+                        a::ToolCall call;
+                        call.toolCallId = a::ToolCallId{ev.id.value};
+                        call.title      = ev.name.value;
+                        call.kind       = acp_tool_kind(ev.name.value);
+                        call.status     = a::ToolCallStatus::Pending;
+                        send_update(sid, a::SU_ToolCall{std::move(call)});
                     } else if constexpr (std::is_same_v<E, StreamToolUseDelta>) {
                         cur_tool_json += ev.partial_json;
                     } else if constexpr (std::is_same_v<E, StreamToolUseEnd>) {
@@ -764,26 +610,22 @@ StopReason AgentServer::stream_completion(Session& sess, bool& out_cancelled,
                             auto& tc = assistant.tool_calls.back();
                             try {
                                 tc.args = cur_tool_json.empty()
-                                    ? json::object()
-                                    : json::parse(cur_tool_json);
+                                    ? json::object() : json::parse(cur_tool_json);
                             } catch (...) { tc.args = json::object(); }
-                            send_update(sid, json{
-                                {"sessionUpdate", "tool_call_update"},
-                                {"toolCallId", tc.id.value},
-                                {"title", tool_title(tc)},
-                                {"rawInput", tc.args},
-                                {"locations", tool_locations(tc)},
-                            });
+                            a::ToolCallUpdate upd;
+                            upd.toolCallId = a::ToolCallId{tc.id.value};
+                            upd.title      = a::Just(tool_title(tc));
+                            upd.rawInput   = a::Just<json>(tc.args);
+                            upd.locations  = a::Just(tool_locations(tc));
+                            send_update(sid, a::SU_ToolCallUpdate{std::move(upd)});
                         }
                     } else if constexpr (std::is_same_v<E, StreamFinished>) {
                         stop = ev.stop_reason;
                     } else if constexpr (std::is_same_v<E, StreamError>) {
                         out_error = ev.message;
                     } else if constexpr (std::is_same_v<E, StreamUsage>) {
-                        last_usage = ev;
-                        have_usage = true;
+                        last_usage = ev; have_usage = true;
                     }
-                    // StreamHeartbeat / StreamStarted: ignored.
                 }, domain);
             }
         }, m);
@@ -795,31 +637,21 @@ StopReason AgentServer::stream_completion(Session& sess, bool& out_cancelled,
         out_error = std::string{"stream backend: "} + e.what();
     }
 
-    if (sess.cancel && sess.cancel->is_cancelled()) {
-        out_cancelled = true;
-    }
+    if (sess.cancel && sess.cancel->is_cancelled()) out_cancelled = true;
 
-    // Surface token accounting to the client as a usage_update so Zed's
-    // context meter tracks the session. `used` = tokens currently in context
-    // (this completion's input + the output it just produced); `size` = the
-    // model's context window. Anthropic reports input_tokens at message_start
-    // and the running output_tokens at message_delta, so last_usage holds the
-    // final tally once the stream ends.
     if (have_usage) {
         const std::string model = sess.model.empty() ? model_id_ : sess.model;
         long long used = static_cast<long long>(last_usage.input_tokens) +
                          last_usage.cache_creation_input_tokens +
                          last_usage.cache_read_input_tokens +
                          last_usage.output_tokens;
-        send_update(sid, json{
-            {"sessionUpdate", "usage_update"},
-            {"used", used < 0 ? 0 : used},
-            {"size", ui::context_max_for_model(model)},
-        });
+        a::SU_Usage u;
+        u.used = used < 0 ? 0 : used;
+        u.size = static_cast<std::int64_t>(ui::context_max_for_model(model));
+        send_update(sid, std::move(u));
     }
 
     sess.thread.messages.push_back(std::move(assistant));
-    (void)any_text_streamed;
     return stop;
 }
 
@@ -828,113 +660,73 @@ bool AgentServer::run_tools(Session& sess, bool& out_cancelled) {
     Message& last = sess.thread.messages.back();
     if (last.role != Role::Assistant || last.tool_calls.empty()) return false;
 
-    // We mutate each ToolUse on `last` in place to its terminal status
-    // (Done/Failed/Rejected). The transport's build_messages synthesises the
-    // paired tool_result follow-up message from these same tool_calls
-    // (reading tc.output() / tc.is_failed() / tc.is_rejected()), so there is
-    // nothing to append separately — the wire pairing is automatic.
-    //
-    // In ACP mode the CLIENT (Zed) owns the approval UI. The profile decides
-    // which tools we gate behind a session/request_permission round-trip:
-    //   Ask (default) — prompt for Exec / WriteFs / Net; auto-run reads so an
-    //                    agent loop's read/grep/glob don't spam dialogs.
-    //   Minimal       — prompt for everything that touches the outside world,
-    //                    reads included.
-    //   Write         — same side-effect prompts as Ask (Exec/WriteFs/Net
-    //                    still prompt) but never prompts for reads.
     const Profile profile = sess.profile;
 
     for (auto& tc : last.tool_calls) {
-        if (sess.cancel && sess.cancel->is_cancelled()) {
-            out_cancelled = true;
-            return false;
-        }
+        if (sess.cancel && sess.cancel->is_cancelled()) { out_cancelled = true; return false; }
 
-        // Permission gate. In Write profile everything auto-allows; we still
-        // ask the client for Exec/WriteFs so Zed can show its own approval UI
-        // when it wants to (the policy decides whether we MUST ask).
         bool needs_perm =
             tool::DynamicDispatch::needs_permission(tc.name.value, profile)
             && !sess.grants.contains(tc.name.value);
         if (needs_perm) {
-            send_update(sess.id, json{
-                {"sessionUpdate", "tool_call_update"},
-                {"toolCallId", tc.id.value},
-                {"status", "pending"},
-            });
+            a::ToolCallUpdate u;
+            u.toolCallId = a::ToolCallId{tc.id.value};
+            u.status     = a::Just(a::ToolCallStatus::Pending);
+            send_update(sess.id, a::SU_ToolCallUpdate{std::move(u)});
+
             auto outcome = ask_permission(sess.id, tc);
-            if (sess.cancel && sess.cancel->is_cancelled()) {
-                out_cancelled = true;
-                return false;
-            }
-            if (outcome == PermissionOutcome::AllowAlways)
-                sess.grants.insert(tc.name.value);
-            const bool ok = outcome != PermissionOutcome::Deny;
-            if (!ok) {
+            if (sess.cancel && sess.cancel->is_cancelled()) { out_cancelled = true; return false; }
+            if (outcome == PermissionOutcome::AllowAlways) sess.grants.insert(tc.name.value);
+            if (outcome == PermissionOutcome::Deny) {
                 tc.status = ToolUse::Rejected{};
-                send_update(sess.id, json{
-                    {"sessionUpdate", "tool_call_update"},
-                    {"toolCallId", tc.id.value},
-                    {"status", "failed"},
-                });
-                // tc stays Rejected; build_messages emits an is_error
-                // tool_result so the model can adapt.
+                a::ToolCallUpdate r;
+                r.toolCallId = a::ToolCallId{tc.id.value};
+                r.status     = a::Just(a::ToolCallStatus::Failed);
+                send_update(sess.id, a::SU_ToolCallUpdate{std::move(r)});
                 continue;
             }
         }
 
-        // Mark running, then execute synchronously.
-        send_update(sess.id, json{
-            {"sessionUpdate", "tool_call_update"},
-            {"toolCallId", tc.id.value},
-            {"status", "in_progress"},
-        });
+        a::ToolCallUpdate running;
+        running.toolCallId = a::ToolCallId{tc.id.value};
+        running.status     = a::Just(a::ToolCallStatus::InProgress);
+        send_update(sess.id, a::SU_ToolCallUpdate{std::move(running)});
 
         auto result = tool::DynamicDispatch::execute(tc.name.value, tc.args);
 
-        json update{
-            {"sessionUpdate", "tool_call_update"},
-            {"toolCallId", tc.id.value},
-        };
+        a::ToolCallUpdate upd;
+        upd.toolCallId = a::ToolCallId{tc.id.value};
 
         if (result) {
-            // A diff-producing tool (edit/write) carries a FileChange; render
-            // it as ACP diff content so Zed shows the change inline.
-            json content = json::array();
+            a::List<a::ToolCallContent> content;
             if (result->change) {
                 const auto& ch = *result->change;
-                json diff{
-                    {"type", "diff"},
-                    {"path", ch.path},
-                    {"newText", ch.new_contents},
-                };
+                a::TCC_Diff diff;
+                diff.path    = ch.path;
+                diff.newText = ch.new_contents;
                 if (!ch.original_contents.empty())
-                    diff["oldText"] = ch.original_contents;
-                content.push_back(std::move(diff));
+                    diff.oldText = a::Just<std::string>(ch.original_contents);
+                content.push_back(a::ToolCallContent{std::move(diff)});
             }
-            if (!result->text.empty()) {
-                content.push_back(json{
-                    {"type", "content"},
-                    {"content", {{"type", "text"}, {"text", result->text}}},
-                });
-            }
-            update["status"] = "completed";
-            update["content"] = std::move(content);
-            update["rawOutput"] = json{{"text", result->text}};
+            if (!result->text.empty())
+                content.push_back(a::ToolCallContent{
+                    a::TCC_Content{text_block(result->text), json::object()}});
 
-            // Mutate the stored tc so the wire payload sees the output.
+            upd.status    = a::Just(a::ToolCallStatus::Completed);
+            upd.content   = a::Just(std::move(content));
+            upd.rawOutput = a::Just<json>(json{{"text", result->text}});
             tc.status = ToolUse::Done{{}, {}, result->text};
         } else {
             std::string detail = result.error().render();
-            update["status"] = "failed";
-            update["content"] = json::array({
-                json{{"type", "content"},
-                     {"content", {{"type", "text"}, {"text", detail}}}},
-            });
+            a::List<a::ToolCallContent> content;
+            content.push_back(a::ToolCallContent{
+                a::TCC_Content{text_block(detail), json::object()}});
+            upd.status  = a::Just(a::ToolCallStatus::Failed);
+            upd.content = a::Just(std::move(content));
             tc.status = ToolUse::Failed{{}, {}, detail};
         }
 
-        send_update(sess.id, update);
+        send_update(sess.id, a::SU_ToolCallUpdate{std::move(upd)});
     }
 
     return true;
@@ -942,39 +734,31 @@ bool AgentServer::run_tools(Session& sess, bool& out_cancelled) {
 
 AgentServer::PermissionOutcome
 AgentServer::ask_permission(const std::string& session_id, const ToolUse& tc) {
-    json options = json::array({
-        json{{"optionId", "allow_once"},  {"name", "Allow"},          {"kind", "allow_once"}},
-        json{{"optionId", "allow_always"},{"name", "Always allow"},   {"kind", "allow_always"}},
-        json{{"optionId", "reject_once"}, {"name", "Reject"},         {"kind", "reject_once"}},
-    });
-    json req{
-        {"sessionId", session_id},
-        {"toolCall", {
-            {"toolCallId", tc.id.value},
-            {"title", tool_title(tc)},
-            {"kind", acp_tool_kind(tc.name.value)},
-            {"rawInput", tc.args},
-            {"locations", tool_locations(tc)},
-        }},
-        {"options", std::move(options)},
+    a::RequestPermissionParams req;
+    req.sessionId = a::SessionId{session_id};
+    // ToolCallUpdate carries the tool card for the permission dialog.
+    req.toolCall.toolCallId = a::ToolCallId{tc.id.value};
+    req.toolCall.title      = a::Just(tool_title(tc));
+    req.toolCall.kind       = a::Just(acp_tool_kind(tc.name.value));
+    if (!tc.args.is_null()) req.toolCall.rawInput = a::Just<json>(tc.args);
+    req.toolCall.locations  = a::Just(tool_locations(tc));
+    req.options = {
+        a::PermissionOption{"allow_once",   "Allow",        a::PermissionOptionKind::AllowOnce,   json::object()},
+        a::PermissionOption{"allow_always", "Always allow", a::PermissionOptionKind::AllowAlways, json::object()},
+        a::PermissionOption{"reject_once",  "Reject",       a::PermissionOptionKind::RejectOnce,  json::object()},
     };
+
     try {
-        json resp = peer_.request("session/request_permission", req);
-        // resp = { outcome: { outcome: "selected", optionId: "..." } | { outcome: "cancelled" } }
-        if (!resp.contains("outcome")) return PermissionOutcome::Deny;
-        const auto& oc = resp["outcome"];
-        std::string kind = oc.value("outcome", "");
-        if (kind == "cancelled") return PermissionOutcome::Deny;
-        if (kind == "selected") {
-            std::string opt = oc.value("optionId", "");
-            if (opt == "allow_always") return PermissionOutcome::AllowAlways;
-            if (opt == "allow_once")   return PermissionOutcome::AllowOnce;
-            return PermissionOutcome::Deny;
-        }
-        return PermissionOutcome::Deny;
+        auto outcome = conn_.request_permission(req).get();   // blocks worker, not reader
+        return a::match(outcome.outcome,
+            [](const a::PO_Cancelled&) { return PermissionOutcome::Deny; },
+            [](const a::PO_Selected& s) {
+                if (s.optionId == "allow_always") return PermissionOutcome::AllowAlways;
+                if (s.optionId == "allow_once")   return PermissionOutcome::AllowOnce;
+                return PermissionOutcome::Deny;
+            });
     } catch (const std::exception&) {
-        // Client disconnected or errored — treat as denied.
-        return PermissionOutcome::Deny;
+        return PermissionOutcome::Deny;   // client disconnected/errored
     }
 }
 

@@ -212,6 +212,17 @@ if(TARGET simdjson)
     endif()
 endif()
 
+# acp-cpp — header-only Agent Client Protocol library (submodule). Provides
+# the wire algebra + JSON-RPC engine + stdio transport for `agentty acp`.
+# Tests/examples off; it reuses the nlohmann_json target already populated
+# above (its own FetchContent_MakeAvailable is a no-op when already present).
+set(ACP_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+set(ACP_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+add_subdirectory(acp-cpp)
+if(TARGET acp)
+    set_target_properties(acp PROPERTIES SYSTEM TRUE)
+endif()
+
 if(NOT TARGET maya::maya)
     add_library(maya::maya ALIAS maya)
 endif()
@@ -361,9 +372,9 @@ set(AGENTTY_PROVIDER_SOURCES
 
 # ACP (Agent Client Protocol) — lets agentty run as a headless agent
 # subprocess that Zed (or any ACP client) drives over JSON-RPC on stdio.
-# Reuses the provider + tools + wire shaping; no maya/UI dependency.
+# The wire protocol/engine/transport live in the acp-cpp submodule (linked
+# as acp::acp); server.cpp is the agentty-specific glue (turn loop + tools).
 set(AGENTTY_ACP_SOURCES
-    src/acp/jsonrpc.cpp
     src/acp/server.cpp
 )
 
@@ -478,6 +489,7 @@ target_include_directories(agentty PRIVATE include)
 target_compile_definitions(agentty PRIVATE AGENTTY_VERSION="${PROJECT_VERSION}")
 target_link_libraries(agentty PRIVATE
     maya::maya
+    acp::acp
     nlohmann_json::nlohmann_json
     simdjson::simdjson
     nghttp2::nghttp2

@@ -40,7 +40,6 @@
 
 #include <maya/maya.hpp>
 
-#include "agentty/acp/jsonrpc.hpp"
 #include "agentty/acp/server.hpp"
 #include "agentty/airgap/airgap.hpp"
 #include "agentty/domain/profile.hpp"
@@ -326,9 +325,9 @@ int main(int argc, char** argv) {
             return 2;
         }
 
-        acp::rpc::Peer peer(std::cin, std::cout);
-        acp::AgentServer server(
-            peer,
+        ::acp::StdioTransport transport(std::cin, std::cout);
+        agentty::acp::AgentServer server(
+            transport,
             [&provider](provider::Request req, provider::EventSink sink) {
                 provider.stream(std::move(req), std::move(sink));
             },
