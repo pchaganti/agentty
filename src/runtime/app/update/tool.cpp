@@ -209,34 +209,22 @@ Step tool_update(Model m, msg::ToolMsg tm) {
                             sync_todo_state_from_args(m, tc.args);
             }
             apply_tool_output(m, e.id, std::move(e.result));
-            // Mid-run incremental freeze: this tool settling may have
-            // made the leading sub-turns of the active run fully
-            // terminal. Freeze that completed prefix now so the live
-            // canvas holds only the active sub-turn. The frozen prefix
-            // is zero-copy (list_ref) + hash-keyed, so maya skips the
-            // body REBUILD — but it does NOT make re-presenting it free:
-            // layout + per-cell blit still run every frame O(rows). The
-            // trim below is what actually bounds that cost mid-run.
-            freeze_settled_subturns(m);
-            // Mid-run-safe trim: bound the live canvas to ~3 viewports
-            // DURING a long auto-pilot run. freeze_settled_subturns alone
-            // does NOT bound per-frame cost — a frozen entry is hash-keyed
-            // so maya skips the BODY REBUILD, but it still re-runs layout
-            // and copies every cached cell into the back buffer each frame
-            // (O(frozen_row_total) per tick: clear + layout + blit +
-            // witness). A 40-edit run grows the prefix to thousands of
-            // rows and pins per-frame render at tens of ms — the lag.
-            // trim_frozen_above_viewport only drops entries PROVABLY above
-            // the viewport (keeps ~3 screens, robust to the byte-wrap
-            // over-count) and commits EXACTLY the dropped rows, so no
-            // on-screen row is released and no duplicate is stranded.
-            auto trim = trim_frozen_above_viewport(m);
+            // No mid-run freeze or trim here. The single freeze site is
+            // finalize_turn (the agent_session MessageStop analog) — the
+            // whole agent turn is wrapped into one Turn Element and
+            // pushed to m.ui.frozen atomically there. Carving mid-run
+            // (the prior freeze_settled_subturns + trim_frozen_above_
+            // viewport calls that lived here) was the documented source
+            // of "redraws from top + scrollback corruption" at every
+            // tool→continuation seam: the freeze pushed an entry whose
+            // hash_id maya's component cache had not seen on the live
+            // tail's previous frame, so the cache missed and re-emitted
+            // those rows — sometimes over already-committed scrollback.
+            // agent_session never carves mid-stream and shows zero
+            // corruption / zero slowdown on long runs (proven by the
+            // long_session bench); we now do the same.
             auto kick = cmd::kick_pending_tools(m);
-            auto cmd  = trim.is_none()
-                ? std::move(kick)
-                : maya::Cmd<Msg>::batch(std::vector<maya::Cmd<Msg>>{
-                      std::move(trim), std::move(kick)});
-            return {std::move(m), std::move(cmd)};
+            return {std::move(m), std::move(kick)};
         },
 
         // ── Permission ──────────────────────────────────────────────────

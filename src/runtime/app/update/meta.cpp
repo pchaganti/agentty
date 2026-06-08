@@ -144,42 +144,21 @@ Step meta_update(Model m, msg::MetaMsg mm) {
                 }
             }
 
-            // ── Per-tick canvas bound (the SPEED path) ───────────
-            // Tick is the dominant render driver during a stream. Without
-            // bounding here, a long single turn (a big streaming response,
-            // or one auto-pilot turn with many write/edit cards) grows the
-            // live canvas unboundedly: every settled-but-unfrozen sub-turn
-            // re-lays-out + re-paints each tick, and the shadow verify +
-            // canvas.clear() walk the whole oversized canvas. Even AFTER a
-            // sub-turn freezes, layout + per-cell blit still scale with
-            // frozen_row_total — so we must both freeze settled prefixes
-            // AND trim the part of the frozen prefix above the viewport.
-            // Cost otherwise climbs with turn length (the mid-stream lag).
-            //
-            // Freeze any sub-turns that became terminal (into the
-            // zero-copy, hash-keyed frozen prefix maya blits), THEN trim
-            // the part of that prefix that has scrolled above the
-            // viewport. Freezing alone does NOT bound per-frame cost: a
-            // hash-keyed frozen entry skips the body REBUILD but still
-            // pays layout + per-cell blit + canvas.clear + shadow verify
-            // every tick, all O(frozen_row_total). A long single turn
-            // grows that prefix without limit, so per-frame cost climbs
-            // with turn length — the progressive mid-stream slowdown.
-            // trim_frozen_above_viewport drops only entries PROVABLY
-            // above the viewport (keeps ~3 screens, robust to the
-            // byte-wrap over-count) and commits EXACTLY the dropped rows,
-            // so the bound holds mid-stream without stranding a duplicate.
+            // No mid-stream freeze or trim on Tick. The single freeze
+            // site is finalize_turn (via pending_settle_freeze, the
+            // agent_session MessageStop analog). Carving during streaming
+            // was the documented source of "redraws from top + scrollback
+            // corruption": each mid-stream freeze stamped a frozen Turn
+            // whose hash_id maya's component cache had not seen on the
+            // previous live-tail frame, so the cache missed and re-emitted
+            // those rows — sometimes over committed scrollback. The
+            // claimed per-frame cost it was meant to bound ("5k-line
+            // prose reply re-lays-out every frame") is in fact handled
+            // by maya's component cache on a STABLE live-tail hash; the
+            // mid-stream carves were the ones invalidating that cache.
+            // agent_session never carves mid-stream and shows zero
+            // corruption / zero slowdown on long runs.
             maya::Cmd<Msg> midrun_trim = maya::Cmd<Msg>::none();
-            if (m.s.active()) {
-                // Bound a long PURE-TEXT answer first: split its committed
-                // markdown prefix into a settled sub-turn so the next
-                // freeze_settled_subturns call can freeze it. Without
-                // this a 5k-line prose reply re-lays-out every frame
-                // (~13 ms/frame); with it only the ~2KB live tail does.
-                freeze_streaming_text_prefix(m);
-                freeze_settled_subturns(m);
-                midrun_trim = trim_frozen_above_viewport(m);
-            }
 
             // ── Stream-stall watchdog ──────────────────────────────────
             // 120 s of total silence is overwhelmingly likely to be a
