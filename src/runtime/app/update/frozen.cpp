@@ -939,15 +939,34 @@ void freeze_streaming_text_prefix(Model& m) {
     }
 
     // The new settled message carries the committed prefix as `text`
-    // (settled), inheriting the active message's identity-relevant
-    // fields. A fresh MessageId keeps the render-cache keyed per visual
-    // unit. Inserted just before the active tail so the run reads
-    // [settled-text][growing-text] — identical shape to a post-tool
-    // continuation, which the live tail / freeze path already handle.
+    // (settled). CRITICAL for scrollback safety: the settled prefix
+    // INHERITS the active message's ORIGINAL MessageId, and the live
+    // remainder gets a FRESH MessageId. This mirrors agent_session
+    // exactly: there, TextBlockStop collapses the live StreamingMarkdown
+    // into a static Element and resets `m.md = StreamingMarkdown{}` so
+    // the remainder streams from byte 0 in a brand-new widget — never a
+    // divergent reparse.
+    //
+    // Why the prefix keeps the id (and the suffix is fresh), not the
+    // other way around: the md widget is keyed by (ThreadId, MessageId).
+    // The active widget has ALREADY rendered the prefix's rows, and once
+    // the live tail overflowed a viewport those rows are committed to
+    // immutable native scrollback. If the SUFFIX kept the id, that same
+    // widget would be fed the shortened "ABCDEF"->"DEF" source — a
+    // divergent reparse that re-blits cells at shifted positions over
+    // the committed rows (the duplication ghost). By giving the prefix
+    // the original id, its widget keeps exactly the bytes it already
+    // rendered (now settled, frozen to a byte-identical static Element —
+    // no divergence), and the suffix's FRESH id gets a brand-new widget
+    // that streams "DEF" from byte 0, monotonically, never rewriting a
+    // committed row. Inserted just before the active tail so the run
+    // reads [settled-text][growing-text].
     Message settled;
     settled.role      = Role::Assistant;
+    settled.id        = active.id;          // prefix keeps the rendered widget
     settled.text      = std::move(prefix_body);
     settled.timestamp = active.timestamp;
+    active.id         = new_message_id();   // suffix streams fresh from byte 0
     // Insert before back(): msgs.end() - 1.
     msgs.insert(msgs.end() - 1, std::move(settled));
 
