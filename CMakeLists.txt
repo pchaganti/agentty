@@ -1158,6 +1158,43 @@ if(AGENTTY_BUILD_TESTS)
     endif()
     add_test(NAME frozen_invariant_fuzz COMMAND frozen_invariant_fuzz)
 
+    # anthropic_md_stream — dev tool, NOT a ctest entry. Captures a real
+    # Anthropic SSE markdown stream to a .jsonl fixture (network +
+    # credentials required), or replays a captured fixture through
+    # maya's StreamingMarkdown reveal-fx path so we can visually verify
+    # the typewriter animation against authentic delta sizes / timing.
+    add_executable(anthropic_md_stream EXCLUDE_FROM_ALL
+        tests/anthropic_md_stream.cpp
+        ${AGENTTY_IO_SOURCES}
+        ${AGENTTY_WORKSPACE_SOURCES}
+        ${AGENTTY_AIRGAP_SOURCES}
+        ${AGENTTY_PROVIDER_SOURCES}
+        ${AGENTTY_DIFF_SOURCES}
+        ${AGENTTY_TOOL_SOURCES}
+        ${AGENTTY_RUNTIME_NOMAIN_SOURCES}
+    )
+    target_include_directories(anthropic_md_stream PRIVATE include)
+    target_compile_definitions(anthropic_md_stream PRIVATE
+        AGENTTY_VERSION="${PROJECT_VERSION}")
+    target_link_libraries(anthropic_md_stream PRIVATE
+        maya::maya
+        nlohmann_json::nlohmann_json
+        simdjson::simdjson
+        nghttp2::nghttp2
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(anthropic_md_stream PRIVATE
+            ws2_32 crypt32 shell32 winmm
+            user32 gdi32 gdiplus shlwapi)
+    endif()
+    if(APPLE)
+        target_link_libraries(anthropic_md_stream PRIVATE
+            "-framework Security"
+            "-framework CoreFoundation")
+    endif()
     # Aggregate target so CI can build every ctest-registered binary in one
     # shot. The individual test targets are EXCLUDE_FROM_ALL (kept out of the
     # default `cmake --build` so a plain build stays lean), which means

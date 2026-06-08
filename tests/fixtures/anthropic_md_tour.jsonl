@@ -1,0 +1,99 @@
+{"t_ms":0,"delta":"# A Brief"}
+{"t_ms":332,"delta":" Tour of CommonMark for Terminal Renderers\n\nCommonMark represents the culmination of decades of markdown evolution—a precise specification that transforms"}
+{"t_ms":781,"delta":" the chaotic wilderness of markdown flavors into something implementable. For"}
+{"t_ms":1246,"delta":" terminal renderer authors, it's both a gift and a challenge: the spec is exhaust"}
+{"t_ms":1716,"delta":"ive, but terminals aren't browsers.\n\n## The Core Building Blocks\n\nAt its heart"}
+{"t_ms":2230,"delta":", CommonMark defines twelve block-level constructs and a handful of inline"}
+{"t_ms":2694,"delta":" ones. The block types cascade through a precedence ladder:"}
+{"t_ms":3150,"delta":" thematic breaks trump paragraph boundaries, ATX headings parse"}
+{"t_ms":3589,"delta":" before setext alternatives, and fenced code blocks close greedily on"}
+{"t_ms":4177,"delta":" their fence string. Inline parsing happens *after* block structure settles—a critical"}
+{"t_ms":4526,"delta":" detail that keeps parsers sane.\n\nThe scanning phase builds a"}
+{"t_ms":4995,"delta":" tree of containers (block quotes, lists, code blocks) using a technique"}
+{"t_ms":5463,"delta":" called *continuation lines*. Each line either extends"}
+{"t_ms":5933,"delta":" the current container, closes it, or opens a new sibling. The algorithm is"}
+{"t_ms":6493,"delta":" deterministic: given the same input, every compliant parser must produce identical structure"}
+{"t_ms":6897,"delta":". Here's what a minimal block scanner might look like in"}
+{"t_ms":7349,"delta":" C++:\n\n```cpp\nstruct Block {\n    BlockType type;\n    std::vector<Block*> children;\n    std::string literal"}
+{"t_ms":7820,"delta":";  // for leafs (paragraph, code)\n    int indent"}
+{"t_ms":8350,"delta":"_level;\n};\n\nBlock* parse_blocks(std::string_view input) {\n    auto root"}
+{"t_ms":8825,"delta":" = new Block{BlockType::Document};\n    Block* tip = root;\n    \n    for (auto line : split_lines(input)) {\n        int"}
+{"t_ms":9297,"delta":" consumed = 0;\n        while (tip != root && !continues(tip, line,"}
+{"t_ms":9781,"delta":" consumed)) {\n            tip = tip->parent;\n        }\n        if (auto opener = try_open"}
+{"t_ms":10241,"delta":"_block(line, consumed)) {\n            tip->children.push_back(opener);\n            tip = opener;\n        }\n    }\n    return"}
+{"t_ms":10714,"delta":" root;\n}\n```\n\nList parsing deserves special mention. A list item begins with a marker (`"}
+{"t_ms":11241,"delta":"-`, `+`, `*` for unordered; `1.` or `1)"}
+{"t_ms":11695,"delta":"` for ordered) followed by 1-4 spaces. Content aligns to the column"}
+{"t_ms":12151,"delta":" *after* the marker plus those spaces—not the marker itself. Nested lists must outd"}
+{"t_ms":12675,"delta":"ent to the parent's content column. The spec's examples 264"}
+{"t_ms":13090,"delta":"-298 cover edge cases that break most naive parsers:\n\n-"}
+{"t_ms":13535,"delta":" Empty list items are valid\n- Lazy continuation lines (undented"}
+{"t_ms":14006,"delta":" paragraphs in a list item) work, but only for"}
+{"t_ms":14486,"delta":" paragraphs\n- Changing the marker mid-list starts a fresh list"}
+{"t_ms":15019,"delta":"\n- Tight vs. loose lists depend on blank lines between items\n\n## Inline Parsing: Where"}
+{"t_ms":15565,"delta":" Ambiguity Lives\n\nOnce blocks settle, inline parsing runs on leaf content. This"}
+{"t_ms":16096,"delta":" phase handles emphasis (`*` and `_`), links, code spans, and raw"}
+{"t_ms":16450,"delta":" HTML. The emphasis algorithm is notoriously subtle—**bold** and"}
+{"t_ms":16908,"delta":" *italic* can nest, but the spec's delimiter run rules prevent naive left"}
+{"t_ms":17356,"delta":"-to-right matching from producing wrong trees.\n\nCode spans deserve"}
+{"t_ms":17852,"delta":" their own paragraph. They're delimited by backtick runs:"}
+{"t_ms":18303,"delta":" `` `code` `` for simple cases, but ``` "}
+{"t_ms":18767,"delta":"`` `literal backtick` `` ``` when you need a"}
+{"t_ms":19237,"delta":" backtick inside. The opening and closing runs must match in length,"}
+{"t_ms":19708,"delta":" and interior content is taken literally—no escapes, no n"}
+{"t_ms":20224,"delta":"esting. The `trim_one_space_each_"}
+{"t_ms":20646,"delta":"side` rule removes a single leading and trailing space when both ends"}
+{"t_ms":21117,"delta":" have them, enabling `` ` code `"}
+{"t_ms":21825,"delta":" `` to render as ` code `.\n\nAutolinks (`<https://example"}
+{"t_ms":22194,"delta":".com>`) and raw HTML (`<em>raw</em>`) share angle-bracket syntax"}
+{"t_ms":25363,"delta":" but parse differently. An autolink must be a valid URI"}
+{"t_ms":25380,"delta":" or email address; anything else is treated as raw HTML. Terminal renderers typically strip HTML or replace it with a placeholder—"}
+{"t_ms":25410,"delta":"there's no DOM to inject into.\n\n> Rendering emphasis"}
+{"t_ms":25423,"delta":" and strong emphasis in a terminal is straightforward: ANSI SG"}
+{"t_ms":25444,"delta":"R codes map cleanly to bold (SGR 1) and italic (SGR 3)."}
+{"t_ms":25461,"delta":" The real challenge is *nested* emphasis—tracking the SGR stack"}
+{"t_ms":25547,"delta":" so that closing a `**bold**` inside an `*italic*` region"}
+{"t_ms":25974,"delta":" correctly restores italic-only state. Many terminal renderers get"}
+{"t_ms":26440,"delta":" this wrong and emit SGR 0 (reset all),"}
+{"t_ms":26904,"delta":" breaking the outer emphasis.\n\n## Tables: The Unofficial Extension\n\nTables aren't part of the core Common"}
+{"t_ms":27420,"delta":"Mark spec—they're a GitHub Flavored Markdown (GFM) extension. But they're so ub"}
+{"t_ms":27881,"delta":"iquitous that most renderers support them anyway. The syntax is deceptively simple: pipe-delimited cells with a header"}
+{"t_ms":28353,"delta":" separator row. Here's a comparison of delimiter styles:\n\n| Syntax"}
+{"t_ms":28891,"delta":"         | Opening Fence | Closing Fence | Escape Sequences |\n|----------------|---------------|---------------|------------------|\n|"}
+{"t_ms":29571,"delta":" Fenced code    | ``` or ~~~    | Matching run  "}
+{"t_ms":29871,"delta":"| None (literal)   |\n| Inline code    | ` run         |"}
+{"t_ms":30298,"delta":" Matching run  | None (literal)   |\n| HTML blocks    | `<tag>`       | `</tag>`      | Entity refs"}
+{"t_ms":30767,"delta":"      |\n| Autolinks      | `<`           | `>`           | None             |\n| Emphasis       | `*`"}
+{"t_ms":31241,"delta":" or `_`    | Matching run  | Backslash `\\`    |\n\nThe separator row (second"}
+{"t_ms":31708,"delta":" row) must contain only hyphens, pipes, colons, and whit"}
+{"t_ms":32182,"delta":"espace. Colons control alignment: `:---` for left, `:---:` for center,"}
+{"t_ms":32650,"delta":" `---:` for right. Cells can span multiple visual columns, but terminals don't support true"}
+{"t_ms":33121,"delta":" colspan—you just pad with spaces or truncate.\n\nColumn"}
+{"t_ms":33669,"delta":" width calculation is terminal-specific. A fixed-width font"}
+{"t_ms":34061,"delta":" simplifies things: measure each cell's content width in code"}
+{"t_ms":34591,"delta":" points (accounting for double-width CJK), then distribute available"}
+{"t_ms":35001,"delta":" terminal columns proportionally. Overflow handling varies:"}
+{"t_ms":35472,"delta":" some renderers truncate with ellipsis, others wrap within the cell, and a"}
+{"t_ms":35943,"delta":" few just let content bleed into adjacent columns.\n\n## Rendering"}
+{"t_ms":36416,"delta":" to the Terminal\n\nThe final step is walking the parsed tree and emitting ANSI sequences. Each block type maps"}
+{"t_ms":36883,"delta":" to layout decisions: headings get vertical spacing and maybe"}
+{"t_ms":37356,"delta":" an underline (SGR 4), block quotes get a left margin with"}
+{"t_ms":37834,"delta":" a vertical bar, code blocks get a background color. Inline spans trigger"}
+{"t_ms":38300,"delta":" SGR sequences mid-paragraph.\n\nThe trickiest part is **width"}
+{"t_ms":38817,"delta":" calculation**. Terminals measure in *columns*, which aren't the same as Unicode"}
+{"t_ms":39295,"delta":" code points or grapheme clusters. An emoji (🎉) occupies two columns. Combining"}
+{"t_ms":39765,"delta":" diacritics occupy zero. East Asian fullwidth characters occupy"}
+{"t_ms":40303,"delta":" two. The `wcwidth()` function from POSIX helps"}
+{"t_ms":40795,"delta":", but it's locale-dependent and doesn't cover every edge case. Modern"}
+{"t_ms":41236,"delta":" renderers often use a precompiled Unicode width table.\n\nWord wrapping must"}
+{"t_ms":41706,"delta":" account for ANSI escape sequences—they're invisible but consume bytes. A"}
+{"t_ms":42183,"delta":" naive `strlen()` will count `\\x1b[1"}
+{"t_ms":42647,"delta":"m` (5 bytes for bold) as 5 columns, breaking"}
+{"t_ms":43123,"delta":" alignment. The solution is a two-pass render: first measure *"}
+{"t_ms":43696,"delta":"visible* width, then emit with escapes. Alternatively, track SG"}
+{"t_ms":44074,"delta":"R state and subtract escape sequence byte counts from the column budget"}
+{"t_ms":44545,"delta":".\n\nIn the end, a CommonMark-to-terminal renderer is a study in **precision"}
+{"t_ms":44999,"delta":"** and *compromise*: precision in parsing (the"}
+{"t_ms":45500,"delta":" spec is unambiguous), compromise in rendering (terminals lack the layout engine of a"}
+{"t_ms":45940,"delta":" browser). Done well, it transforms plain text into richly structured,"}
+{"t_ms":46325,"delta":" *readable* output—without ever leaving the shell."}
