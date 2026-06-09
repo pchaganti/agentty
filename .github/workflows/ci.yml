@@ -52,12 +52,9 @@ jobs:
             -DAGENTTY_BUILD_TESTS=ON
 
       - name: Build
-        run: cmake --build build -j"$(nproc)"
-
-      - name: Build tests
-        # Test binaries are EXCLUDE_FROM_ALL; the `tests` aggregate target
-        # pulls them all in so ctest has something to run.
-        run: cmake --build build -j"$(nproc)" --target tests
+        # Build the main binary AND the test aggregate (EXCLUDE_FROM_ALL)
+        # in one ninja invocation so ctest has something to run.
+        run: cmake --build build -j"$(nproc)" --target all tests
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
