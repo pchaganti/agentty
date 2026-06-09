@@ -28,6 +28,7 @@
 #include "agentty/runtime/view/helpers.hpp"
 #include "agentty/tool/policy.hpp"
 #include "agentty/tool/registry.hpp"
+#include "agentty/tool/skills.hpp"
 #include "agentty/tool/spec.hpp"
 #include "agentty/tool/tool.hpp"
 
@@ -332,6 +333,10 @@ a::InitializeResult AgentServer::on_initialize(const a::InitializeParams& p) {
 
 a::NewSessionResult AgentServer::on_new_session(const a::NewSessionParams& p) {
     std::lock_guard<std::mutex> lk(session_mtx_);
+    // Skill activations belong to the previous session's context. The
+    // tracker is process-wide, so this is best-effort under concurrent
+    // sessions — worst case a re-activation re-injects (token cost only).
+    tools::skills::reset_activations();
     ThreadId tid = persistence::new_id();
     std::string sid = tid.value;
     Session s;
@@ -355,6 +360,8 @@ void AgentServer::on_load_session(const a::LoadSessionParams& p) {
     std::string sid = p.sessionId.value;
     std::string cwd = p.cwd;
     if (sid.empty()) throw std::runtime_error("session/load: missing sessionId");
+    // Loaded session = different context; allow skills to re-activate.
+    tools::skills::reset_activations();
 
     Thread thread;
     bool   from_memory = false;

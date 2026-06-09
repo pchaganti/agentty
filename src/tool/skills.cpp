@@ -332,6 +332,9 @@ std::string activation_payload(const Skill& s) {
         out << "Compatibility: " << s.compatibility << "\n\n";
     if (!s.license.empty())
         out << "License: " << s.license << "\n\n";
+    if (!s.allowed_tools.empty())
+        out << "Allowed tools: " << s.allowed_tools
+            << " \u2014 prefer these tools while following this skill.\n\n";
     out << s.body << "\n";
     if (!s.dir.empty()) {
         out << "\nSkill directory: " << s.dir.string() << "\n"
