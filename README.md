@@ -228,10 +228,21 @@ The `.agents/` convention means skills installed by any compliant client are
 visible to agentty and vice versa; `.claude/` compatibility means your
 existing Claude Code skills work unchanged. Project skills shadow user skills
 with the same name. Frontmatter supports the full spec surface —
-`compatibility`, `allowed-tools`, `metadata`, and `disable-model-invocation`
-(hidden from the model, loadable on request). Parsing is lenient per the
+`compatibility`, `allowed-tools`, `license`, `metadata`, and
+`disable-model-invocation` (hidden from the model, loadable on request) —
+including YAML block scalars (`description: >-`). Parsing is lenient per the
 spec's interop guidance: unquoted colons, name/dir mismatches, and missing
 frontmatter all still load.
+
+Activate explicitly with a slash command — `/skill-name fix the parser` — and
+the harness splices the instructions in without waiting for the model to
+decide. Validate your skills the way `skills-ref validate` would, with no
+extra tooling:
+
+```bash
+agentty skills      # list every discovered skill + spec-lint diagnostics
+                    # exit 1 on warnings — drop it straight into CI
+```
 
 Why this matters: on a codebase or internal DSL no model has ever seen,
 agent accuracy starts below 20% — with curated skills (grammar sheets, golden

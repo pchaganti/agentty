@@ -117,14 +117,38 @@ int main() {
         "description: has every optional field\n"
         "compatibility: Requires python3\n"
         "allowed-tools: bash read\n"
+        "license: Apache-2.0\n"
+        "metadata:\n"
+        "  author: example-org\n"
+        "  version: \"1.0\"\n"
         "---\nMETA BODY\n");
     write_file_at(work / ".agentty/skills/hidden/SKILL.md",
         "---\nname: hidden\ndescription: user-explicit only\n"
         "disable-model-invocation: true\n---\nHIDDEN BODY\n");
+    // Block-scalar description (folded `>-`), the Claude Code-ism.
+    write_file_at(work / ".agentty/skills/folded/SKILL.md",
+        "---\n"
+        "name: folded\n"
+        "description: >-\n"
+        "  First folded line\n"
+        "  second folded line\n"
+        "---\nFOLD BODY\n");
     {
         const auto* f = skills::find("full-meta");
         CHECK(f && f->compatibility == "Requires python3");
         CHECK(f && f->allowed_tools == "bash read");
+        CHECK(f && f->license == "Apache-2.0");
+        CHECK(f && f->metadata.size() == 2);
+        if (f && f->metadata.size() == 2) {
+            CHECK(f->metadata[0].first == "author"
+                  && f->metadata[0].second == "example-org");
+            CHECK(f->metadata[1].first == "version"
+                  && f->metadata[1].second == "1.0");
+        }
+        const auto* fo = skills::find("folded");
+        CHECK(fo && fo->description ==
+              "First folded line second folded line");
+        CHECK(fo && fo->body == "FOLD BODY");
         // hidden: findable explicitly, absent from the catalog.
         const auto* h = skills::find("hidden");
         CHECK(h && h->user_only);
@@ -160,7 +184,7 @@ int main() {
         }
     }
 
-    // ── Stage 5: activation dedup + reset ────────────────────────────
+    // ── Stage 5: activation dedup + reset ────────────────────────
     {
         skills::reset_activations();
         CHECK(skills::note_activated("alpha") == true);    // first load
@@ -168,6 +192,26 @@ int main() {
         CHECK(skills::note_activated("beta") == true);     // independent
         skills::reset_activations();                       // thread swap
         CHECK(skills::note_activated("alpha") == true);    // loadable again
+    }
+
+    // ── Stage 5b: spec lint ───────────────────────────────────
+    {
+        // Clean skill → no diagnostics.
+        const auto* f = skills::find("full-meta");
+        CHECK(f && skills::lint(*f).empty());
+        // Violations → diagnostics fire (loading stayed lenient).
+        skills::Skill bad;
+        bad.name = "Bad--Name-";
+        bad.description = "";
+        auto diags = skills::lint(bad);
+        CHECK(diags.size() >= 3);   // charset + double hyphen + edge + desc
+        // name/dir mismatch caught.
+        const auto* mm = skills::find("othername");
+        bool has_mismatch = false;
+        if (mm) for (const auto& d : skills::lint(*mm))
+            if (d.find("does not match parent directory") != std::string::npos)
+                has_mismatch = true;
+        CHECK(has_mismatch);
     }
 
     // ── Stage 6: read-allowlist gate ─────────────────────────────────

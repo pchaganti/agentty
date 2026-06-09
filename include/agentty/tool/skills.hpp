@@ -58,9 +58,13 @@ struct Skill {
     std::string source;        // "project" | "user" (provenance for the catalog)
     std::string compatibility; // frontmatter `compatibility` (env requirements)
     std::string allowed_tools; // frontmatter `allowed-tools` (experimental)
+    std::string license;       // frontmatter `license`
     bool        user_only = false; // `disable-model-invocation`: hidden from the
                                    // model-facing catalog, loadable explicitly
     std::filesystem::path dir; // absolute skill directory (tier-3 base path)
+    // Frontmatter `metadata:` nested mapping, flattened to key/value
+    // pairs in file order. Spec: arbitrary client-defined properties.
+    std::vector<std::pair<std::string, std::string>> metadata;
     // Bundled resource files, relative to `dir` (e.g. "scripts/run.py",
     // "references/REFERENCE.md"). Enumerated at discovery, capped at
     // kMaxResources, never eagerly read. SKILL.md itself is excluded.
@@ -106,6 +110,22 @@ struct Skill {
 // thread / session load, where the old tool_results leave context.
 [[nodiscard]] bool note_activated(std::string_view name);
 void reset_activations();
+
+// ── Spec validation (the spec's `skills-ref validate` equivalent) ────
+// Lint one skill against the agentskills.io constraints. Loading stays
+// LENIENT (warn-don't-block, per the client-implementation guidance);
+// this surface is for authors: `agentty skills` prints every discovered
+// skill with its diagnostics. Checks: name charset (lowercase alnum +
+// single hyphens, no edge hyphens), name ≤ 64 chars, name matches the
+// parent directory, description present and ≤ 1024 chars, body ≤ 500
+// lines (spec recommendation — move detail to references/).
+[[nodiscard]] std::vector<std::string> lint(const Skill& s);
+
+// CLI entry: list every discovered skill (scope, dir, resource count)
+// with lint diagnostics. Returns 0 when every skill is clean, 1 when
+// any diagnostic fired — usable in CI exactly like `skills-ref
+// validate`, with zero extra tooling.
+int cmd_skills();
 
 inline constexpr std::size_t kMaxSkills     = 64;
 inline constexpr std::size_t kMaxBodyBytes  = 64 * 1024;

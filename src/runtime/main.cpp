@@ -48,6 +48,7 @@
 #include "agentty/auth/auth.hpp"
 #include "agentty/io/persistence.hpp"
 #include "agentty/provider/anthropic/provider.hpp"
+#include "agentty/tool/skills.hpp"
 #include "agentty/tool/util/fs_helpers.hpp"
 #include "agentty/tool/util/sandbox.hpp"
 #include "agentty/tool/subagent.hpp"
@@ -80,6 +81,8 @@ void print_usage() {
         "  airgap            Launch agentty on an air-gapped host via SSH tunnel\n"
         "                    (`agentty airgap --help` for details)\n"
         "  acp               Run as an ACP agent over stdio (for Zed et al.)\n"
+        "  skills            List discovered skills with spec-lint diagnostics\n"
+        "                    (exit 1 on warnings — CI-friendly validate)\n"
         "  version           Print the agentty version and exit\n"
         "  help              Show this message\n"
         "\n"
@@ -121,7 +124,7 @@ Args parse_args(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "login" || a == "logout" || a == "status" || a == "help"
-         || a == "acp") {
+         || a == "acp" || a == "skills") {
             out.subcommand = std::move(a);
         } else if (a == "airgap") {
             // Hand the remaining argv tail to the airgap subcommand verbatim
@@ -199,6 +202,7 @@ int main(int argc, char** argv) {
     if (args.subcommand == "login")  return auth::cmd_login();
     if (args.subcommand == "logout") return auth::cmd_logout();
     if (args.subcommand == "status") return auth::cmd_status();
+    if (args.subcommand == "skills") return tools::skills::cmd_skills();
     if (args.subcommand == "airgap")
         return airgap::cmd_airgap(args.airgap_argc, args.airgap_argv);
 

@@ -6,6 +6,7 @@
 #include "agentty/tool/util/fs_helpers.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -72,10 +73,23 @@ namespace {
     return v == "true" || v == "1" || v == "yes";
 }
 
+// Leading-space count (frontmatter nesting depth detector).
+[[nodiscard]] std::size_t indent_of(const std::string& line) noexcept {
+    std::size_t i = 0;
+    while (i < line.size() && line[i] == ' ') ++i;
+    return i;
+}
+
 // Split a SKILL.md into frontmatter fields + body. Frontmatter is the
 // block between the first two `---` lines. `slug` is the directory
 // name, used as the name fallback (lenient: a name/dir mismatch loads
 // anyway, with the frontmatter name winning).
+//
+// The mini-parser covers the YAML subset real skills use:
+//   • scalar `key: value` (first-colon split — unquoted colons fine)
+//   • block scalars `key: |` / `key: >` (folded/literal multi-line
+//     descriptions — common in Claude Code-authored skills)
+//   • one-level nested mapping under `metadata:`
 [[nodiscard]] Skill parse_skill(const std::string& raw, const std::string& slug,
                                 const std::string& source) {
     Skill s;
@@ -88,16 +102,60 @@ namespace {
     bool fm_done = false;
     std::string first;
     if (std::getline(in, first) && trim(first) == "---") {
+        bool in_metadata = false;          // inside the `metadata:` nested map
+        std::string* block_target = nullptr;  // collecting a block scalar into
+        bool block_fold = false;           // `>` folds newlines to spaces
+        bool block_first = true;
         while (std::getline(in, line)) {
             if (trim(line) == "---") { fm_done = true; body_start = in.tellg(); break; }
+
+            const std::size_t ind = indent_of(line);
+
+            // Continuation lines of an active block scalar: any indented
+            // non-empty line. A top-level (unindented) line ends it.
+            if (block_target) {
+                if (ind > 0 || trim(line).empty()) {
+                    auto t = trim(line);
+                    if (!t.empty()) {
+                        if (!block_first) *block_target += block_fold ? " " : "\n";
+                        *block_target += t;
+                        block_first = false;
+                    }
+                    continue;
+                }
+                block_target = nullptr;   // fall through: parse this line
+            }
+
+            // Nested lines under `metadata:`.
+            if (in_metadata && ind > 0) {
+                std::string k, v;
+                if (parse_kv(line, k, v)) s.metadata.emplace_back(k, v);
+                continue;
+            }
+            in_metadata = false;
+
             std::string k, v;
-            if (parse_kv(line, k, v)) {
-                if (k == "name" && !v.empty())             s.name = v;
-                else if (k == "description")               s.description = v;
-                else if (k == "compatibility")             s.compatibility = v;
-                else if (k == "allowed-tools")             s.allowed_tools = v;
-                else if (k == "disable-model-invocation")  s.user_only = is_truthy(v);
-                // `license` / `metadata` / unknown keys: tolerated, unused.
+            if (!parse_kv(line, k, v)) continue;
+            if (k == "metadata" && v.empty()) { in_metadata = true; continue; }
+
+            // Block-scalar opener: `description: |` / `description: >-` etc.
+            std::string* field = nullptr;
+            if      (k == "name")                      { if (!v.empty()) s.name = v; continue; }
+            else if (k == "description")               field = &s.description;
+            else if (k == "compatibility")             field = &s.compatibility;
+            else if (k == "allowed-tools")             field = &s.allowed_tools;
+            else if (k == "license")                   field = &s.license;
+            else if (k == "disable-model-invocation")  { s.user_only = is_truthy(v); continue; }
+            else continue;   // unknown keys: tolerated, unused
+
+            if (v == "|" || v == "|-" || v == "|+" ||
+                v == ">" || v == ">-" || v == ">+") {
+                block_target = field;
+                block_fold   = (v[0] == '>');
+                block_first  = true;
+                field->clear();
+            } else {
+                *field = v;
             }
         }
     }
@@ -272,6 +330,8 @@ std::string activation_payload(const Skill& s) {
     if (!s.description.empty()) out << s.description << "\n\n";
     if (!s.compatibility.empty())
         out << "Compatibility: " << s.compatibility << "\n\n";
+    if (!s.license.empty())
+        out << "License: " << s.license << "\n\n";
     out << s.body << "\n";
     if (!s.dir.empty()) {
         out << "\nSkill directory: " << s.dir.string() << "\n"
@@ -314,6 +374,70 @@ void reset_activations() {
     auto& a = activations();
     std::lock_guard lk(a.mu);
     a.names.clear();
+}
+
+std::vector<std::string> lint(const Skill& s) {
+    std::vector<std::string> out;
+    // name: 1-64 chars, lowercase alnum + hyphens, no edge/double hyphens.
+    if (s.name.empty()) out.push_back("name is empty");
+    if (s.name.size() > 64) out.push_back("name exceeds 64 characters");
+    bool bad_char = false, prev_hyphen = false, dbl = false;
+    for (char c : s.name) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
+        if (!ok) bad_char = true;
+        if (c == '-' && prev_hyphen) dbl = true;
+        prev_hyphen = (c == '-');
+    }
+    if (bad_char)
+        out.push_back("name has invalid characters (allowed: a-z, 0-9, hyphen)");
+    if (!s.name.empty() && (s.name.front() == '-' || s.name.back() == '-'))
+        out.push_back("name must not start or end with a hyphen");
+    if (dbl) out.push_back("name contains consecutive hyphens");
+    if (!s.dir.empty() && s.dir.filename().string() != s.name)
+        out.push_back("name does not match parent directory '"
+                      + s.dir.filename().string() + "'");
+    // description: required, ≤ 1024.
+    if (s.description.empty()) out.push_back("description is missing");
+    if (s.description.size() > 1024)
+        out.push_back("description exceeds 1024 characters");
+    // compatibility: ≤ 500 when present.
+    if (s.compatibility.size() > 500)
+        out.push_back("compatibility exceeds 500 characters");
+    // body: spec recommends ≤ 500 lines (move detail to references/).
+    std::size_t lines = 1 + static_cast<std::size_t>(
+        std::count(s.body.begin(), s.body.end(), '\n'));
+    if (lines > 500)
+        out.push_back("body is " + std::to_string(lines)
+                      + " lines (spec recommends ≤ 500 — move detail to "
+                        "references/)");
+    return out;
+}
+
+int cmd_skills() {
+    const auto& sk = all();
+    if (sk.empty()) {
+        std::printf("no skills installed.\n"
+                    "add one: <project>/.agentty/skills/<name>/SKILL.md "
+                    "(or ~/.agentty/skills/, .agents/, .claude/)\n");
+        return 0;
+    }
+    int dirty = 0;
+    for (const auto& s : sk) {
+        std::printf("%-28s %-8s %s\n", s.name.c_str(), s.source.c_str(),
+                    s.dir.string().c_str());
+        if (!s.description.empty())
+            std::printf("    %s\n", s.description.c_str());
+        if (!s.resources.empty())
+            std::printf("    resources: %zu file(s)\n", s.resources.size());
+        if (s.user_only)
+            std::printf("    [disable-model-invocation — hidden from catalog]\n");
+        for (const auto& d : lint(s)) {
+            std::printf("    warn: %s\n", d.c_str());
+            ++dirty;
+        }
+    }
+    std::printf("%zu skill(s), %d warning(s)\n", sk.size(), dirty);
+    return dirty ? 1 : 0;
 }
 
 } // namespace agentty::tools::skills

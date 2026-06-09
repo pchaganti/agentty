@@ -14,6 +14,7 @@
 #include "agentty/runtime/app/deps.hpp"
 #include "agentty/runtime/composer_attachment.hpp"
 #include "agentty/store/store.hpp"
+#include "agentty/tool/skills.hpp"
 
 namespace agentty::app::detail {
 
@@ -159,6 +160,37 @@ Step submit_message(Model m) {
     }
     user.text        = std::move(drained.text);
     user.attachments = std::move(drained.attachments);
+
+    // ── User-explicit skill activation (spec: slash-command syntax) ──
+    // `/skill-name [rest of prompt]` — the harness intercepts the token,
+    // splices the skill's full activation payload into the message, and
+    // marks it active (so a later model-driven `skill` call dedups).
+    // The model receives the instructions without having to take an
+    // activation action itself. Only the FIRST token is considered, and
+    // only when it exactly matches a discovered skill — `/compact` and
+    // friends fall through to their existing handlers untouched.
+    if (!user.text.empty() && user.text.front() == '/') {
+        auto sp  = user.text.find_first_of(" \t\n");
+        auto tok = user.text.substr(1, sp == std::string::npos
+                                           ? std::string::npos : sp - 1);
+        if (const auto* sk = tools::skills::find(tok)) {
+            std::string rest = sp == std::string::npos
+                ? std::string{}
+                : std::string{user.text.substr(sp + 1)};
+            std::string expanded;
+            if (tools::skills::note_activated(sk->name)) {
+                expanded  = tools::skills::activation_payload(*sk);
+                expanded += "\n\nFollow the skill instructions above";
+                expanded += rest.empty() ? "." : " for this task: " + rest;
+            } else {
+                // Already active this session — don't re-inject the body.
+                expanded = "Apply the already-loaded '" + sk->name
+                         + "' skill" + (rest.empty() ? "." : ": " + rest);
+            }
+            user.text = std::move(expanded);
+        }
+    }
+
     if (m.d.current.title.empty()) {
         // Title generation should see human-readable text, not raw
         // chip placeholders. Build a plain-text view of the user's
