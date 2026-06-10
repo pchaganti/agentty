@@ -1709,6 +1709,29 @@ static void test_model_picker_open_close_no_scrollback_growth() {
 
     // Welcome (base).
     render_state(m);
+    // THE fix invariant (view.cpp overlay_layer): opening a picker must
+    // NEVER grow the frame. The overlay is bottom-inset 2 rows so its
+    // painted extent stays at/above the base's painted extent; without
+    // the inset the overlay's bg fill painted the base box's 2
+    // structurally-unpainted bottom rows (+2 on open, -2 on close),
+    // pushing the wordmark into native scrollback once per cycle.
+    {
+        Canvas closed_c = paint(view_root(m), kWidth, pool);
+        const int closed_rows = closed_c.max_content_row();
+        m.ui.model_picker = ui::pick::OpenAt{0};
+        Canvas open_c = paint(view_root(m), kWidth, pool);
+        m.ui.model_picker = ui::pick::Closed{};
+        const int open_rows = open_c.max_content_row();
+        if (open_rows > closed_rows) {
+            std::fprintf(stderr,
+                "  PICKER frame grew on open: closed=%d open=%d\n",
+                closed_rows + 1, open_rows + 1);
+        }
+        CHECK(open_rows <= closed_rows,
+              "opening the model picker grew the frame past the closed "
+              "welcome height \u2014 rows would cross the viewport boundary "
+              "into native scrollback (the growing-wordmark bug)");
+    }
     // Several open→close cycles — the accumulation the user reported.
     // Render multiple animation frames per state so the welcome
     // wordmark's per-frame bob and the picker animation advance.
