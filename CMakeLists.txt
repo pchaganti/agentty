@@ -1057,6 +1057,47 @@ if(AGENTTY_BUILD_TESTS)
     endif()
     add_test(NAME midrun_wire_test COMMAND midrun_wire_test)
 
+    # stream_liveness_test — UX-critical caret-liveness regression. The
+    # live-edge typewriter caret must stay armed (request_animation_frame
+    # every build) for the WHOLE time phase==Streaming — even across a
+    # 10 s inter-delta gap — and must disarm after settle + finalize
+    # ramp. Locks the phase-authoritative RAF gate in turn.cpp
+    # (commit a9760e7); a fixed byte-recency timeout would fail it.
+    add_executable(stream_liveness_test EXCLUDE_FROM_ALL
+        tests/stream_liveness_test.cpp
+        ${AGENTTY_IO_SOURCES}
+        ${AGENTTY_WORKSPACE_SOURCES}
+        ${AGENTTY_AIRGAP_SOURCES}
+        ${AGENTTY_PROVIDER_SOURCES}
+        ${AGENTTY_DIFF_SOURCES}
+        ${AGENTTY_TOOL_SOURCES}
+        ${AGENTTY_RUNTIME_NOMAIN_SOURCES}
+    )
+    target_include_directories(stream_liveness_test PRIVATE include)
+    target_compile_definitions(stream_liveness_test PRIVATE
+        AGENTTY_VERSION="${PROJECT_VERSION}")
+    target_link_libraries(stream_liveness_test PRIVATE
+        maya::maya
+        nlohmann_json::nlohmann_json
+        simdjson::simdjson
+        nghttp2::nghttp2
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(stream_liveness_test PRIVATE
+            ws2_32 crypt32 shell32 winmm
+            user32 gdi32 gdiplus shlwapi)
+    endif()
+    if(APPLE)
+        target_link_libraries(stream_liveness_test PRIVATE
+            "-framework Security"
+            "-framework CoreFoundation")
+    endif()
+    add_test(NAME stream_liveness_test COMMAND stream_liveness_test)
+    set_tests_properties(stream_liveness_test PROPERTIES TIMEOUT 30)
+
     # table_render_test — pins maya's GFM table classification: a
     # well-formed table (header line starts at '|', blank line before)
     # is a Table block; a malformed one with lead-in prose on the header
@@ -1280,6 +1321,7 @@ if(AGENTTY_BUILD_TESTS)
         midrun_freeze_test
         midrun_seam_test
         midrun_wire_test
+        stream_liveness_test
         table_render_test
         visual_hash_coverage_test
         tool_result_budget_test
