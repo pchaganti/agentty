@@ -48,6 +48,8 @@
 #include "agentty/auth/auth.hpp"
 #include "agentty/io/persistence.hpp"
 #include "agentty/provider/anthropic/provider.hpp"
+#include "agentty/provider/openai/provider.hpp"
+#include "agentty/provider/selection.hpp"
 #include "agentty/tool/skills.hpp"
 #include "agentty/tool/util/fs_helpers.hpp"
 #include "agentty/tool/util/sandbox.hpp"
@@ -101,6 +103,13 @@ void print_usage() {
         "                             ask     (default: prompt write/exec/net),\n"
         "                             minimal (also prompt reads),\n"
         "                             write   (never prompt reads).\n"
+        "      --provider P    LLM backend. anthropic (default, OAuth/Pro/Max)\n"
+        "                      or an OpenAI-compatible one: openai | groq |\n"
+        "                      openrouter | together | cerebras | ollama, or a\n"
+        "                      raw host[:port]. Reads OPENAI_API_KEY (or the\n"
+        "                      provider-specific *_API_KEY) / -k for the key;\n"
+        "                      ollama needs no key. Persisted like -m.\n"
+        "                      (Switch live in-app with Ctrl-P or palette.)\n"
         "  -V, --version       Print the agentty version and exit.\n"
         "  -h, --help          Show this message.\n"
         "\n",
@@ -114,6 +123,7 @@ struct Args {
     std::string cli_workspace;
     std::string cli_sandbox;   // "auto" | "on" | "off"; empty = auto default
     std::string cli_profile;   // "write" | "ask" | "minimal"; ACP only
+    std::string cli_provider;  // "anthropic" | "openai" | "groq" | "ollama" | host[:port]
     int         airgap_argc = 0;
     char**      airgap_argv = nullptr;   // borrowed from main's argv
     bool        bad = false;
@@ -144,6 +154,8 @@ Args parse_args(int argc, char** argv) {
             out.cli_sandbox = argv[++i];
         } else if ((a == "-p" || a == "--profile") && i + 1 < argc) {
             out.cli_profile = argv[++i];
+        } else if (a == "--provider" && i + 1 < argc) {
+            out.cli_provider = argv[++i];
         } else if (a == "-h" || a == "--help") {
             out.subcommand = "help";
         } else if (a == "-V" || a == "--version" || a == "version") {
@@ -276,10 +288,69 @@ int main(int argc, char** argv) {
                      tools::util::sandbox::describe_state().c_str());
     }
 
+    // ── Resolve the active provider ─────────────────────────────────────
+    // --provider wins; otherwise the saved setting; otherwise Anthropic.
+    // "anthropic" (default) keeps the OAuth/Pro/Max path. Any other value
+    // ("openai" | "groq" | "openrouter" | "ollama" | "host[:port]") routes
+    // through the OpenAI-compatible transport.
+    std::string provider_spec = args.cli_provider;
+    if (provider_spec.empty()) {
+        auto s = persistence::load_settings();
+        provider_spec = s.provider;          // empty → anthropic
+    } else if (args.subcommand != "acp") {
+        // Persist the --provider choice (except in ACP mode, where it's an
+        // ephemeral per-subprocess override like -m).
+        auto s = persistence::load_settings();
+        s.provider = provider_spec;
+        persistence::save_settings(s);
+    }
+    auto selection = provider::parse_selection(provider_spec);
+    provider::select(selection);
+
+    // Auth header per provider, registry-driven. Anthropic uses the
+    // OAuth/key creds resolved above; OpenAI-family backends read their
+    // provider-specific env var (GROQ_API_KEY, …) then OPENAI_API_KEY, or
+    // -k; local backends (Ollama) accept an empty key. See
+    // provider::resolve_auth_for — the single place that knows this mapping.
+    auth::AuthHeader anthropic_creds = auth::make_auth_header(creds);
+    auth::AuthHeader provider_auth =
+        provider::resolve_auth_for(provider_spec, anthropic_creds, args.cli_key);
+
     // ── Wire the Provider + Store seams ─────────────────────────────────
-    provider::anthropic::AnthropicProvider provider;
+    // Both providers live on main's stack so whichever the install lambda
+    // captures by reference outlives maya::run / the ACP serve loop.
+    provider::anthropic::AnthropicProvider anthropic_provider;
     io::FsStore                            store;
-    app::install(provider, store, auth::make_auth_header(creds));
+
+    // The seam: a single std::function the runtime calls. It dispatches on
+    // provider::active() AT CALL TIME (not on a frozen branch), so the
+    // provider picker can live-switch the backend mid-session
+    // (provider::select() + app::switch_provider()) and the very next
+    // request targets the new provider — no seam rebuild, no restart. For an
+    // OpenAI-family switch we rebuild the per-call endpoint from the active
+    // selection so a host/path/tls change takes effect immediately.
+    std::function<void(provider::Request, provider::EventSink)> stream_fn =
+        [&anthropic_provider]
+        (provider::Request req, provider::EventSink sink) {
+            const auto& sel = provider::active();
+            if (sel.kind == provider::Kind::OpenAI) {
+                provider::openai::OpenAIProvider p{sel.openai_endpoint};
+                p.stream(std::move(req), std::move(sink));
+            } else {
+                anthropic_provider.stream(std::move(req), std::move(sink));
+            }
+        };
+    app::install_deps(app::Deps{
+        .stream        = stream_fn,
+        .save_thread   = [&store](const Thread& t) { store.save_thread(t); },
+        .load_threads  = [&store] { return store.load_threads(); },
+        .load_thread   = [&store](const ThreadId& id) { return store.load_thread(id); },
+        .load_settings = [&store] { return store.load_settings(); },
+        .save_settings = [&store](const store::Settings& x) { store.save_settings(x); },
+        .new_thread_id = [&store] { return store.new_id(); },
+        .title_from    = [&store](std::string_view t) { return store.title_from(t); },
+        .auth          = provider_auth,
+    });
 
     // ── Wire the subagent (`task` tool) seam ────────────────────────────
     // Process-global config the `task` tool reads to spin up an isolated
@@ -292,7 +363,7 @@ int main(int argc, char** argv) {
           : !sa_settings.model_id.empty() ? sa_settings.model_id.value
           :                                 std::string{"claude-opus-4-5"};
         tools::subagent::install(tools::subagent::Config{
-            auth::make_auth_header(creds), std::move(sa_model), true});
+            provider_auth, std::move(sa_model), true});
     }
 
     // ── ACP mode: run as a headless agent over stdio (Zed et al.) ───────
@@ -332,10 +403,8 @@ int main(int argc, char** argv) {
         ::acp::StdioTransport transport(std::cin, std::cout);
         agentty::acp::AgentServer server(
             transport,
-            [&provider](provider::Request req, provider::EventSink sink) {
-                provider.stream(std::move(req), std::move(sink));
-            },
-            auth::make_auth_header(creds),
+            stream_fn,
+            provider_auth,
             std::move(model_id),
             profile);
         std::fprintf(stderr, "agentty: ACP agent ready on stdio (profile=%s)\n",

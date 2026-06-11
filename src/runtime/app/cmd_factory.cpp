@@ -10,6 +10,8 @@
 #include "agentty/runtime/app/update/internal.hpp"
 #include "agentty/io/http.hpp"
 #include "agentty/provider/anthropic/transport.hpp"
+#include "agentty/provider/openai/transport.hpp"
+#include "agentty/provider/selection.hpp"
 #include "agentty/tool/registry.hpp"
 #include "agentty/tool/spec.hpp"
 #include "agentty/tool/tool.hpp"
@@ -640,7 +642,14 @@ Cmd<Msg> kick_pending_tools(Model& m) {
 Cmd<Msg> fetch_models() {
     return Cmd<Msg>::task([](std::function<void(Msg)> dispatch) {
         try {
-            auto models = provider::anthropic::list_models(deps().auth);
+            std::vector<ModelInfo> models;
+            const auto& sel = provider::active();
+            if (sel.kind == provider::Kind::OpenAI) {
+                models = provider::openai::list_models(deps().auth,
+                                                       sel.openai_endpoint);
+            } else {
+                models = provider::anthropic::list_models(deps().auth);
+            }
             dispatch(ModelsLoaded{std::move(models)});
         } catch (const std::exception& e) {
             dispatch(StreamError{std::string{"models fetch: "} + e.what()});

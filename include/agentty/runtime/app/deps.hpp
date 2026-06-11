@@ -54,6 +54,15 @@ void install_deps(Deps d);
 // streams in flight cache the header at request-build time.
 void update_auth(auth::AuthHeader auth);
 
+// Live-switch the active provider after install. The provider picker
+// dispatches a Cmd that calls this when the user selects a new backend:
+// it installs the new `provider::Selection` (process-global) AND swaps
+// `Deps::auth` to that provider's resolved credentials, so the next
+// stream targets the new backend with the right key. The stream seam
+// itself dispatches on `provider::active()` at call time, so no
+// std::function needs replacing here. Safe to call from the UI thread.
+void switch_provider(auth::AuthHeader auth);
+
 // Convenience: bind a Provider + Store satisfying the concepts.
 template <provider::Provider P, store::Store S>
 void install(P& p, S& s, auth::AuthHeader auth) {

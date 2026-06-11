@@ -22,6 +22,12 @@ struct Settings {
     ModelId              model_id;
     Profile              profile = Profile::Write;
     std::vector<ModelId> favorite_models;
+    // Active LLM backend. Empty / "anthropic" = the default Claude path
+    // (OAuth/Pro/Max). Any other value ("openai" | "groq" | "openrouter" |
+    // "together" | "cerebras" | "ollama" | "host[:port]") routes through
+    // the OpenAI-compatible transport. Set by `--provider`; consulted at
+    // startup in main.cpp.
+    std::string          provider;
 };
 
 template <class S>

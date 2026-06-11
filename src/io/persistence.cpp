@@ -736,6 +736,7 @@ store::Settings load_settings() {
         s.profile = static_cast<Profile>(j.value("profile", 0));
         auto favs = j.value("favorite_models", std::vector<std::string>{});
         for (auto& f : favs) s.favorite_models.push_back(ModelId{std::move(f)});
+        s.provider = j.value("provider", "");
     } catch (...) {}
     return s;
 }
@@ -747,6 +748,7 @@ void save_settings(const store::Settings& s) {
     json favs = json::array();
     for (const auto& mid : s.favorite_models) favs.push_back(mid);
     j["favorite_models"] = std::move(favs);
+    if (!s.provider.empty()) j["provider"] = s.provider;
     (void)write_json_atomic(data_dir() / "settings.json", j.dump(2));
 }
 

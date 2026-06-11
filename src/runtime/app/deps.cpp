@@ -24,4 +24,14 @@ void update_auth(auth::AuthHeader auth) {
     g_deps->auth = std::move(auth);
 }
 
+void switch_provider(auth::AuthHeader auth) {
+    // The active provider::Selection is process-global and is set by the
+    // reducer via provider::select() before this runs; the stream seam
+    // dispatches on provider::active() at call time. All this seam does is
+    // re-point Deps::auth at the new backend's credentials so the next
+    // request authenticates correctly.
+    if (!g_deps) return;
+    g_deps->auth = std::move(auth);
+}
+
 } // namespace agentty::app
