@@ -29,8 +29,6 @@
 #include "agentty/provider/provider.hpp"
 
 #include <chrono>
-#include <cstdio>
-#include <cstdlib>
 #include <sstream>
 #include <string>
 #include <variant>
@@ -47,6 +45,7 @@ namespace {
 struct TaskArgs {
     std::string prompt;
     std::string display_description;
+    std::string agent_type;   // explorer | reviewer | tester | coder | general
 };
 
 std::expected<TaskArgs, ToolError> parse_task_args(const json& j) {
@@ -54,28 +53,103 @@ std::expected<TaskArgs, ToolError> parse_task_args(const json& j) {
     TaskArgs out;
     out.prompt = ar.str("prompt", "");
     out.display_description = ar.str("display_description", "");
+    out.agent_type = ar.str("agent_type", "general");
     if (out.prompt.empty())
         return std::unexpected(ToolError::invalid_args(
             "task requires a non-empty `prompt` describing the subagent's goal"));
     return out;
 }
 
+// ── Agent types ──────────────────────────────────────────────────────────
+// A subagent is far more useful when it's SPECIALISED: a tuned role prompt
+// + a restricted tool set keeps it focused, prevents it from wandering
+// (or fork-bombing via nested `task`), and makes its report predictable.
+// Each type names the tools it may use; an empty allow-list means "every
+// tool except `task`". `read_only` types never get write/exec tools even
+// if listed, a hard guard for investigation roles.
+struct AgentType {
+    std::string_view name;
+    bool             read_only;
+    std::string_view role;     // appended to the subagent system prompt
+    // Tools this type is allowed to call. Empty => all (minus `task`).
+    std::vector<std::string_view> tools;
+};
+
+const AgentType& resolve_agent_type(std::string_view t) {
+    static const std::vector<AgentType> kTypes = {
+        {"explorer", /*read_only=*/true,
+         "Your role: EXPLORER. Map and explain the codebase region the task "
+         "names. Read widely, trace call sites and definitions, and return a "
+         "precise map: the key files, the functions/types involved, how they "
+         "connect, and any gotchas. Cite exact file paths and line numbers. "
+         "You are READ-ONLY \xe2\x80\x94 never modify anything.",
+         {"read", "grep", "glob", "list_dir", "find_definition", "web_search",
+          "web_fetch"}},
+
+        {"reviewer", /*read_only=*/true,
+         "Your role: REVIEWER. Critically review the code or change the task "
+         "names. Look for bugs, edge cases, race conditions, security issues, "
+         "and deviations from the surrounding conventions. Return findings as "
+         "a prioritised list (blocker / major / minor / nit), each with the "
+         "exact file:line and a concrete fix suggestion. You are READ-ONLY.",
+         {"read", "grep", "glob", "list_dir", "find_definition", "git_diff",
+          "git_log", "git_status"}},
+
+        {"tester", /*read_only=*/false,
+         "Your role: TESTER. Reproduce, run, and diagnose. Build/run the "
+         "relevant tests or commands the task names, read the failures, and "
+         "report the root cause with the exact failing assertion and the "
+         "file:line that produced it. Prefer running over guessing. Do NOT "
+         "rewrite production code \xe2\x80\x94 only run, read, and diagnose.",
+         {"read", "grep", "glob", "list_dir", "find_definition", "bash",
+          "diagnostics", "git_diff", "git_status"}},
+
+        {"coder", /*read_only=*/false,
+         "Your role: CODER. Implement the change the task names end-to-end: "
+         "read the relevant code first, make the edits, and verify they build/"
+         "compile if a build command is obvious. Follow the surrounding "
+         "conventions exactly. Report what you changed (files + a one-line "
+         "summary each) and whether it built.",
+         {}},  // full tool set (minus task)
+
+        {"general", /*read_only=*/false,
+         "Your role: GENERAL. Complete the delegated task end-to-end using "
+         "whatever tools fit, then report the outcome.",
+         {}},
+    };
+    for (const auto& a : kTypes)
+        if (a.name == t) return a;
+    return kTypes.back();  // "general"
+}
+
 // System prompt for the subagent. Deliberately terse + outcome-focused:
 // the subagent exists to do ONE delegated job and report back, not to
-// chat. It reuses the same tool catalog as the parent.
-std::string subagent_system_prompt() {
+// chat. It reuses the same tool catalog as the parent, narrowed to the
+// agent type's allow-list. The role line specialises behaviour.
+std::string subagent_system_prompt(const AgentType& type) {
     std::string base = provider::anthropic::default_system_prompt();
+    base += "\n\n<subagent>\n";
+    base += std::string{type.role};
     base +=
-        "\n\n<subagent>\n"
-        "You are a SUBAGENT spawned to complete one delegated task in "
-        "isolation. You do NOT see the parent conversation. Work "
-        "autonomously: use tools to investigate and act, then finish "
-        "with a single concise report of what you found or did. Do not "
-        "ask the parent questions — you cannot receive answers. When the "
-        "task is complete, stop calling tools and write your final "
-        "report as plain text. Keep the report tight: the parent only "
-        "gets your final message, not your transcript.\n"
-        "</subagent>";
+        "\n\nYou are a SUBAGENT spawned to complete ONE delegated task in "
+        "isolation. You do NOT see the parent conversation and cannot ask it "
+        "questions \xe2\x80\x94 work fully autonomously from the task prompt alone. "
+        "Use your tools to investigate and act, then STOP calling tools and "
+        "write your final report as plain text.\n\n"
+        "Your final message is the ONLY thing the parent receives \xe2\x80\x94 not your "
+        "transcript, not your tool output. So the report must stand alone. "
+        "Structure it as:\n"
+        "  \xe2\x80\xa2 A one-line OUTCOME (what you found / did).\n"
+        "  \xe2\x80\xa2 The key details the parent needs to act, with exact file:line "
+        "references where relevant.\n"
+        "  \xe2\x80\xa2 Anything you could NOT determine, stated plainly.\n"
+        "Be concrete and cite evidence (paths, line numbers, command output). "
+        "Do not pad. If the task is impossible or underspecified, say so and "
+        "explain what's missing rather than guessing.";
+    if (type.read_only)
+        base += "\n\nYou are READ-ONLY: you have no tools that modify files, "
+                "run commands, or reach the network. Investigate and report only.";
+    base += "\n</subagent>";
     return base;
 }
 
@@ -110,19 +184,47 @@ std::string summarize_call(const ToolUse& tc) {
 // running card shows what the subagent is doing instead of sitting
 // blank until the final report lands.
 StopReason run_one_completion(Thread& thread, const subagent::Config& cfg,
+                              const AgentType& type,
                               std::string& log, std::string& err_out) {
     namespace ap = provider::anthropic;
     ap::Request req;
     req.model         = cfg.model;
-    req.system_prompt = subagent_system_prompt();
+    req.system_prompt = subagent_system_prompt(type);
     req.auth          = cfg.auth;
-    req.max_tokens    = provider::kSafeMaxTokens;
+    // Subagents do real, multi-step investigation/implementation; a tight
+    // token cap truncates long reports. Give them headroom — the turn
+    // budget (kMaxTurns) bounds total spend, not per-completion size.
+    req.max_tokens    = 32000;
     req.messages      = thread.messages;
+
+    // Build the allowed-tool name set for this agent type. An empty
+    // allow-list means "everything". `task` is ALWAYS excluded so a
+    // subagent can't recurse (the depth cap is a backstop, but not
+    // exposing the tool is cleaner — it never wastes a turn trying).
+    // read_only types additionally drop any WriteFs/Exec/Net tool even
+    // if the allow-list named it, a hard guard against an investigation
+    // agent mutating state.
+    auto allowed = [&](const tools::ToolDef& t) -> bool {
+        if (t.name.value == "task") return false;
+        if (!type.tools.empty()) {
+            bool listed = false;
+            for (auto n : type.tools)
+                if (n == t.name.value) { listed = true; break; }
+            if (!listed) return false;
+        }
+        if (type.read_only) {
+            if (const auto* sp = tools::spec::lookup(t.name.value)) {
+                using tools::Effect;
+                if (sp->effects.has(Effect::WriteFs)
+                    || sp->effects.has(Effect::Exec)
+                    || sp->effects.has(Effect::Net))
+                    return false;
+            }
+        }
+        return true;
+    };
     for (const auto& t : tools::registry()) {
-        // The subagent does NOT get the `task` tool itself beyond the
-        // depth cap; the cap (checked in run_task) is the real guard,
-        // but we still expose the full catalog so a depth-1 subagent
-        // can delegate once more if genuinely needed.
+        if (!allowed(t)) continue;
         req.tools.push_back({t.name.value, t.description, t.input_schema,
                              t.eager_input_streaming});
     }
@@ -221,6 +323,8 @@ ExecResult run_task(const TaskArgs& a) {
         ~DepthGuard() { subagent::pop_depth(); }
     } depth_guard;
 
+    const AgentType& type = resolve_agent_type(a.agent_type);
+
     // Seed the subagent thread with the delegated prompt.
     Thread thread;
     {
@@ -234,7 +338,7 @@ ExecResult run_task(const TaskArgs& a) {
     // Human-readable activity feed streamed to the parent's tool card and
     // appended to the final report so even a no-text-report subagent shows
     // what it actually did.
-    std::string log;
+    std::string log = "\xe2\x97\x86 " + std::string{type.name} + " subagent\n";  // ◆
     std::string last_error;  // last StreamError, if any
     while (turns < subagent::kMaxTurns) {
         ++turns;
@@ -242,7 +346,7 @@ ExecResult run_task(const TaskArgs& a) {
         log += "\xe2\x80\xa2 turn " + std::to_string(turns);  // •
         progress::emit(log);
         std::string err;
-        StopReason stop = run_one_completion(thread, cfg, log, err);
+        StopReason stop = run_one_completion(thread, cfg, type, log, err);
         if (!err.empty()) last_error = err;
 
         Message& asst = thread.messages.back();
@@ -310,7 +414,7 @@ ExecResult run_task(const TaskArgs& a) {
     }
 
     std::ostringstream out;
-    out << "Subagent report (" << turns << " turn"
+    out << "Subagent report (" << type.name << ", " << turns << " turn"
         << (turns == 1 ? "" : "s") << "):\n\n" << report;
     return ToolOutput{out.str(), std::nullopt};
 }
@@ -322,22 +426,40 @@ ToolDef tool_task() {
     constexpr const auto& kSpec = spec::require<"task">();
     t.name = ToolName{std::string{kSpec.name}};
     t.description =
-        "Spawn an autonomous subagent to complete a self-contained task "
-        "in isolation (own context, own tool budget). Use for focused "
-        "investigations or multi-step jobs you want handled end-to-end "
-        "without cluttering this conversation — e.g. \"find every call "
-        "site of X and summarize them\", \"reproduce and diagnose this "
-        "failing test\". The subagent runs to completion and returns a "
-        "single condensed report; you do NOT see its intermediate steps. "
-        "It cannot ask you questions, so give a complete, unambiguous "
-        "prompt.";
+        "Spawn an autonomous subagent to complete a self-contained task in "
+        "isolation (own context window, own tool budget). The subagent runs "
+        "to completion and returns ONE condensed report; you do NOT see its "
+        "intermediate steps, and it cannot ask you questions \xe2\x80\x94 so give a "
+        "complete, unambiguous prompt with all the context it needs.\n\n"
+        "Pick an `agent_type` to specialise it (each has a tuned role + a "
+        "restricted tool set):\n"
+        "  \xe2\x80\xa2 explorer  \xe2\x80\x94 read-only: map/understand a codebase region, trace "
+        "call sites, return a file:line map.\n"
+        "  \xe2\x80\xa2 reviewer  \xe2\x80\x94 read-only: critique a change/file for bugs, return "
+        "prioritised findings with fixes.\n"
+        "  \xe2\x80\xa2 tester    \xe2\x80\x94 run/diagnose: build+run tests, report the root cause "
+        "of failures (no production edits).\n"
+        "  \xe2\x80\xa2 coder     \xe2\x80\x94 full tools: implement a change end-to-end and verify "
+        "it builds.\n"
+        "  \xe2\x80\xa2 general   \xe2\x80\x94 (default) full tools, no specialisation.\n\n"
+        "Best for focused, parallelisable jobs you want handled without "
+        "cluttering this conversation \xe2\x80\x94 e.g. 'explore how auth flows through "
+        "the request pipeline', 'review my last commit for races', 'reproduce "
+        "and diagnose the failing midrun_freeze_test'.";
     t.input_schema = json{
         {"type", "object"},
         {"required", {"prompt"}},
         {"properties", {
             {"prompt", {{"type", "string"},
                 {"description", "Complete, self-contained description of the "
-                                "task for the subagent to accomplish."}}},
+                                "task for the subagent to accomplish. Include "
+                                "all context it needs \xe2\x80\x94 it cannot see this "
+                                "conversation and cannot ask follow-ups."}}},
+            {"agent_type", {{"type", "string"},
+                {"enum", {"explorer", "reviewer", "tester", "coder", "general"}},
+                {"description", "Subagent specialisation. explorer/reviewer are "
+                                "read-only; tester runs+diagnoses; coder edits; "
+                                "general (default) is unrestricted."}}},
             {"display_description", {{"type", "string"},
                 {"description", "One-line summary shown in the UI. Optional."}}},
         }},
