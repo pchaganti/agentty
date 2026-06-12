@@ -182,6 +182,14 @@ Element panel_picking(bool failed, std::string_view fail_msg) {
     rows.push_back(h(text("   ", fg_of(fg)),
                      body_text("starts with sk-ant-…", fg_dim(muted))).build());
     rows.push_back(text(""));
+    // Other backends (OpenAI, Groq, OpenRouter, Ollama, …) authenticate via
+    // an env var, not this modal. Point first-run users who don't have a
+    // Claude account at the provider picker so they're never stuck here.
+    rows.push_back(body_text(
+        "Using OpenAI, Groq, OpenRouter or a local model instead? "
+        "Press Esc, then Ctrl-P to pick that provider.",
+        fg_dim(muted)));
+    rows.push_back(text(""));
     rows.push_back(key_hints({{"1/2", "choose"}, {"Esc", "close"}}));
     return v(std::move(rows)).build();
 }

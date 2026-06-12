@@ -224,6 +224,10 @@ Element provider_picker(const Model& m) {
 
     cfg.footer.push_back(text(""));
     cfg.footer.push_back(h(
+        text("✓", fg_of(success)), text(" ready  ", fg_dim(muted)),
+        text("⚠", fg_of(warn)),    text(" set the named key first  ", fg_dim(muted))
+    ).build());
+    cfg.footer.push_back(h(
         text("↑↓", fg_of(fg)), text(" move  ", fg_dim(muted)),
         text("Enter", fg_of(fg)), text(" switch  ", fg_dim(muted)),
         text("Esc", fg_of(fg)), text(" close", fg_dim(muted))

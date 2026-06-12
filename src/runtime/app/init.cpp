@@ -3,6 +3,7 @@
 #include "agentty/runtime/login.hpp"
 #include "agentty/runtime/view/helpers.hpp"
 #include "agentty/auth/auth.hpp"
+#include "agentty/provider/selection.hpp"
 
 #include <vector>
 
@@ -48,7 +49,15 @@ std::pair<Model, maya::Cmd<Msg>> init() {
     // without leaving the TUI; subscribe.cpp routes all input there
     // until they finish (or Esc out, leaving agentty unauth'd — they'll
     // hit a stream error on first send and can /login from the palette).
-    if (auth::is_empty(deps().auth))
+    //
+    // Gate on the active provider being Anthropic: the modal is
+    // Anthropic-specific (OAuth / sk-ant key). An OpenAI-family backend
+    // authenticates via an env var resolved at startup, so an empty
+    // header there means "no key in env" — popping the Anthropic OAuth
+    // modal would be nonsensical. Those users get a stream error naming
+    // the missing key on first send instead.
+    if (auth::is_empty(deps().auth)
+        && provider::active().kind == provider::Kind::Anthropic)
         m.ui.login = ui::login::Picking{};
 
     std::vector<maya::Cmd<Msg>> cmds;

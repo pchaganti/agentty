@@ -165,6 +165,31 @@ Step provider_picker_update(Model m, msg::ProviderPickerMsg pm) {
             const auto& preset = presets[static_cast<std::size_t>(p->index)];
             const std::string spec{preset.id};
 
+            // Resolve the new backend's credentials BEFORE committing the
+            // switch so we can refuse a switch that would land the user in a
+            // silently-broken state (every request 401s with no key). For
+            // Anthropic we reuse the session creds; for OpenAI-family we
+            // resolve from the registry's env-var chain; local needs none.
+            auth::AuthHeader new_auth =
+                provider::resolve_auth_for(spec, deps().auth);
+
+            // A hosted (non-local) OpenAI-family provider with no resolvable
+            // key would 401 on every request. Don't switch into that — keep
+            // the current backend and tell the user exactly which env var to
+            // set (or to pass -k). Far better than a confusing stream error.
+            const bool needs_key =
+                preset.kind == provider::Kind::OpenAI && !preset.is_local
+                && preset.auth != provider::AuthStyle::None;
+            if (needs_key && auth::is_empty(new_auth)) {
+                std::string want{preset.auth_env.front()};
+                std::string msg = "set " + (want.empty() ? std::string{"OPENAI_API_KEY"} : want)
+                                + " to use " + std::string{preset.label}
+                                + " (or pass -k)";
+                return {std::move(m),
+                        set_status_toast(m, std::move(msg),
+                                         std::chrono::seconds{6})};
+            }
+
             // Install + persist the new selection.
             provider::select(provider::parse_selection(spec));
             {
@@ -173,13 +198,9 @@ Step provider_picker_update(Model m, msg::ProviderPickerMsg pm) {
                 deps().save_settings(settings);
             }
 
-            // Swap the Deps auth to the new backend's credentials. For
-            // Anthropic we keep the existing session creds (already in
-            // deps().auth); for OpenAI-family we resolve from the registry's
-            // env-var chain. The stream seam reads provider::active() at
-            // call time so the next request targets the new backend.
-            auth::AuthHeader new_auth =
-                provider::resolve_auth_for(spec, deps().auth);
+            // Swap the Deps auth to the new backend's credentials. The stream
+            // seam reads provider::active() at call time so the next request
+            // targets the new backend.
             app::switch_provider(new_auth);
 
             // Models differ per backend — drop the stale list and refetch.
