@@ -244,6 +244,73 @@ static void test_sse_error_frame() {
     CHECK(saw_err);
 }
 
+// ── Leaked-tool-call salvage (weak local models like qwen2.5-coder:7b) ──
+// These models emit the call as a bare JSON in `content` with
+// finish_reason "stop" instead of the structured tool_calls[] channel.
+static void test_sse_salvage_leaked_tool_call() {
+    // The exact shape Ollama returns for qwen2.5-coder:7b: one content
+    // delta carrying {"name":..,"arguments":{..}} as a string.
+    std::string sse =
+        "data: {\"choices\":[{\"delta\":{\"content\":"
+            "\"{\\\"name\\\": \\\"echo\\\", \\\"arguments\\\": "
+            "{\\\"text\\\": \\\"hi\\\"}}\"}}]}\n\n"
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+        "data: [DONE]\n\n";
+    auto msgs = oai::parse_sse_for_test(sse, {"echo", "read"});
+
+    // The leaked JSON must become a REAL tool call, not surface as text.
+    CHECK(count_leaf<StreamToolUseStart>(msgs) == 1);
+    CHECK(count_leaf<StreamToolUseEnd>(msgs) == 1);
+    CHECK(joined_text(msgs).empty());     // nothing leaked into the text body
+    for (const auto& m : msgs)
+        if (const auto* s = get_leaf<StreamToolUseStart>(m))
+            CHECK(s->name.value == "echo");
+    CHECK(joined_tool_args(msgs) == std::string{"{\"text\":\"hi\"}"});
+    // Salvaged calls report ToolUse so the reducer kicks the tool loop.
+    for (const auto& m : msgs)
+        if (const auto* f = get_leaf<StreamFinished>(m))
+            CHECK(f->stop_reason == StopReason::ToolUse);
+}
+
+static void test_sse_salvage_unknown_tool_stays_text() {
+    // A bare JSON naming a tool we did NOT advertise must NOT be salvaged —
+    // it falls through to ordinary text (we never invent a call).
+    std::string sse =
+        "data: {\"choices\":[{\"delta\":{\"content\":"
+            "\"{\\\"name\\\": \\\"nonexistent\\\", \\\"arguments\\\": {}}\"}}]}\n\n"
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+        "data: [DONE]\n\n";
+    auto msgs = oai::parse_sse_for_test(sse, {"echo"});
+    CHECK(count_leaf<StreamToolUseStart>(msgs) == 0);
+    CHECK(!joined_text(msgs).empty());    // surfaced as text
+}
+
+static void test_sse_plain_json_prose_not_salvaged() {
+    // Ordinary prose that merely STARTS with text isn't held/mangled.
+    std::string sse =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Sure, here you go.\"}}]}\n\n"
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+        "data: [DONE]\n\n";
+    auto msgs = oai::parse_sse_for_test(sse, {"echo"});
+    CHECK(joined_text(msgs) == "Sure, here you go.");
+    CHECK(count_leaf<StreamToolUseStart>(msgs) == 0);
+}
+
+static void test_sse_structured_tool_still_works_with_salvage_on() {
+    // A REAL structured tool call must be unaffected by the salvage path.
+    std::string sse =
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,"
+            "\"id\":\"call_1\",\"function\":{\"name\":\"read\","
+            "\"arguments\":\"{}\"}}]}}]}\n\n"
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"
+        "data: [DONE]\n\n";
+    auto msgs = oai::parse_sse_for_test(sse, {"read"});
+    CHECK(count_leaf<StreamToolUseStart>(msgs) == 1);
+    for (const auto& m : msgs)
+        if (const auto* s = get_leaf<StreamToolUseStart>(m))
+            CHECK(s->name.value == "read");
+}
+
 static void test_endpoint_presets() {
     auto groq = oai::Endpoint::from_spec("groq");
     CHECK(groq.host == "api.groq.com");
@@ -273,6 +340,10 @@ int main() {
     test_sse_tool_call_stream();
     test_sse_two_tool_calls();
     test_sse_error_frame();
+    test_sse_salvage_leaked_tool_call();
+    test_sse_salvage_unknown_tool_stays_text();
+    test_sse_plain_json_prose_not_salvaged();
+    test_sse_structured_tool_still_works_with_salvage_on();
     test_endpoint_presets();
 
     if (g_failures == 0) {

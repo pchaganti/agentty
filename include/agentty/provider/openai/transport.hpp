@@ -96,6 +96,8 @@ void run_stream_sync(Request req, EventSink sink, http::CancelTokenPtr cancel = 
 // the live stream uses and collect every dispatched Msg. Lets a unit test
 // verify the delta→Msg translation (text, tool-call assembly, finish_reason,
 // usage, [DONE]) without a network round-trip.
-[[nodiscard]] std::vector<Msg> parse_sse_for_test(std::string_view sse_bytes);
+[[nodiscard]] std::vector<Msg> parse_sse_for_test(
+    std::string_view sse_bytes,
+    std::vector<std::string> known_tools = {});
 
 } // namespace agentty::provider::openai
