@@ -432,69 +432,77 @@ void ensure_nonempty_turn(StreamCtx& ctx) {
 
     bool any_emitted = false;
 
-    // Strip wrapper prefixes (opening tags/fences) and suffixes (closing).
-    // These might arrive before/after the JSON body.
+    // Strip wrapper prefixes (opening tags/fences) and suffixes (closing)
+    // that weak local models wrap around leaked tool calls. ONLY strip when
+    // we see an ACTUAL wrapper — don't strip ordinary whitespace or content.
+    // This is called at the start of incremental salvage and after a JSON
+    // object is extracted (to consume trailing wrappers).
     auto skip_wrapper_prefix = [&]() {
         std::string_view sv{ctx.text_hold};
         std::size_t orig = sv.size();
-        // Trim leading whitespace.
-        while (!sv.empty() && (sv.front()==' '||sv.front()=='\t'
-                               ||sv.front()=='\n'||sv.front()=='\r')) {
-            sv.remove_prefix(1);
-        }
-        // <tool_call> tag.
-        if (sv.starts_with("<tool_call>")) {
-            sv.remove_prefix(11);
-        }
-        // </tool_call> closing tag (might appear after JSON).
-        if (sv.starts_with("</tool_call>")) {
-            sv.remove_prefix(12);
-        }
-        // ```json fence is a tool-call wrapper — strip it. But ```cpp,
-        // ```python, etc. are markdown code blocks — DON'T strip them.
-        // NOTE: After JSON is salvaged, we also see a CLOSING ``` (the end of
-        // a ```json...``` fence). Strip it unconditionally — it's not a code
-        // block, it's the end of the wrapper. Detect "closing fence" by
-        // checking if it's followed by </tool_call> or end-of-buffer.
-        if (sv.starts_with("```json")) {
-            sv.remove_prefix(7);
-        } else if (sv.starts_with("```")) {
-            std::string_view after = sv.substr(3);
-            // Skip whitespace/newlines
-            std::size_t k = 0;
-            while (k < after.size() && (after[k] == ' ' || after[k] == '\t'
-                   || after[k] == '\n' || after[k] == '\r')) ++k;
-            // Strip if:
-            // - followed by { (opening fence for JSON body)
-            // - followed by </tool_call> (closing fence of wrapper)
-            // DON'T strip if:
-            // - at end of buffer (could be incomplete OPENING fence like ```)
-            // - followed by a language tag (```cpp etc. = markdown, not tool)
-            // The key insight: an incomplete ``` could be EITHER an opening
-            // fence (waiting for language tag or content) OR a closing fence.
-            // We can only tell by what follows. If nothing follows yet, DON'T
-            // strip — wait for more data.
-            if (k < after.size() &&
-                (after[k] == '{' || after.substr(k).starts_with("</tool_call>"))) {
-                sv.remove_prefix(3);
+        
+        // Helper: trim leading whitespace from sv.
+        auto ltrim = [&sv]() {
+            while (!sv.empty() && (sv.front()==' '||sv.front()=='\t'
+                                   ||sv.front()=='\n'||sv.front()=='\r')) {
+                sv.remove_prefix(1);
             }
-            // Otherwise leave it alone — it's either an incomplete opener or
-            // a markdown code fence (```cpp etc.)
+        };
+        
+        // Keep stripping wrappers until we can't find any more.
+        // This handles cases like: <tool_call>```json\n{...}
+        bool found_any = false;
+        bool found_this_pass = true;
+        while (found_this_pass) {
+            found_this_pass = false;
+            ltrim();
+            
+            // <tool_call> opening tag
+            if (sv.starts_with("<tool_call>")) {
+                sv.remove_prefix(11);
+                found_this_pass = true;
+                found_any = true;
+                continue;
+            }
+            // </tool_call> closing tag
+            if (sv.starts_with("</tool_call>")) {
+                sv.remove_prefix(12);
+                found_this_pass = true;
+                found_any = true;
+                continue;
+            }
+            // ```json fence
+            if (sv.starts_with("```json")) {
+                sv.remove_prefix(7);
+                found_this_pass = true;
+                found_any = true;
+                continue;
+            }
+            // Closing ``` followed by </tool_call> or { (JSON body)
+            if (sv.starts_with("```")) {
+                std::string_view after = sv.substr(3);
+                std::size_t k = 0;
+                while (k < after.size() && (after[k] == ' ' || after[k] == '\t'
+                       || after[k] == '\n' || after[k] == '\r')) ++k;
+                if (k < after.size() &&
+                    (after[k] == '{' || after.substr(k).starts_with("</tool_call>"))) {
+                    sv.remove_prefix(3);
+                    found_this_pass = true;
+                    found_any = true;
+                    continue;
+                }
+            }
         }
-        // More whitespace after fence/tag.
-        while (!sv.empty() && (sv.front()==' '||sv.front()=='\t'
-                               ||sv.front()=='\n'||sv.front()=='\r')) {
-            sv.remove_prefix(1);
+        
+        if (!found_any) {
+            // No wrapper found — DON'T strip the leading whitespace either,
+            // it's meaningful content (e.g., a newline between code lines).
+            return;
         }
-        // </tool_call> might come AFTER the closing ``` fence.
-        if (sv.starts_with("</tool_call>")) {
-            sv.remove_prefix(12);
-        }
-        // Final whitespace cleanup.
-        while (!sv.empty() && (sv.front()==' '||sv.front()=='\t'
-                               ||sv.front()=='\n'||sv.front()=='\r')) {
-            sv.remove_prefix(1);
-        }
+        
+        // Strip final whitespace after wrappers.
+        ltrim();
+        
         std::size_t removed = orig - sv.size();
         if (removed > 0) {
             ctx.text_hold.erase(0, removed);
