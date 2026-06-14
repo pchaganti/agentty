@@ -534,6 +534,7 @@ void run_stream_sync(Request req, EventSink sink, http::CancelTokenPtr cancel) {
     hreq.host    = req.endpoint.host;
     hreq.port    = req.endpoint.port;
     hreq.path    = req.endpoint.path;
+    hreq.plaintext = !req.endpoint.use_tls;
     if (const auto& ov = http::agentty_api_host_override(); ov.active()) {
         hreq.dial_host = ov.host;
         hreq.dial_port = ov.port;
@@ -593,7 +594,14 @@ void run_stream_sync(Request req, EventSink sink, http::CancelTokenPtr cancel) {
                                                 tos, std::move(cancel));
 
     if (!result) {
-        emit_terminal(ctx, std::string{"http: "} + result.error().render());
+        std::string msg = std::string{"http: "} + result.error().render();
+        // Local backend unreachable — the daemon almost certainly isn't
+        // running. Name the concrete fix; a bare connection-refused is
+        // opaque to someone who just expected agentty to "work with ollama".
+        if (!req.endpoint.use_tls)
+            msg += "  (is the server running? start it with 'ollama serve', "
+                   "or check the --provider host:port)";
+        emit_terminal(ctx, std::move(msg));
         return;
     }
 
@@ -613,6 +621,13 @@ void run_stream_sync(Request req, EventSink sink, http::CancelTokenPtr cancel) {
         }
         if (http_status == 401 || http_status == 403)
             msg += "  (check the provider API key)";
+        // A 404 on a local OpenAI-compatible server (Ollama/llama.cpp)
+        // almost always means the model id isn't loaded — the daemon is
+        // up, it just never pulled this model. Point the user at the
+        // fix instead of a bare "HTTP 404: model: <id>".
+        if (http_status == 404 && !req.endpoint.use_tls)
+            msg += "  (model not loaded — run 'ollama pull " + req.model
+                 + "', or pick an available one with Ctrl-P)";
         emit_terminal(ctx, std::move(msg), retry_after_hint);
         return;
     }
@@ -631,6 +646,7 @@ std::vector<ModelInfo> list_models(const AuthHeader& auth, const Endpoint& endpo
     hreq.host   = endpoint.host;
     hreq.port   = endpoint.port;
     hreq.path   = endpoint.models_path;
+    hreq.plaintext = !endpoint.use_tls;
     if (const auto& ov = http::agentty_api_host_override(); ov.active()) {
         hreq.dial_host = ov.host;
         hreq.dial_port = ov.port;

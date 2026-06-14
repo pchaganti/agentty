@@ -63,6 +63,19 @@ std::pair<Model, maya::Cmd<Msg>> init() {
     std::vector<maya::Cmd<Msg>> cmds;
     cmds.push_back(cmd::load_threads_async());
 
+    // OpenAI-family backends (Ollama, llama.cpp, groq, …) have no fixed
+    // built-in model list — seed_models() only knows Claude ids. A saved
+    // or --provider-restored model id may not be served by the active
+    // endpoint (e.g. "qwen2.5-coder:7b" persisted but the daemon never
+    // pulled it, or the id belongs to a different backend), which 404s
+    // on the very first prompt. Fetch /v1/models eagerly at startup so
+    // the ModelsLoaded reducer can swap to a real, served model id
+    // BEFORE the user sends anything — the same validation the model
+    // picker does, just not gated on the user opening it. Anthropic has
+    // a trustworthy built-in seed list, so it skips this round trip.
+    if (provider::active().kind == provider::Kind::OpenAI)
+        cmds.push_back(cmd::fetch_models());
+
     // Background OAuth refresh handoff. `auth::resolve()` parked a
     // refresh token here when it found expired-but-refreshable creds
     // on disk; pick it up and dispatch the network round trip on a
