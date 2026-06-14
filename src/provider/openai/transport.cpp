@@ -118,7 +118,17 @@ struct StreamCtx {
     while (i < s.size() && (s[i] == ' ' || s[i] == '\t'
                             || s[i] == '\n' || s[i] == '\r')) ++i;
     if (i >= s.size()) return true;          // only whitespace so far
-    return s[i] == '{';                       // a JSON object must open with {
+    std::string_view rest = s.substr(i);
+    // Qwen / Hermes / many llama.cpp chat templates wrap a leaked tool call
+    // in <tool_call>…</tool_call> (or a fenced ```json block) instead of the
+    // structured tool_calls[] channel. Keep holding while the prefix is still
+    // a possible opener for any of those forms, or a bare JSON object.
+    if (rest.front() == '{') return true;
+    // Prefix of "<tool_call>" or a code fence — still possibly a tool call.
+    constexpr std::string_view kTag = "<tool_call>";
+    if (kTag.starts_with(rest) || rest.starts_with("<")) return true;
+    if (rest.starts_with("`")) return true;  // start of a ``` fence
+    return false;
 }
 
 constexpr std::size_t kSseCompactThreshold = 64 * 1024;
@@ -143,24 +153,49 @@ void close_active_tool(StreamCtx& ctx) {
     }
 }
 
-// True iff the held buffer opens like a bare tool-call JSON object but is
-// INCOMPLETE — it begins with `{` (after optional whitespace / a ```json
-// fence) yet does not parse as a complete JSON value. That is the signature of
-// a tool call the model leaked into `content` whose wire cut off mid-body
-// ("upstream cut off"). A COMPLETE object that simply named an unadvertised
-// tool is NOT incomplete — it still surfaces as text so the user sees what the
-// model meant.
-[[nodiscard]] bool hold_is_truncated_tool_json(std::string_view sv) noexcept {
+// Strip the wrappers weak local models put around a leaked tool call so what
+// remains is (ideally) a bare JSON object: surrounding whitespace, a single
+// <tool_call>…</tool_call> tag pair, and/or a ```json … ``` code fence. Order
+// is tag-then-fence-then-trim, applied leniently (a missing closing tag/fence
+// is tolerated — the wire may have cut off). Returns the inner slice.
+[[nodiscard]] std::string_view strip_tool_call_wrappers(std::string_view sv) noexcept {
     auto ltrim = [](std::string_view& s) {
         while (!s.empty() && (s.front()==' '||s.front()=='\t'
                               ||s.front()=='\n'||s.front()=='\r')) s.remove_prefix(1);
     };
-    ltrim(sv);
+    auto rtrim = [](std::string_view& s) {
+        while (!s.empty() && (s.back()==' '||s.back()=='\t'
+                              ||s.back()=='\n'||s.back()=='\r')) s.remove_suffix(1);
+    };
+    ltrim(sv); rtrim(sv);
+    // <tool_call> … </tool_call>
+    if (sv.starts_with("<tool_call>")) {
+        sv.remove_prefix(std::string_view{"<tool_call>"}.size());
+        if (auto p = sv.rfind("</tool_call>"); p != std::string_view::npos)
+            sv = sv.substr(0, p);
+        ltrim(sv); rtrim(sv);
+    }
+    // ```json … ```  (or a bare ``` fence)
     if (sv.starts_with("```")) {
         sv.remove_prefix(3);
         if (sv.starts_with("json")) sv.remove_prefix(4);
         ltrim(sv);
+        if (auto p = sv.rfind("```"); p != std::string_view::npos)
+            sv = sv.substr(0, p);
+        rtrim(sv);
     }
+    return sv;
+}
+
+// True iff the held buffer opens like a bare tool-call JSON object but is
+// INCOMPLETE — it begins with `{` (after optional whitespace / a ```json
+// fence / a <tool_call> tag) yet does not parse as a complete JSON value. That
+// is the signature of a tool call the model leaked into `content` whose wire
+// cut off mid-body ("upstream cut off"). A COMPLETE object that simply named
+// an unadvertised tool is NOT incomplete — it still surfaces as text so the
+// user sees what the model meant.
+[[nodiscard]] bool hold_is_truncated_tool_json(std::string_view sv) noexcept {
+    sv = strip_tool_call_wrappers(sv);
     if (sv.empty() || sv.front() != '{') return false;
     try { (void)json::parse(sv); return false; }   // complete — keep as text
     catch (...) { return true; }                    // truncated — drop
@@ -198,26 +233,9 @@ void flush_text_hold(StreamCtx& ctx) {
     if (ctx.any_structured_tool) return false;
     if (ctx.text_hold.empty())   return false;
 
-    // Trim surrounding whitespace; some models wrap the JSON in a fenced
-    // ```json block — strip a single leading/trailing fence if present.
-    std::string_view sv{ctx.text_hold};
-    auto ltrim = [](std::string_view& s) {
-        while (!s.empty() && (s.front()==' '||s.front()=='\t'
-                              ||s.front()=='\n'||s.front()=='\r')) s.remove_prefix(1);
-    };
-    auto rtrim = [](std::string_view& s) {
-        while (!s.empty() && (s.back()==' '||s.back()=='\t'
-                              ||s.back()=='\n'||s.back()=='\r')) s.remove_suffix(1);
-    };
-    ltrim(sv); rtrim(sv);
-    if (sv.starts_with("```")) {
-        sv.remove_prefix(3);
-        if (sv.starts_with("json")) sv.remove_prefix(4);
-        ltrim(sv);
-        if (auto p = sv.rfind("```"); p != std::string_view::npos)
-            sv = sv.substr(0, p);
-        rtrim(sv);
-    }
+    // Peel off any <tool_call> tags / ```json fence / whitespace the model
+    // wrapped the call in, leaving (ideally) a bare JSON object.
+    std::string_view sv = strip_tool_call_wrappers(ctx.text_hold);
     if (sv.empty() || sv.front() != '{') return false;
 
     json j;
@@ -809,6 +827,23 @@ void run_stream_sync(Request req, EventSink sink, http::CancelTokenPtr cancel) {
 
     // 2xx — guarantee a terminal event even if [DONE] never arrived.
     emit_terminal(ctx, std::nullopt);
+}
+
+std::string_view local_model_prompt_addendum() {
+    return
+        "\n\n<local-model-guidance>\n"
+        "You are running on a local / OpenAI-compatible model. Two hard rules:\n"
+        "1. Only call a tool when the user's request actually requires one. "
+        "For greetings, small talk, acknowledgements, or anything you can "
+        "answer directly, reply in plain text and call NO tools. In "
+        "particular, do NOT call `remember` unless the user explicitly asks "
+        "you to remember, note, or not forget something.\n"
+        "2. When you DO call a tool, emit exactly one tool call using the "
+        "tool-calling mechanism. Do not print the call as JSON in your "
+        "normal reply, do not wrap it in markdown fences, and never repeat a "
+        "call you already made this turn — once a tool result comes back, use "
+        "it and either continue or answer the user.\n"
+        "</local-model-guidance>";
 }
 
 // ── Model listing ────────────────────────────────────────────────────────────

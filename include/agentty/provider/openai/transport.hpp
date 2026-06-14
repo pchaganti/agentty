@@ -92,6 +92,14 @@ void run_stream_sync(Request req, EventSink sink, http::CancelTokenPtr cancel = 
 [[nodiscard]] std::vector<ModelInfo> list_models(const AuthHeader& auth,
                                                  const Endpoint& endpoint);
 
+// Extra system-prompt guidance appended ONLY for OpenAI-compatible backends.
+// Weak local models (Ollama qwen2.5-coder, llama.cpp templates) over-call
+// tools (e.g. firing `remember` at a bare "hi") and leak calls as content
+// text instead of the structured channel. This addendum nudges them to chat
+// in plain text when no tool is needed and to emit one well-formed call when
+// one is. Hosted OpenAI/Groq models ignore it harmlessly.
+[[nodiscard]] std::string_view local_model_prompt_addendum();
+
 // Test-only: feed a complete OpenAI SSE byte buffer through the same parser
 // the live stream uses and collect every dispatched Msg. Lets a unit test
 // verify the delta→Msg translation (text, tool-call assembly, finish_reason,

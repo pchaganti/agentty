@@ -75,28 +75,52 @@ std::size_t dedup_releaked_salvage_calls(Model& m) {
         return tc.name.value + '\0' + tc.args.dump();
     };
     std::unordered_set<std::string> terminal_sigs;
+    std::size_t terminal_salvaged = 0;   // how many salvaged calls already ran
     for (std::size_t i = turn_start; i < msgs.size(); ++i)
         for (const auto& tc : msgs[i].tool_calls)
-            if (tc.is_terminal())
+            if (tc.is_terminal()) {
                 terminal_sigs.insert(sig(tc));
+                if (is_salvaged_call(tc.id)) ++terminal_salvaged;
+            }
 
-    if (terminal_sigs.empty()) return 0;
+    // Runaway-loop guard. Exact-match dedup (below) only catches a re-leak
+    // whose args are BYTE-identical to a prior terminal call. Weak local
+    // models (qwen2.5-coder:7b via Ollama) routinely re-leak the SAME tool
+    // with slightly drifted args every post-tool sub-turn — different scope,
+    // reworded text — so dedup misses it and the agent loops forever (the
+    // "stuck RUNNING" card the user sees). Once a turn has already executed
+    // kMaxSalvagedPerTurn salvaged calls, treat any further pending salvaged
+    // call as a leak loop and fail it WITHOUT running, regardless of args.
+    // Structured tool calls (deliberate model intent) are never counted or
+    // capped here — only synthetic salvaged leaks.
+    constexpr std::size_t kMaxSalvagedPerTurn = 8;
+
+    if (terminal_sigs.empty() && terminal_salvaged < kMaxSalvagedPerTurn)
+        return 0;
 
     std::size_t deduped = 0;
     const auto now = std::chrono::steady_clock::now();
     for (auto& tc : msgs.back().tool_calls) {
         if (!tc.is_pending() && !tc.is_approved()) continue;
         if (!is_salvaged_call(tc.id)) continue;   // only dedup salvaged leaks
-        if (!terminal_sigs.contains(sig(tc))) continue;
-        // Re-leak of a call already settled this turn. Resolve as Failed
-        // WITHOUT running it — the side effect already happened once. The
-        // message tells the model to stop re-emitting it so the loop ends.
+        const bool is_exact_releak = terminal_sigs.contains(sig(tc));
+        const bool over_budget     = terminal_salvaged >= kMaxSalvagedPerTurn;
+        if (!is_exact_releak && !over_budget) continue;
+        // Re-leak of a call already settled this turn (exact match), OR the
+        // turn has blown its salvage budget (drifting-args leak loop).
+        // Resolve as Failed WITHOUT running it — any real side effect already
+        // happened. The message tells the model to stop re-emitting and finish.
         tc.status = ToolUse::Failed{
             tc.started_at(), now,
-            "duplicate tool call — this exact call (same name and arguments) "
-            "already ran this turn and its result is above. It was NOT run "
-            "again to avoid repeating the side effect. Do not re-emit it; "
-            "continue with the next step or finish."};
+            over_budget && !is_exact_releak
+                ? std::string{"too many repeated tool calls this turn — this "
+                  "call was NOT run. Stop calling tools and answer the user "
+                  "directly in plain text now."}
+                : std::string{"duplicate tool call — this exact call (same name "
+                  "and arguments) already ran this turn and its result is "
+                  "above. It was NOT run again to avoid repeating the side "
+                  "effect. Do not re-emit it; continue with the next step or "
+                  "finish."}};
         ++deduped;
     }
     return deduped;
@@ -416,6 +440,11 @@ Cmd<Msg> launch_stream(Model& m) {
         provider::Request req;
         req.model         = std::move(model_id);
         req.system_prompt = provider::anthropic::default_system_prompt();
+        // Weak local / OpenAI-compat models over-call tools and leak calls as
+        // content text. Append guidance that curbs both. Hosted Anthropic
+        // keeps the base prompt unchanged.
+        if (provider::active().kind == provider::Kind::OpenAI)
+            req.system_prompt += provider::openai::local_model_prompt_addendum();
         req.cancel        = cancel;
         req.auth          = std::move(auth);
         req.retry_count   = retry_count;

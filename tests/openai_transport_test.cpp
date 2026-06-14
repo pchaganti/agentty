@@ -272,6 +272,41 @@ static void test_sse_salvage_leaked_tool_call() {
             CHECK(f->stop_reason == StopReason::ToolUse);
 }
 
+// ── <tool_call>-tag-wrapped leak (qwen/Hermes chat-template form) ──────
+// The qwen2.5-coder template instructs the model to wrap calls in
+// <tool_call>…</tool_call>. When Ollama fails to strip those tags they
+// arrive in `content`; salvage must peel the tags and recover the call.
+static void test_sse_salvage_tool_call_tags() {
+    std::string sse =
+        "data: {\"choices\":[{\"delta\":{\"content\":"
+            "\"<tool_call>\\n{\\\"name\\\": \\\"echo\\\", "
+            "\\\"arguments\\\": {\\\"text\\\": \\\"hi\\\"}}\\n"
+            "</tool_call>\"}}]}\n\n"
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+        "data: [DONE]\n\n";
+    auto msgs = oai::parse_sse_for_test(sse, {"echo", "read"});
+    CHECK(count_leaf<StreamToolUseStart>(msgs) == 1);
+    CHECK(joined_text(msgs).empty());   // tags + JSON consumed, not leaked
+    for (const auto& m : msgs)
+        if (const auto* s = get_leaf<StreamToolUseStart>(m))
+            CHECK(s->name.value == "echo");
+    CHECK(joined_tool_args(msgs) == std::string{"{\"text\":\"hi\"}"});
+}
+
+// A ```json-fenced leak inside <tool_call> tags (belt-and-suspenders form
+// some templates produce) must also salvage cleanly.
+static void test_sse_salvage_fenced_tags() {
+    std::string sse =
+        "data: {\"choices\":[{\"delta\":{\"content\":"
+            "\"<tool_call>```json\\n{\\\"name\\\": \\\"echo\\\", "
+            "\\\"arguments\\\": {}}\\n```</tool_call>\"}}]}\n\n"
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+        "data: [DONE]\n\n";
+    auto msgs = oai::parse_sse_for_test(sse, {"echo"});
+    CHECK(count_leaf<StreamToolUseStart>(msgs) == 1);
+    CHECK(joined_text(msgs).empty());
+}
+
 static void test_sse_salvage_unknown_tool_stays_text() {
     // A bare JSON naming a tool we did NOT advertise must NOT be salvaged —
     // it falls through to ordinary text (we never invent a call).
@@ -373,6 +408,8 @@ int main() {
     test_sse_two_tool_calls();
     test_sse_error_frame();
     test_sse_salvage_leaked_tool_call();
+    test_sse_salvage_tool_call_tags();
+    test_sse_salvage_fenced_tags();
     test_sse_salvage_unknown_tool_stays_text();
     test_sse_truncated_leaked_tool_call_dropped();
     test_sse_two_leaked_calls_unique_ids();

@@ -179,6 +179,59 @@ void test_cross_subturn_releak_deduped() {
           "cross-sub-turn re-leak resolved Failed");
 }
 
+// ── 7. Runaway leak loop with DRIFTING args is bounded by the budget ────────
+// Weak models re-leak the same tool with slightly different args each
+// sub-turn (e.g. remember with scope flipping project/user), defeating the
+// exact-match dedup. After the per-turn salvage budget is spent, any further
+// pending salvaged call is failed without running so the loop terminates.
+void test_salvage_budget_bounds_drifting_loop() {
+    Model m;
+    m.d.current.messages.push_back(user());
+    // 8 prior salvaged calls already ran terminal this turn (the budget), each
+    // with DIFFERENT args so none would be caught by exact-match dedup.
+    std::vector<ToolUse> calls;
+    for (int i = 0; i < 8; ++i)
+        calls.push_back(make_call("call_salvaged_" + std::to_string(i),
+                                  "remember",
+                                  json{{"text", "fact " + std::to_string(i)}},
+                                  /*terminal=*/true));
+    m.d.current.messages.push_back(asst(std::move(calls)));
+    // The 9th re-leak: a brand-new args value, not an exact duplicate.
+    m.d.current.messages.push_back(asst({
+        make_call("call_salvaged_8", "remember",
+                  json{{"text", "fact 8 (drifted)"}}, /*terminal=*/false),
+    }));
+
+    auto n = agentty::app::cmd::dedup_releaked_salvage_calls(m);
+    check(n == 1, "over-budget drifting salvaged call failed (loop bounded)");
+    check(m.d.current.messages.back().tool_calls[0].is_failed(),
+          "over-budget call resolved Failed without running");
+}
+
+// ── 8. A STRUCTURED call is never capped by the salvage budget ──────────────
+// The budget only governs synthetic salvaged leaks. A real structured tool
+// call after many salvaged ones is deliberate intent and must still run.
+void test_structured_call_not_budget_capped() {
+    Model m;
+    m.d.current.messages.push_back(user());
+    std::vector<ToolUse> calls;
+    for (int i = 0; i < 8; ++i)
+        calls.push_back(make_call("call_salvaged_" + std::to_string(i),
+                                  "remember",
+                                  json{{"text", "fact " + std::to_string(i)}},
+                                  /*terminal=*/true));
+    m.d.current.messages.push_back(asst(std::move(calls)));
+    m.d.current.messages.push_back(asst({
+        make_call("call_real_1", "read",
+                  json{{"path", "/tmp/x"}}, /*terminal=*/false),
+    }));
+
+    auto n = agentty::app::cmd::dedup_releaked_salvage_calls(m);
+    check(n == 0, "structured call not capped by salvage budget");
+    check(m.d.current.messages.back().tool_calls[0].is_pending(),
+          "structured call stays Pending despite spent salvage budget");
+}
+
 } // namespace
 
 int main() {
@@ -188,6 +241,8 @@ int main() {
     test_first_salvaged_call_runs();
     test_prior_turn_not_counted();
     test_cross_subturn_releak_deduped();
+    test_salvage_budget_bounds_drifting_loop();
+    test_structured_call_not_budget_capped();
 
     if (g_fails == 0) {
         std::printf("salvage_dedup_test: all checks passed\n");
