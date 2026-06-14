@@ -135,7 +135,22 @@ struct StreamCtx {
     // in <tool_call>…</tool_call> (or a fenced ```json block) instead of the
     // structured tool_calls[] channel. Keep holding while the prefix is still
     // a possible opener for any of those forms, or a bare JSON object.
-    if (rest.front() == '{') return true;
+    // NOTE: A lone `{` is NOT enough — that could be C++ code like `int main() {`.
+    // Require `{"` (brace + quote) to indicate a JSON object is starting.
+    // If there's a newline before any quote, it's NOT JSON (C++ code block).
+    if (rest.front() == '{') {
+        if (rest.size() == 1) return true;  // incomplete, could be {"...
+        // Scan for the next significant character
+        for (std::size_t j = 1; j < rest.size(); ++j) {
+            char c = rest[j];
+            if (c == '"') return true;   // {" or { " = JSON object
+            if (c == '\n' || c == '\r') return false;  // {\n = C++ code, not JSON
+            // Skip spaces/tabs, keep looking
+            if (c != ' ' && c != '\t') return false;  // { followed by non-quote = not JSON
+        }
+        // Only spaces/tabs seen, still incomplete
+        return true;
+    }
     // Prefix of "<tool_call>" — still possibly a tool call.
     // NOTE: We ONLY hold if `rest` is a strict prefix of "<tool_call>"
     // (e.g. "<", "<t", "<tool_"). We do NOT hold on arbitrary <...
