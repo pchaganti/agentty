@@ -652,6 +652,28 @@ static void test_ndjson_prose_not_salvaged() {
     CHECK(!joined_text(msgs).empty());
 }
 
+// Markdown code fences with a language tag (```cpp, ```python) must stream
+// immediately, NOT be held as potential tool-call JSON. This was a bug:
+// the model emitting a code block with {} inside would freeze the stream.
+static void test_sse_markdown_code_fence_not_held() {
+    // A ```cpp code block with braces inside.
+    std::string sse =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"```cpp\\n\"}}]}\n\n"
+        "data: {\"choices\":[{\"delta\":{\"content\":\"int main() {\"}}]}\n\n"
+        "data: {\"choices\":[{\"delta\":{\"content\":\"\\n  return 0;\"}}]}\n\n"
+        "data: {\"choices\":[{\"delta\":{\"content\":\"\\n}\\n```\"}}]}\n\n"
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+        "data: [DONE]\n\n";
+    auto msgs = oai::parse_sse_for_test(sse, {"read"});
+    // Should NOT be held/salvaged as a tool call.
+    CHECK(count_leaf<StreamToolUseStart>(msgs) == 0);
+    // All text should be flushed immediately as prose.
+    auto text = joined_text(msgs);
+    CHECK(text.find("```cpp") != std::string::npos);
+    CHECK(text.find("int main()") != std::string::npos);
+    CHECK(text.find("return 0") != std::string::npos);
+}
+
 int main() {
     test_build_tools();
     test_build_messages_basic();
@@ -685,6 +707,9 @@ int main() {
     test_ndjson_structured_tool_call();
     test_ndjson_leaked_content_salvaged();
     test_ndjson_prose_not_salvaged();
+
+    // Markdown code fence regression.
+    test_sse_markdown_code_fence_not_held();
 
     if (g_failures == 0) {
         std::printf("openai_transport_test: all checks passed\n");

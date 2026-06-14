@@ -445,11 +445,31 @@ void ensure_nonempty_turn(StreamCtx& ctx) {
         if (sv.starts_with("</tool_call>")) {
             sv.remove_prefix(12);
         }
-        // ```json or ``` fence.
+        // ```json fence is a tool-call wrapper — strip it. But ```cpp,
+        // ```python, etc. are markdown code blocks — DON'T strip them.
+        // NOTE: After JSON is salvaged, we also see a CLOSING ``` (the end of
+        // a ```json...``` fence). Strip it unconditionally — it's not a code
+        // block, it's the end of the wrapper. Detect "closing fence" by
+        // checking if it's followed by </tool_call> or end-of-buffer.
         if (sv.starts_with("```json")) {
             sv.remove_prefix(7);
         } else if (sv.starts_with("```")) {
-            sv.remove_prefix(3);
+            std::string_view after = sv.substr(3);
+            // Skip whitespace/newlines
+            std::size_t k = 0;
+            while (k < after.size() && (after[k] == ' ' || after[k] == '\t'
+                   || after[k] == '\n' || after[k] == '\r')) ++k;
+            // Strip if:
+            // - followed by { (opening fence for JSON)
+            // - followed by </tool_call> (closing fence of wrapper)
+            // - at end of buffer (closing fence, incomplete)
+            // - just whitespace to end (closing fence, incomplete)
+            // DON'T strip if followed by a language tag (```cpp etc.)
+            if (k >= after.size() || after[k] == '{' ||
+                after.substr(k).starts_with("</tool_call>")) {
+                sv.remove_prefix(3);
+            }
+            // Otherwise it's ```cpp / ```python etc. — don't strip anything
         }
         // More whitespace after fence/tag.
         while (!sv.empty() && (sv.front()==' '||sv.front()=='\t'
