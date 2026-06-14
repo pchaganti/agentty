@@ -74,6 +74,28 @@ void sync_todo_state_from_args(Model& m, const nlohmann::json& args);
 Step           submit_message(Model m);
 void           persist_settings(const Model& m);
 
+// Clear ALL transient composer draft state (text, cursor, attachments,
+// undo/redo, history walk, queued messages, queue-peek/draft snapshots).
+// Used on a wholesale thread swap (NewThread / ThreadLoaded): a draft —
+// including a pasted-but-unsent image attachment — belongs to the thread
+// the user was on, not the one they switched to. Leaking it carried the
+// pasted image (with its bytes already drained into a prior Message, so
+// the leftover Attachment body is EMPTY) into the next thread's first
+// submit, which serialized an empty image block and 400'd the request.
+void           reset_composer_draft(ComposerState& c);
+
+// Canonical id of the currently-active provider ("anthropic" for the
+// Claude path, else the OpenAI endpoint label — "openai" / "ollama" / …).
+// Used to key per-provider model recall in Settings::provider_models.
+std::string    active_provider_id();
+
+// Pick the model to make active when switching TO provider `spec`. Prefers
+// the model last used on that provider (Settings::provider_models), else a
+// sane built-in default for the provider kind. Returns empty when no recall
+// exists and the provider has no hardcoded default (the model list refetch
+// will then auto-select the first available model).
+std::string    model_for_provider(std::string_view spec);
+
 // ── Frozen-scrollback prefix helpers (frozen.cpp) ────────────────────────
 //
 // freeze_through_prior_turn: walk m.d.current.messages[frozen_through..end)

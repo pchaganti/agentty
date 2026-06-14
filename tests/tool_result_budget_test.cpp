@@ -143,6 +143,59 @@ int main() {
         check(!content.empty(), "multibyte result content non-empty");
     }
 
+    // ── 4. Empty-bytes image must NOT serialize an empty image block ──
+    // A draft image attachment whose bytes were already drained can leak
+    // into a thread (pre-fix) and surface as a User message carrying an
+    // ImageContent with empty bytes. The wire must drop it entirely —
+    // emitting `"data":""` 400s the whole request ("image cannot be
+    // empty"). A REAL image in the same message must still ship.
+    {
+        using agentty::ImageContent;
+        using agentty::Message;
+        using agentty::Role;
+
+        Message user;
+        user.role = Role::User;
+        user.text = "look at this";
+        ImageContent empty_img;          // empty bytes — the leak shape
+        empty_img.media_type = "image/png";
+        user.images.push_back(std::move(empty_img));
+
+        Thread t{ThreadId{"t"}, "", {user}, {}, {}};
+        std::string wire = ap::messages_json_string(t);
+        auto j = nlohmann::json::parse(wire);
+        // No image block anywhere; the message still ships its text.
+        bool any_image = false, any_text = false;
+        for (const auto& msg : j)
+            for (const auto& b : msg.value("content", nlohmann::json::array())) {
+                if (b.value("type", "") == "image")  any_image = true;
+                if (b.value("type", "") == "text")   any_text  = true;
+            }
+        check(!any_image, "empty-bytes image is dropped from the wire");
+        check(any_text, "the message's text still ships");
+
+        // Now a real image alongside an empty one: only the real one ships.
+        Message user2;
+        user2.role = Role::User;
+        user2.text = "two images";
+        ImageContent empty2; empty2.media_type = "image/png";
+        ImageContent real2;  real2.media_type = "image/png";
+        real2.bytes = "\x89PNG\r\n\x1a\n realbytes";
+        user2.images.push_back(std::move(empty2));
+        user2.images.push_back(std::move(real2));
+        Thread t2{ThreadId{"t"}, "", {user2}, {}, {}};
+        auto j2 = nlohmann::json::parse(ap::messages_json_string(t2));
+        int image_blocks = 0;
+        for (const auto& msg : j2)
+            for (const auto& b : msg.value("content", nlohmann::json::array()))
+                if (b.value("type", "") == "image") {
+                    ++image_blocks;
+                    check(!b["source"].value("data", "").empty(),
+                          "shipped image block has non-empty base64");
+                }
+        check(image_blocks == 1, "exactly the one real image ships");
+    }
+
     if (g_fails == 0) std::fprintf(stderr, "\nALL PASS\n");
     else              std::fprintf(stderr, "\n%d FAILURE(S)\n", g_fails);
     return g_fails == 0 ? 0 : 1;

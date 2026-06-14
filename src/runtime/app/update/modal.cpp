@@ -13,6 +13,8 @@
 #include "agentty/runtime/app/cmd_factory.hpp"
 #include "agentty/runtime/app/deps.hpp"
 #include "agentty/runtime/composer_attachment.hpp"
+#include "agentty/provider/registry.hpp"
+#include "agentty/provider/selection.hpp"
 #include "agentty/store/store.hpp"
 #include "agentty/tool/skills.hpp"
 
@@ -301,12 +303,56 @@ Step submit_message(Model m) {
     return {std::move(m), std::move(cmd)};
 }
 
+std::string active_provider_id() {
+    const auto& sel = provider::active();
+    if (sel.kind == provider::Kind::OpenAI)
+        return sel.openai_endpoint.label;
+    return std::string{provider::default_provider_id()};
+}
+
+std::string model_for_provider(std::string_view spec) {
+    // 1) Recall the model the user last used on this provider.
+    auto s = deps().load_settings();
+    if (auto it = s.provider_models.find(std::string{spec});
+        it != s.provider_models.end() && !it->second.empty())
+        return it->second;
+
+    // 2) No recall — fall back to a sane built-in default per provider.
+    //    Local backends (Ollama) have no fixed default; return empty so the
+    //    model-list refetch auto-selects the first available model.
+    if (spec == "anthropic" || spec.empty()) return "claude-opus-4-5";
+    if (spec == "openai")                    return "gpt-4o";
+    return {};
+}
+
+void reset_composer_draft(ComposerState& c) {
+    c.text.clear();
+    c.cursor = 0;
+    c.attachments.clear();
+    c.undo_stack.clear();
+    c.redo_stack.clear();
+    c.history_idx = -1;
+    c.draft_save.reset();
+    c.draft_save_attachments.clear();
+    c.queue_peek_idx = -1;
+    c.queued.clear();
+}
+
 void persist_settings(const Model& m) {
-    store::Settings s;
+    // Load-modify-save: preserve provider, provider_keys, and the
+    // per-provider model map that this function doesn't own. Building a
+    // fresh Settings{} here would silently wipe the active provider on
+    // every model-picker select.
+    auto s = deps().load_settings();
     s.model_id = m.d.model_id;
     s.profile  = m.d.profile;
+    s.favorite_models.clear();
     for (const auto& mi : m.d.available_models)
         if (mi.favorite) s.favorite_models.push_back(mi.id);
+    // Record this model as the active provider's last-used selection so a
+    // later switch back to it restores exactly this model.
+    if (!m.d.model_id.empty())
+        s.provider_models[active_provider_id()] = m.d.model_id.value;
     deps().save_settings(s);
 }
 

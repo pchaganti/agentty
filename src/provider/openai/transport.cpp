@@ -510,7 +510,13 @@ json build_messages(const Thread& t) {
     json arr = json::array();
     for (const auto& m : t.messages) {
         const bool has_text   = !m.text.empty();
-        const bool has_images = (m.role == Role::User && !m.images.empty());
+        // Skip empty-bytes images (a drained draft attachment that leaked
+        // into the wrong thread) — a "data:...;base64," with no payload
+        // makes the server reject the request.
+        bool has_images = false;
+        if (m.role == Role::User)
+            for (const auto& img : m.images)
+                if (!img.bytes.empty()) { has_images = true; break; }
         const bool has_tools  = is_assistant_with_results(m);
 
         if (has_text || has_images || has_tools) {
@@ -529,6 +535,7 @@ json build_messages(const Thread& t) {
                 if (!wire_text.empty())
                     content.push_back({{"type", "text"}, {"text", wire_text}});
                 for (const auto& img : m.images) {
+                    if (img.bytes.empty()) continue;
                     std::string url = "data:" + img.media_type + ";base64,"
                                     + agentty::util::base64_encode(img.bytes);
                     content.push_back({{"type", "image_url"},

@@ -51,6 +51,21 @@ Step model_picker_update(Model m, msg::ModelPickerMsg pm) {
                     if (mi.id == fav) mi.favorite = true;
                 m.d.available_models.push_back(std::move(mi));
             }
+            // If the active model isn't offered by this provider (e.g. just
+            // switched to Ollama with no recall, or a stale saved id), fall
+            // back to the first available model so the user is never pointed
+            // at a model that 400s on the first prompt. Persist the pick so
+            // it sticks as this provider's recall.
+            bool active_present = false;
+            for (const auto& mi : m.d.available_models)
+                if (mi.id == m.d.model_id) { active_present = true; break; }
+            if (!active_present && !m.d.available_models.empty()) {
+                m.d.model_id = m.d.available_models.front().id;
+                m.s.context_max =
+                    ui::context_max_for_model(m.d.model_id.value);
+                tools::subagent::set_model(m.d.model_id.value);
+                persist_settings(m);
+            }
             if (auto* p = pick::opened(m.ui.model_picker)) {
                 p->index = 0;
                 for (int i = 0; i < static_cast<int>(m.d.available_models.size()); ++i)
@@ -165,6 +180,10 @@ Step provider_picker_update(Model m, msg::ProviderPickerMsg pm) {
             const auto& preset = presets[static_cast<std::size_t>(p->index)];
             const std::string spec{preset.id};
 
+            // Capture the OUTGOING provider id before provider::select swaps
+            // active() — needed to file the current model under it.
+            const std::string active_provider_id_before = active_provider_id();
+
             // Resolve the new backend's credentials BEFORE committing the
             // switch so we can refuse a switch that would land the user in a
             // silently-broken state (every request 401s with no key). For
@@ -196,8 +215,23 @@ Step provider_picker_update(Model m, msg::ProviderPickerMsg pm) {
             provider::select(provider::parse_selection(spec));
             {
                 auto settings = deps().load_settings();
+                // Remember the model we were using on the OUTGOING provider
+                // so a later switch back restores it.
+                if (!m.d.model_id.empty())
+                    settings.provider_models[active_provider_id_before] =
+                        m.d.model_id.value;
                 settings.provider = spec;
                 deps().save_settings(settings);
+            }
+
+            // Make a valid model active for the NEW provider: the model last
+            // used there, else a built-in default. For local backends with
+            // no recall this is empty and ModelsLoaded auto-selects the first
+            // available model once the refetch lands.
+            if (auto next = model_for_provider(spec); !next.empty()) {
+                m.d.model_id = ModelId{next};
+                m.s.context_max = ui::context_max_for_model(m.d.model_id.value);
+                tools::subagent::set_model(m.d.model_id.value);
             }
 
             // Swap the Deps auth to the new backend's credentials. The stream
@@ -336,8 +370,11 @@ Step thread_list_update(Model m, msg::ThreadListMsg tm) {
             clear_frozen(m);
             m.ui.thread_list = pick::Closed{};
             m.ui.command_palette = palette::Closed{};
-            m.ui.composer.text.clear();
-            m.ui.composer.cursor = 0;
+            // Wipe the whole composer draft — a pasted-but-unsent image (or
+            // any chip / queued message) belongs to the thread we're
+            // leaving. Leaking it carried an empty-bytes image attachment
+            // into the new thread's first submit and 400'd the request.
+            reset_composer_draft(m.ui.composer);
             // any → Idle. Discards the active ctx if any was present
             // (NewThread can fire mid-stream; the user-visible Esc
             // wasn't pressed but the request is conceptually
@@ -402,6 +439,12 @@ Step thread_list_update(Model m, msg::ThreadListMsg tm) {
                 std::fflush(prof_out);
             };
             m.d.current = std::move(e.thread);
+            // Wipe the composer draft — same rationale as NewThread: a
+            // pasted-but-unsent image / chip / queued message belongs to
+            // the thread being left, and the leftover image Attachment has
+            // empty bytes (drained into a prior Message), which serializes
+            // an empty image block and 400s the next submit.
+            reset_composer_draft(m.ui.composer);
             auto t1 = std::chrono::steady_clock::now();
             rehydrate_frozen(m);
             stamp("rehydrate_frozen", t1);

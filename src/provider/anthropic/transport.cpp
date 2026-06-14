@@ -913,6 +913,17 @@ namespace {
     return m.role == Role::Assistant && !m.tool_calls.empty();
 }
 
+// True iff the message carries at least one image with non-empty bytes.
+// An empty-bytes ImageContent (e.g. a draft attachment whose body was
+// already drained, leaked into a thread it doesn't belong to) must NOT
+// drive the message-emission decision: serializing it produces an empty
+// base64 "data" field that 400s the whole request.
+[[nodiscard]] inline bool has_wire_image(const Message& m) noexcept {
+    for (const auto& img : m.images)
+        if (!img.bytes.empty()) return true;
+    return false;
+}
+
 void json_write_escaped_string(std::string& out, std::string_view s) {
     out.push_back('"');
     out.reserve(out.size() + s.size() + 2);
@@ -1077,7 +1088,7 @@ void write_tool_result_block(std::string& out, const ToolUse& tc, bool pin_cache
     // contributes TWO messages (assistant + tool_results follow-up).
     int total_msgs = 0;
     for (const auto& m : t.messages) {
-        const bool has_images = (m.role == Role::User && !m.images.empty());
+        const bool has_images = (m.role == Role::User && has_wire_image(m));
         if (!m.text.empty()
          || has_images
          || (m.role == Role::Assistant && !m.tool_calls.empty())) {
@@ -1107,7 +1118,7 @@ void write_tool_result_block(std::string& out, const ToolUse& tc, bool pin_cache
     for (const auto& m : t.messages) {
         // ── Primary message (text + tool_use blocks if Assistant) ──
         const bool has_text   = !m.text.empty();
-        const bool has_images = (m.role == Role::User && !m.images.empty());
+        const bool has_images = (m.role == Role::User && has_wire_image(m));
         const bool has_tools  = (m.role == Role::Assistant && !m.tool_calls.empty());
         if (has_text || has_images || has_tools) {
             const int my_idx   = emitted;
@@ -1123,12 +1134,21 @@ void write_tool_result_block(std::string& out, const ToolUse& tc, bool pin_cache
             // model reads in array order and benefits from having the
             // visual context loaded before the prompt text. Then the
             // text block, then any tool_use blocks (Assistant turns).
-            int blocks = (has_images ? static_cast<int>(m.images.size()) : 0)
+            // EMPTY-bytes images are skipped entirely: a stray
+            // empty ImageContent (e.g. a draft attachment whose bytes
+            // were already drained) would serialize an empty base64
+            // "data" field and 400 the whole request.
+            int wire_images = 0;
+            if (has_images)
+                for (const auto& img : m.images)
+                    if (!img.bytes.empty()) ++wire_images;
+            int blocks = wire_images
                        + (has_text ? 1 : 0)
                        + (has_tools ? static_cast<int>(m.tool_calls.size()) : 0);
             int block_emitted = 0;
             if (has_images) {
                 for (const auto& img : m.images) {
+                    if (img.bytes.empty()) continue;
                     if (block_emitted++ > 0) out.push_back(',');
                     const bool last_block = (block_emitted == blocks);
                     write_image_block(out, img, do_pin && last_block);
