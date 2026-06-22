@@ -387,15 +387,21 @@ static void test_trim_no_leading_gap() {
           "but kept its body)");
 }
 
-// 8. The over-budget trim must commit EXACTLY the rows it dropped via a
-//    row-counted commit_scrollback(removed_rows) — never the generic
-//    commit_scrollback_overflow(), which releases down to a single
-//    viewport (prev_rows - term_h) while the trim KEEPS ~1.5 viewports.
-//    Over-committing the extra ~0.5 viewport releases rows still in the
-//    live frozen tree; the next render re-emits them above the committed
-//    boundary and the most-recent off-budget turn duplicates one screen
-//    up. This is the "after the third write, the second duplicates" bug.
-//    The commit must never exceed the dropped (estimated) rows.
+// 8. The over-budget trim drops the oldest frozen entries from the MODEL
+//    (a top-DELETION of the frozen prefix) and MUST commit exactly the
+//    dropped rows to native scrollback via Cmd::commit_scrollback(N).
+//    This is NOT a bottom-shrink: maya's render-time shrink
+//    reconciliation cannot fix a top-deletion. After the drop the new
+//    canvas content shifts up, so canvas row 0 differs from prev_cells
+//    and scrollback_prefix_matches() returns false; maya's only
+//    prefix-mismatch recovery commits the NEW prefix into scrollback
+//    rows that PHYSICALLY hold OLD content, stranding a duplicate of the
+//    trimmed boundary one screen up. Returning none() TRIGGERS that bug,
+//    it does not avoid it. commit_scrollback(removed_rows) runs against
+//    the prior (old-content) frame, advancing prev_rows/prev_cells in
+//    lockstep so the next render aligns and the boundary lands once.
+//    CONTRACT: the trim mutates the model AND returns
+//    commit_scrollback(removed_rows).
 static void test_trim_commits_exact_dropped_rows() {
     Model m;
     m.d.current.id = agentty::ThreadId{"trimrows"};
@@ -438,22 +444,24 @@ static void test_trim_commits_exact_dropped_rows() {
           "trim did not drop any entries despite an over-budget prefix");
     CHECK(dropped_rows > 0, "trim dropped entries but no rows");
 
-    // The returned Cmd MUST be a row-counted commit_scrollback whose
-    // count equals exactly the dropped rows — NOT commit_scrollback_
-    // overflow (which would over-commit and duplicate the kept turn).
+    // The returned Cmd MUST be commit_scrollback(N) where N is the exact
+    // count of rows the trim removed from the TOP of the frozen prefix.
+    // A top-deletion is invisible to maya's render-time reconciliation;
+    // the host must commit the dropped rows against the still-valid old
+    // frame so the next render's shorter canvas aligns. Returning none()
+    // (or commit_scrollback_overflow) strands a duplicate boundary.
     using Cmd = maya::Cmd<agentty::Msg>;
-    const auto* exact = std::get_if<Cmd::CommitScrollback>(&cmd.inner);
-    const auto* overflow =
-        std::get_if<Cmd::CommitScrollbackOverflow>(&cmd.inner);
-    CHECK(overflow == nullptr,
-          "trim used commit_scrollback_overflow() (over-commits the kept "
-          "~0.5 viewport -> duplicate). Must use commit_scrollback(removed).");
-    CHECK(exact != nullptr,
-          "trim did not return a row-counted commit_scrollback");
-    if (exact) {
-        CHECK(static_cast<std::size_t>(exact->rows) == dropped_rows,
-              "trim committed a row count != the rows it dropped "
-              "(over-commit strands a duplicate, under-commit leaks rows)");
+    const auto* commit = std::get_if<Cmd::CommitScrollback>(&cmd.inner);
+    CHECK(commit != nullptr,
+          "trim must return commit_scrollback(N) for the top-deletion; "
+          "none() leaves maya unable to reconcile and strands a duplicate "
+          "of the trimmed boundary one screen up.");
+    if (commit) {
+        CHECK(commit->rows == static_cast<int>(dropped_rows),
+              "trim committed the wrong row count — must equal the rows "
+              "dropped from the frozen prefix, or the scrollback boundary "
+              "misaligns (under-commit strands the new prefix; over-commit "
+              "eats a visible row).");
     }
 }
 

@@ -951,20 +951,34 @@ maya::Cmd<Msg> trim_frozen_if_oversized(Model& m) {
     std::size_t removed_rows = pop_front_frozen(m, drop);
     removed_rows += pop_front_frozen_leading_separators(m);
 
-    // commit_scrollback(removed_rows): commit EXACTLY the rows this
-    // trim dropped from the front — no more. The generic
-    // commit_scrollback_overflow() commits down to a single viewport
-    // (prev_rows - term_h), but this trim KEEPS ~1.5 viewports
-    // (frozen_row_budget). Over-committing the extra ~0.5 viewport
-    // releases rows that are STILL in the live frozen tree: the next
-    // render re-emits them above the committed boundary, stranding a
-    // duplicate copy of the most-recent off-budget turn one screen up
-    // (the "after the third write the second duplicates" ghost). The
-    // dropped rows all overflowed (we retain >= term_h on screen), so
-    // commit_inline_prefix's clamp to (prev_rows - term_h) never bites
-    // and the committed boundary lands exactly at the new tree's top.
+    // Commit EXACTLY the rows the trim deleted from the TOP of the frozen
+    // prefix. This is a top-DELETION, not a bottom-shrink, and maya's
+    // render-time shrink reconciliation cannot fix it: after the drop the
+    // new canvas's content shifts up, so canvas row 0 differs from
+    // prev_cells and scrollback_prefix_matches() returns false. maya's
+    // only recovery for a prefix mismatch is
+    // `scrollback_marker(prev_rows - term_h) + soft-repaint`, which
+    // commits the NEW canvas's prefix into the scrollback region that
+    // PHYSICALLY still holds the OLD content — stranding a duplicate copy
+    // of the trimmed boundary one screen up. Returning none() does not
+    // avoid that; it triggers it, because render-time reconciliation
+    // can't tell "scrolled because the bottom grew" (commit byte-
+    // accurate) from "deleted at the top" (commit byte-wrong).
+    //
+    // commit_scrollback(removed_rows) runs against the PRIOR frame's
+    // Synced state — i.e. the still-valid OLD content — advancing
+    // prev_rows/prev_cells by exactly the dropped rows in lockstep with
+    // the memmove. The trimmed entries were off-viewport (deep in
+    // scrollback), so removed_rows <= prev_rows - term_h and maya's
+    // internal clamp never truncates. The next render() then paints the
+    // shorter canvas against the already-advanced shadow: new_rows ==
+    // prev_rows, the shrink-while-overflowed guard never fires, and the
+    // boundary lands once, in place, with no \x1b[3J wipe.
+    if (removed_rows == 0) return maya::Cmd<Msg>::none();
     return maya::Cmd<Msg>::commit_scrollback(
-        static_cast<int>(removed_rows));
+        static_cast<int>(std::min<std::size_t>(
+            removed_rows,
+            static_cast<std::size_t>(std::numeric_limits<int>::max()))));
 }
 
 } // namespace agentty::app::detail

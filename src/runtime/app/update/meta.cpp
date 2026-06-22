@@ -103,6 +103,13 @@ Step meta_update(Model m, msg::MetaMsg mm) {
             m.s.last_tick = now;
             if (m.s.active()) m.s.spinner.advance(dt);
 
+            // Post-freeze settling window countdown. Keeps the tick
+            // subscription armed (subscribe.cpp gates on it) for a few
+            // frames after the settle-freeze so maya's renderer fully
+            // reconciles the live-tail→frozen collapse before the clock
+            // stops. Decrement here so each rendered frame burns one.
+            if (m.ui.settle_cooldown_ticks > 0) --m.ui.settle_cooldown_ticks;
+
             // ── Deferred settle-freeze (post-stream redraw fix) ──────
             // finalize_turn settled the just-finished assistant message
             // (finish() on its StreamingMarkdown) but deferred the freeze
@@ -150,7 +157,38 @@ Step meta_update(Model m, msg::MetaMsg mm) {
                         settle_message_md(m, mm);
                     }
                     freeze_through(m, m.d.current.messages.size());
+                    // Drop oldest frozen entries past the budget. The
+                    // live-tail collapse and the front-trim are TWO
+                    // distinct shrinks with OPPOSITE wire requirements,
+                    // so they must not be lumped under one none():
+                    //
+                    //  • The collapse (live tail folds into the frozen
+                    //    prefix) is a BOTTOM-shrink with an unchanged
+                    //    overflowed prefix. maya's scrollback_prefix_
+                    //    matches branch falls through to the append-only
+                    //    per-row diff — corruption-free, NO host commit.
+                    //
+                    //  • The trim drops entries from the TOP of the
+                    //    frozen prefix — a top-DELETION maya cannot
+                    //    reconcile at render time (the shifted-up canvas
+                    //    fails the prefix memcmp and maya commits the NEW
+                    //    prefix over PHYSICAL old rows, stranding a
+                    //    duplicate). It MUST host-commit exactly the
+                    //    dropped rows. trim_frozen_if_oversized returns
+                    //    that commit_scrollback(N) when (and only when)
+                    //    it actually trimmed; none() when it didn't.
+                    //
+                    // Forward the trim's Cmd verbatim: none() on the
+                    // common collapse-only Tick, commit_scrollback(N) on
+                    // the rarer Tick that also trims the front.
                     settle_freeze_trim = trim_frozen_if_oversized(m);
+
+                    // Keep the clock alive for a few frames so maya's
+                    // shrink reconciliation (its own diff-path collapse)
+                    // completes at fps=0, mirroring agent_session's
+                    // always-on clock.
+                    m.ui.settle_cooldown_ticks = 6;
+                    ::maya::request_animation_frame();
                 } else {
                     // Reveal still draining — keep the frame armed so the
                     // typewriter animates and we re-test the gate next
