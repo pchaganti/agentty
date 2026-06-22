@@ -223,6 +223,37 @@ int main() {
         check(read_file(f) == "yyyyy\n", "full-replacement correct");
     }
 
+    // ── Test 6: "Did you mean?" error for genuine mismatch ───────────
+    // When old_text is genuinely NOT in the file, the error should surface
+    // the closest matching region (Aider-style "Did you mean?").
+    {
+        fs::path f = dir / "didyoumean.cpp";
+        write_file(f,
+            "void process_data(int x) {\n"
+            "    int result = x * 2;\n"
+            "    return result;\n"
+            "}\n");
+
+        // Try to match with completely different function name.
+        json args = {
+            {"path", f.string()},
+            {"edits", json::array({
+                json{
+                    {"old_text",
+                        "void totally_different_function(int y) {\n"
+                        "    int output = y / 3;\n"
+                        "    return output;\n"
+                        "}"},
+                    {"new_text", "void foo() {}"},
+                },
+            })},
+        };
+        bool ok = false;
+        std::string out = run_edit(args, ok);
+        // Should fail.
+        check(!ok, "genuinely-different edit should fail");
+    }
+
     if (g_fails == 0) std::fprintf(stderr, "\nALL PASS\n");
     else              std::fprintf(stderr, "\n%d FAIL(s)\n", g_fails);
     return g_fails ? 1 : 0;

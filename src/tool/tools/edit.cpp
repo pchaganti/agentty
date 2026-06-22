@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <format>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -361,6 +362,162 @@ std::string render_context_window(std::string_view buf,
     return out;
 }
 
+// ── Aider-style "Did you mean?" candidate finding ────────────────────────
+// When fuzzy_find fails, find candidate regions in the file that PARTIALLY
+// match the needle's structure. Returns a rendered block showing:
+//   1. The first few lines of old_text (what the model sent)
+//   2. The best-matching actual region in the file
+// This is Aider's killer UX: instead of "not found", show what COULD match.
+
+struct CandidateRegion {
+    int start_line;       // 1-based
+    int end_line;         // 1-based, inclusive
+    double score;         // 0.0-1.0, higher = better
+};
+
+// Score how well `needle_lines` matches starting at `file_line_idx` in `file_lines`.
+// Uses a simple LCS-style overlap count normalized by needle length.
+double score_region(const std::vector<std::string_view>& file_lines,
+                    std::size_t file_line_idx,
+                    const std::vector<std::string_view>& needle_lines) {
+    if (needle_lines.empty()) return 0.0;
+    std::size_t matched = 0;
+    std::size_t fi = file_line_idx;
+    for (const auto& nl : needle_lines) {
+        if (fi >= file_lines.size()) break;
+        // Exact match or high overlap → count as matched.
+        const auto& fl = file_lines[fi];
+        if (nl == fl) {
+            ++matched;
+        } else {
+            // Check if >60% of the shorter line appears in the longer.
+            auto shorter = (nl.size() < fl.size()) ? nl : fl;
+            auto longer  = (nl.size() < fl.size()) ? fl : nl;
+            if (!shorter.empty() && longer.find(shorter) != std::string_view::npos) {
+                matched += 1;  // Substring containment.
+            } else if (shorter.size() >= 4) {
+                // Check prefix overlap.
+                std::size_t overlap = 0;
+                std::size_t check = std::min(shorter.size(), longer.size());
+                for (std::size_t i = 0; i < check && shorter[i] == longer[i]; ++i)
+                    ++overlap;
+                if (overlap * 2 >= shorter.size()) matched += 1;
+            }
+        }
+        ++fi;
+    }
+    return static_cast<double>(matched) / static_cast<double>(needle_lines.size());
+}
+
+// Trim a line (remove leading/trailing whitespace) for comparison.
+std::string_view trim_line(std::string_view s) {
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r'))
+        s.remove_prefix(1);
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r'))
+        s.remove_suffix(1);
+    return s;
+}
+
+// Split text into trimmed lines.
+std::vector<std::string_view> split_trimmed_lines(std::string_view s) {
+    std::vector<std::string_view> out;
+    std::size_t pos = 0;
+    while (pos < s.size()) {
+        std::size_t end = pos;
+        while (end < s.size() && s[end] != '\n') ++end;
+        auto line = s.substr(pos, end - pos);
+        out.push_back(trim_line(line));
+        pos = (end < s.size()) ? end + 1 : end;
+    }
+    return out;
+}
+
+// Find the best candidate region in `buf` that might match `needle`.
+// Returns empty optional if no reasonable candidate (score < 0.3).
+std::optional<CandidateRegion> find_best_candidate(std::string_view buf,
+                                                    std::string_view needle) {
+    auto file_lines = split_trimmed_lines(buf);
+    auto needle_lines = split_trimmed_lines(needle);
+    if (needle_lines.empty() || file_lines.empty()) return std::nullopt;
+
+    // Skip blank needle lines at start for anchor search.
+    std::size_t first_nonblank = 0;
+    while (first_nonblank < needle_lines.size() && needle_lines[first_nonblank].empty())
+        ++first_nonblank;
+    if (first_nonblank >= needle_lines.size()) return std::nullopt;
+
+    const auto& anchor = needle_lines[first_nonblank];
+    if (anchor.size() < 4) return std::nullopt;  // Too short to anchor.
+
+    CandidateRegion best{0, 0, 0.0};
+
+    // Find lines in file that contain a good chunk of the anchor.
+    for (std::size_t i = 0; i < file_lines.size(); ++i) {
+        const auto& fl = file_lines[i];
+        // Quick filter: anchor must share significant content.
+        bool might_match = false;
+        if (fl == anchor) {
+            might_match = true;
+        } else if (anchor.size() >= 8) {
+            // Check if first 8 chars or last 8 chars overlap.
+            auto prefix = anchor.substr(0, std::min(anchor.size(), std::size_t{8}));
+            auto suffix = anchor.substr(anchor.size() > 8 ? anchor.size() - 8 : 0);
+            might_match = (fl.find(prefix) != std::string_view::npos ||
+                           fl.find(suffix) != std::string_view::npos);
+        } else {
+            might_match = (fl.find(anchor) != std::string_view::npos);
+        }
+        if (!might_match) continue;
+
+        // Score starting from this line, offset back to account for any
+        // blank lines we skipped at the needle start.
+        std::size_t start_idx = (i >= first_nonblank) ? i - first_nonblank : 0;
+        double score = score_region(file_lines, start_idx, needle_lines);
+        if (score > best.score) {
+            best.start_line = static_cast<int>(start_idx) + 1;  // 1-based
+            best.end_line = static_cast<int>(
+                std::min(start_idx + needle_lines.size(), file_lines.size()));
+            best.score = score;
+        }
+    }
+
+    if (best.score < 0.3) return std::nullopt;  // No reasonable candidate.
+    return best;
+}
+
+// Render Aider-style "Did you mean?" error message.
+std::string render_did_you_mean(std::string_view buf,
+                                 std::string_view needle,
+                                 const std::string& path_str) {
+    auto candidate = find_best_candidate(buf, needle);
+    if (!candidate) return {};
+
+    std::string out;
+    out += std::format(
+        "\n\nDid you mean to match some of these actual lines from {}?\n\n",
+        path_str);
+
+    // Show the actual file content at the candidate region.
+    out += "```\n";
+    int ln = 1;
+    std::size_t pos = 0;
+    while (pos < buf.size()) {
+        std::size_t le = pos;
+        while (le < buf.size() && buf[le] != '\n') ++le;
+        if (ln >= candidate->start_line && ln <= candidate->end_line) {
+            out.append(buf.data() + pos, le - pos);
+            out.push_back('\n');
+        }
+        pos = (le < buf.size()) ? le + 1 : le;
+        ++ln;
+        if (ln > candidate->end_line) break;
+    }
+    out += "```\n\n";
+    out += "The old_text must exactly match an existing block of lines ";
+    out += "including all whitespace, comments, and indentation.";
+    return out;
+}
+
 // Apply a single edit to `buf`. Returns number of replacements; sets `err`
 // on terminal failure (ambiguous match, not found). When the edit's
 // `new_text` already appears in `buf` where `old_text` would have matched
@@ -579,6 +736,10 @@ int apply_one(std::string& buf, const OneEdit& e,
                     "whitespace/punctuation in a way fuzzy matching "
                     "couldn't reconcile — re-read the file at that line "
                     "and copy the snippet byte-for-byte.", ln);
+            }
+            if (hint.empty()) {
+                // Last resort: Aider-style "Did you mean?" with actual file content.
+                hint = render_did_you_mean(buf, e.old_text, path_str);
             }
             if (hint.empty()) {
                 if (int ln = closest_line_hint(buf, e.old_text); ln > 0) {

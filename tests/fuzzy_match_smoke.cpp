@@ -119,17 +119,33 @@ void test_crlf() {
     check("CRLF tolerated", r.ok);
 }
 
+void test_crlf_multiline_dp() {
+    // File has CRLF line endings, needle has LF only.
+    // The DP should still match because trimmed_of strips \r.
+    std::string_view file =
+        "fn first() {\r\n"
+        "    return 1;\r\n"
+        "}\r\n"
+        "fn second() {\r\n"
+        "    return 2;\r\n"
+        "}\r\n";
+    std::string_view needle =
+        "fn second() {\n"
+        "    return 2;\n"
+        "}";
+    auto r = fuzzy_find(file, needle);
+    check("CRLF multi-line DP", r.ok,
+          "DP should match CRLF file against LF needle");
+}
+
 void test_smart_quotes() {
-    // U+2018 / U+2019 are 3-byte UTF-8.
+    // U+2018 / U+2019 are 3-byte UTF-8 curly single quotes.
+    // With smart-quote normalization in fuzzy_eq, these are converted to
+    // ASCII ' before Levenshtein comparison, so the lines match exactly.
     std::string_view file = "print(\xe2\x80\x98hello\xe2\x80\x99)\n";
     auto r = fuzzy_find(file, "print('hello')");
-    // Length diff: file has 3+3=6 extra bytes for quotes vs the 1+1 in
-    // needle, but normalized Levenshtein on (file_line=15, needle=14)
-    // → diff = 4, max=15, norm = 11/15 ≈ 0.73. JUST below threshold.
-    // This documents the limit: a single line of pure punctuation drift
-    // can fall under the 0.8 line-fuzzy gate. We accept either result;
-    // the test exists to surface the behavior, not pin a specific one.
-    std::printf("  note  smart-quotes ok=%d (informational)\n", int(r.ok));
+    check("smart-quotes normalized", r.ok,
+          "expected smart-quote normalization to match curly quotes to ASCII");
 }
 
 void test_class_methods() {
@@ -169,6 +185,7 @@ int main() {
     test_no_match();
     test_trailing_whitespace_drift();
     test_crlf();
+    test_crlf_multiline_dp();
     test_smart_quotes();
     test_class_methods();
     std::printf("\n%d/%d passed\n", total - failures, total);

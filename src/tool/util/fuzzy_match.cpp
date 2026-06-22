@@ -75,11 +75,88 @@ std::size_t levenshtein(std::string_view a, std::string_view b) noexcept {
     return prev[b.size()];
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Smart-quote / dash normalization. LLMs often hallucinate curly quotes
+// (U+2018/2019/201C/201D) and em-dashes (U+2014) when the file has plain
+// ASCII. Normalize these BEFORE Levenshtein so they don't inflate the
+// edit distance. Zero allocation when no smart chars present.
+//
+// U+2018 ‘ (left single quote)  -> '
+// U+2019 ’ (right single quote) -> '
+// U+201C “ (left double quote)  -> "
+// U+201D ” (right double quote) -> "
+// U+2014 — (em dash)            -> --
+// U+2013 – (en dash)            -> -
+// ───────────────────────────────────────────────────────────────────────────
+
+bool has_smart_chars(std::string_view s) noexcept {
+    // Quick scan for the UTF-8 lead byte 0xE2 (covers U+2000–U+2FFF).
+    for (char c : s)
+        if (static_cast<unsigned char>(c) == 0xE2) return true;
+    return false;
+}
+
+std::string normalize_smart_chars(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    std::size_t i = 0;
+    while (i < s.size()) {
+        unsigned char c0 = static_cast<unsigned char>(s[i]);
+        // Check for 3-byte UTF-8 starting with 0xE2.
+        if (c0 == 0xE2 && i + 2 < s.size()) {
+            unsigned char c1 = static_cast<unsigned char>(s[i + 1]);
+            unsigned char c2 = static_cast<unsigned char>(s[i + 2]);
+            // U+2018/2019: E2 80 98 / E2 80 99 -> '
+            if (c1 == 0x80 && (c2 == 0x98 || c2 == 0x99)) {
+                out.push_back('\'');
+                i += 3;
+                continue;
+            }
+            // U+201C/201D: E2 80 9C / E2 80 9D -> "
+            if (c1 == 0x80 && (c2 == 0x9C || c2 == 0x9D)) {
+                out.push_back('"');
+                i += 3;
+                continue;
+            }
+            // U+2014 (em dash): E2 80 94 -> --
+            if (c1 == 0x80 && c2 == 0x94) {
+                out.append("--");
+                i += 3;
+                continue;
+            }
+            // U+2013 (en dash): E2 80 93 -> -
+            if (c1 == 0x80 && c2 == 0x93) {
+                out.push_back('-');
+                i += 3;
+                continue;
+            }
+        }
+        out.push_back(static_cast<char>(c0));
+        ++i;
+    }
+    return out;
+}
+
 // Cheap pre-filter: if the length difference alone forces normalized
 // distance below the threshold, skip the full Levenshtein computation.
 // Lines that are wildly different sizes can't be fuzzy-equal.
+// Also normalizes smart-quotes/dashes before comparing.
 bool fuzzy_eq(std::string_view a, std::string_view b) noexcept {
     if (a.empty() && b.empty()) return true;
+
+    // Normalize smart-quotes/dashes if present. This handles the common
+    // case where the LLM hallucinates curly quotes but the file has ASCII.
+    // Only allocates when smart chars are actually present.
+    std::string a_norm, b_norm;
+    if (has_smart_chars(a)) {
+        a_norm = normalize_smart_chars(a);
+        a = a_norm;
+    }
+    if (has_smart_chars(b)) {
+        b_norm = normalize_smart_chars(b);
+        b = b_norm;
+    }
+
     auto max_len = std::max(a.size(), b.size());
     if (max_len == 0) return true;
     auto min_len_diff = (a.size() > b.size()) ? (a.size() - b.size())
