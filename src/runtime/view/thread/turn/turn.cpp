@@ -64,38 +64,31 @@ maya::Element cached_markdown_for(const Message& msg, const Model& m) {
         cache.streaming->set_reveal_fx(true);
         // Reveal pacing. floor_cps is a CEILING under sparse arrival and a
         // FLOOR otherwise: the cursor walks at max(backlog/drain_secs,
-        // floor_cps). The model's OPENING tokens arrive sparsely — a tiny
-        // first delta (~9 bytes) then a ~230 ms gap before the next. At
-        // the default 120 cps the cursor types those 9 bytes in 2 frames
-        // then sits idle the whole gap: the "stuck at the beginning"
-        // stutter (proven via the reveal-cursor trace — cp pins while
-        // inprog=0 until the next delta lands). A lower floor spreads
-        // the sparse opening across the gap so the typewriter glides from
-        // byte 0. Steady-state speed is unaffected: once tokens flow,
-        // backlog accumulates and burst_cps (backlog/drain_secs) takes
-        // over, pacing the cursor well above the floor.
+        // floor_cps).
         //
-        // Floor value: the first delta is ~9 cp followed by a ~330 ms
-        // gap (traced via anthropic_md_stream --trace on the tour
-        // fixture). Gliding 9 cp across that gap needs <=27 cps; at 45
-        // the cursor burned the 9 cp in ~200 ms and PINNED for ~130 ms
-        // (4 frames of inprog=0 — the visible "stuck a lil at the
-        // start"). At 30 the pin is <=2 frames (~66 ms, under
-        // perception); the floor only ever applies when backlog
-        // < floor*drain ~= 8 cp, so mid-stream typing speed is
-        // unchanged.
+        // These were retuned when the typewriter became genuinely VISIBLE
+        // (ghost_blank: not-yet-typed text renders as invisible spaces rather
+        // than dim-but-readable glyphs). Before, the reveal could lag the
+        // wire by ~0.7s and nobody noticed (the text was already on screen,
+        // just dim) — but every lagging frame re-arms a 60fps repaint, and
+        // now that the eye TRACKS the cursor that sustained repaint load reads
+        // as "slow / high CPU" for the whole turn. Tracking the wire tightly
+        // (small drain) keeps the cursor at the live edge, so the reveal is
+        // 'in motion' only for the brief trailing run — the loop drops to the
+        // calm 33ms color bucket the instant the wire pauses instead of
+        // holding 60fps for a quarter-second tail after every burst.
         //
-        // drain_secs is the cursor's lag behind the live edge: the
-        // burst term backlog/drain_secs converges the displayed rate to
-        // the wire rate with backlog ≈ drain_secs x wire_cps left
-        // standing. At 0.8 s the opening ramped 45→wire over ~2 s and
-        // the whole stream ran ~0.8 s behind arrival — the "md stream
-        // stuck at the start" feel vs agent_session (reveal off, paints
-        // on arrival). 0.25 s tracks the wire within a quarter second
-        // while keeping the floor-30 glide for sparse openings
-        // (backlog < ~8 cp still rides the floor).
-        cache.streaming->set_reveal_pacing(/*floor_cps=*/30.0,
-                                           /*drain_secs=*/0.25);
+        //   • floor 80 cps: still spreads a sparse ~9 cp opening across its
+        //     ~330 ms gap (9/80 ≈ 110 ms of typing, then a short pin under
+        //     the perception threshold) — the floor only applies when backlog
+        //     < floor*drain ≈ 5 cp, so steady typing speed is set by the wire.
+        //   • drain 0.06 s: the cursor converges to within ~0.06 s of the live
+        //     edge, so the 60fps 'in motion' window closes almost immediately
+        //     after the wire goes quiet (vs 0.25 s before). Mid-stream the
+        //     cursor rides the live edge, so the reveal is a short bright
+        //     trailing run, not a cursor crawling seconds behind.
+        cache.streaming->set_reveal_pacing(/*floor_cps=*/80.0,
+                                           /*drain_secs=*/0.06);
     }
 
     // Pick the source bytes for THIS frame. The reveal cursor must see
