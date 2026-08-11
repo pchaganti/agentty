@@ -1834,27 +1834,145 @@ Retrieval Retriever::retrieve_thread(const std::string& thread_id,
         ::rag::Engine& eng = it->second;
         if (eng.corpus().chunk_count() == 0) return out;
 
-        const auto want = static_cast<std::size_t>(std::min(k, 12));
-        auto res = eng.search(query, want, {}, nullptr);
-        if (!res) return out;
+        const auto want = static_cast<std::size_t>(std::min(std::max(k, 1), 12));
+        std::vector<std::string> trace;
+        std::vector<std::string>* tracep = impl_->cfg.trace ? &trace : nullptr;
+        std::string mode = "thread:" +
+            std::to_string(eng.corpus().chunk_count()) + " chunks";
 
-        std::size_t budget = retrieval_output_budget();
+        // 0. LLM-assisted retrieval (HyDE / multi-query) when a generator is
+        //    wired AND enabled — the same recall lift the docs path gets. For
+        //    a fork this matters: your terse follow-up ("and the sandbox?")
+        //    gets expanded toward the parent thread's actual wording, so a
+        //    relevant old turn is found even when the query and turn share few
+        //    literal terms. Falls back to plain search when unavailable.
+        std::vector<::rag::SearchResult> hits;
+        bool used_llm = false;
+        if (impl_->generator && (impl_->cfg.hyde || impl_->cfg.expand)) {
+            ::rag::query::Generator gen =
+                [&](std::string_view prompt) -> ::rag::Result<std::vector<std::string>> {
+                    try {
+                        int n = impl_->cfg.expand ? 3 : 1;
+                        return impl_->generator(std::string(prompt), n);
+                    } catch (...) { return std::vector<std::string>{}; }
+                };
+            ::rag::Result<std::vector<::rag::Hit>> lh = std::unexpected(::rag::Error{});
+            if (impl_->cfg.expand)
+                lh = ::rag::query::multi_query_search(eng.corpus(), query, want, gen, 3);
+            else
+                lh = ::rag::query::hyde_search(eng.corpus(), query, want, gen);
+            if (lh && !lh->empty()) {
+                for (const auto& h : *lh) hits.push_back(eng.corpus().resolve(h));
+                used_llm = true;
+                mode += impl_->cfg.expand ? "+multiquery" : "+hyde";
+            }
+        }
+        if (!used_llm) {
+            auto res = eng.search(query, want, {}, tracep);
+            if (!res) return out;
+            hits.assign(res->begin(), res->end());
+        }
+        if (hits.empty()) return out;
+
+        // 1. CRAG corrective grading — the same self-checking evaluator the
+        //    docs path uses: drop turns graded irrelevant and derive a real,
+        //    calibrated confidence in [0,1]. For a fork this is exactly what
+        //    keeps a non-relevant query from injecting stale old context: if
+        //    nothing in the parent thread actually answers the question, CRAG
+        //    grades it low and we inject nothing.
+        double crag_conf = -1.0;
+        if (impl_->cfg.corrective) {
+            try {
+                std::vector<::rag::Hit> raw;
+                raw.reserve(hits.size());
+                for (const auto& h : hits) raw.push_back(::rag::Hit{h.chunk, h.score});
+                ::rag::crag::CragConfig cc;
+                cc.strips = want;
+                cc.drop_irrelevant = false;
+                auto corr = ::rag::crag::correct(eng.corpus(), query, raw, cc);
+                crag_conf = static_cast<double>(corr.confidence);
+                if (!corr.kept.empty()) {
+                    std::vector<::rag::SearchResult> kept;
+                    for (const auto& h : corr.kept)
+                        kept.push_back(eng.corpus().resolve(h));
+                    if (!kept.empty()) { hits = std::move(kept); mode += "+crag"; }
+                }
+            } catch (...) { /* grading optional */ }
+        }
+        if (hits.empty()) return out;
+        if (hits.size() > want) hits.resize(want);
+
+        // 2. Relevance floor — drop the low-confidence tail before spending any
+        //    tokens on it (top always survives; a later hit only if within
+        //    floor_frac of the top).
+        {
+            double hi = 0.0;
+            for (const auto& r : hits) hi = std::max(hi, static_cast<double>(r.score.value));
+            const double floor = hi * relevance_floor_frac();
+            if (hi > 0.0 && floor > 0.0) {
+                std::size_t keep = 1;
+                while (keep < hits.size()
+                       && static_cast<double>(hits[keep].score.value) >= floor)
+                    ++keep;
+                if (keep < hits.size()) hits.resize(keep);
+            }
+        }
+
+        // 3. Confidence-scaled, score-proportional (water-filling) budget —
+        //    total scaled down by CRAG confidence, then split so confident
+        //    turns render complete and the tail gets a tight excerpt.
+        const std::size_t total_budget =
+            confidence_scaled_budget(retrieval_output_budget(), crag_conf);
+        std::vector<double> pre_scores;
+        pre_scores.reserve(hits.size());
+        for (const auto& r : hits)
+            pre_scores.push_back(std::clamp(static_cast<double>(r.score.value), 0.0, 1.0));
+        const std::vector<std::size_t> allowances =
+            allocate_budget(pre_scores, total_budget);
+
+        std::size_t remaining = total_budget;
+        std::size_t idx = 0;
         double top = 0.0;
-        for (const auto& r : *res) {
+        for (const auto& r : hits) {
             if (out.passages.size() >= want) break;
             Passage p;
             auto [uri, _line] = split_uri(r.uri);
-            p.path  = uri;
-            p.score = static_cast<double>(r.score.value);
-            std::size_t allowance = std::min<std::size_t>(768, budget);
+            p.source = "thread";
+            p.path   = uri;
+            p.score  = std::clamp(static_cast<double>(r.score.value), 0.0, 1.0);
+            std::string raw = r.context.empty() ? r.text : (r.context + "\n" + r.text);
+            std::size_t want_bytes = idx < allowances.size() ? allowances[idx] : 768;
+            const std::size_t allowance = std::min(want_bytes, remaining);
+            ++idx;
             if (allowance < 256) break;
-            p.text  = compress_passage(query, r.text, allowance);
-            budget -= std::min(budget, p.text.size());
+            p.text = compress_passage(query, raw, allowance);
+            remaining -= std::min(remaining, p.text.size());
             top = std::max(top, p.score);
             out.passages.push_back(std::move(p));
         }
-        out.confidence = top;
-        out.mode = "thread:" + std::to_string(eng.corpus().chunk_count()) + " chunks";
+        // Prefer CRAG's calibrated confidence; else the top score.
+        out.confidence = crag_conf >= 0.0 ? crag_conf : top;
+
+        // Funnel provenance for the retrieved-context card (same shape as docs).
+        {
+            char buf[48];
+            std::snprintf(buf, sizeof buf, ", confidence %.2f", out.confidence);
+            mode += buf;
+            if (impl_->cfg.trace && !trace.empty()) {
+                std::vector<std::string> steps;
+                for (const auto& t : trace) {
+                    if (t.empty()) continue;
+                    if (t.rfind("\xe2\x86\x92 ", 0) == 0 || t.rfind("-> ", 0) == 0) continue;
+                    steps.push_back(t);
+                }
+                if (!steps.empty()) {
+                    mode += "\n  funnel:";
+                    for (const auto& s : steps) mode += "\n    \xe2\x86\xb3 " + s;
+                    mode += "\n    \xe2\x86\xb3 top-" + std::to_string(out.passages.size());
+                }
+            }
+        }
+        out.mode = std::move(mode);
     } catch (...) {
         // best-effort; leave `out` empty (no error surfaced — carry-context is
         // an enhancement, never a hard dependency of the turn).
