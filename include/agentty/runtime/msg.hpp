@@ -364,6 +364,14 @@ struct ThreadListSelect {};
 // toast so the user always knows where they landed.
 struct ThreadCycle { int delta; };
 struct NewThread {};
+// "New thread from this one" — fork the SELECTED history row into a fresh
+// thread. Loads the picked thread's messages (async, same path as a normal
+// open) but re-homes them under a NEW thread id with cleared
+// compactions/proactive markers and a "⌥ fork" title tag, so the new thread
+// is independently saveable and the ORIGINAL file is never touched. Lets you
+// branch a conversation: keep the old thread intact, continue from its
+// context in a new one.
+struct ForkThread {};
 // Result of the background thread-history load kicked off from
 // `AgenttyApp::init()`. The on-disk thread JSON walk used to run
 // synchronously on startup; with hundreds of multi-MB files (real-world
@@ -381,7 +389,7 @@ struct ThreadsLoaded    { std::vector<Thread> threads; };
 // Msg lands when the new thread's bytes are parsed; the reducer then
 // swaps `m.d.current`, rehydrates the frozen prefix, and commits the
 // scrollback-overflow seam in one go.
-struct ThreadLoaded     { Thread thread; };
+struct ThreadLoaded     { Thread thread; bool fork = false; };
 
 // ── Command palette ──────────────────────────────────────────────────────
 struct OpenCommandPalette {};
@@ -683,7 +691,7 @@ using ProviderPickerMsg = std::variant<
 
 using ThreadListMsg = std::variant<
     OpenThreadList, CloseThreadList, ThreadListMove, ThreadListJump,
-    ThreadListSelect, ThreadCycle, NewThread, ThreadsLoaded, ThreadLoaded>;
+    ThreadListSelect, ThreadCycle, NewThread, ForkThread, ThreadsLoaded, ThreadLoaded>;
 
 using CommandPaletteMsg = std::variant<
     OpenCommandPalette, CloseCommandPalette, CommandPaletteInput,
@@ -819,6 +827,8 @@ static_assert(leaf_domain_count<OpenProviderPicker>()        == 1,
               "OpenProviderPicker must belong to exactly one Msg domain");
 static_assert(leaf_domain_count<NewThread>()                 == 1,
               "NewThread must belong to exactly one Msg domain");
+static_assert(leaf_domain_count<ForkThread>()                == 1,
+              "ForkThread must belong to exactly one Msg domain");
 static_assert(leaf_domain_count<CommandPaletteSelect>()      == 1,
               "CommandPaletteSelect must belong to exactly one Msg domain");
 static_assert(leaf_domain_count<MentionPaletteSelect>()      == 1,

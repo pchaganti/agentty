@@ -383,7 +383,23 @@ Step submit_message(Model m) {
     //
     // When there's no probe (fast hedge hit, or a non-knowledge query) we
     // launch immediately as before — zero added latency on the common path.
-    const bool defer_for_retrieval = !proactive_probe.empty();
+    // EXCEPTION: a FORKED thread always runs the worker so it can pull the
+    // relevant parent-thread passages (its whole point), even for a query
+    // the normal knowledge-probe would skip.
+    const std::string fork_parent = m.d.current.forked_from;
+    // The user's newest message is the retrieval query for the fork index.
+    std::string fork_query;
+    if (!fork_parent.empty()) {
+        for (auto it = m.d.current.messages.rbegin();
+             it != m.d.current.messages.rend(); ++it) {
+            if (it->role == Role::User && !it->text.empty()) {
+                fork_query = it->text;
+                break;
+            }
+        }
+    }
+    const bool do_fork_retrieve = !fork_parent.empty() && !fork_query.empty();
+    const bool defer_for_retrieval = !proactive_probe.empty() || do_fork_retrieve;
     maya::Cmd<Msg> launch;
     if (defer_for_retrieval) {
         m.s.status       = "retrieving context\xE2\x80\xA6";   // …
@@ -391,12 +407,28 @@ Step submit_message(Model m) {
         // The launch is issued by the ProactiveContextReady handler once the
         // grounding is in the transcript. Here we only kick the retrieval.
         launch = Cmd<Msg>::task_isolated(
-            [probe = std::move(proactive_probe)]
+            [probe = std::move(proactive_probe),
+             fork_parent, fork_query, do_fork_retrieve]
             (std::function<void(Msg)> dispatch) {
-                auto hit = tools::proactive_retrieve_blocking(probe, /*k=*/3);
-                dispatch(Msg{ProactiveContextReady{
-                    hit ? std::move(hit->block) : std::string{},
-                    hit ? hit->confidence : -1.0}});
+                std::string block;
+                double conf = -1.0;
+                if (!probe.empty()) {
+                    if (auto hit = tools::proactive_retrieve_blocking(probe, 3)) {
+                        block = std::move(hit->block);
+                        conf  = hit->confidence;
+                    }
+                }
+                // Fork carry-context: append the parent-thread passages as a
+                // second <retrieved-context> block. Independent of the docs
+                // probe — either or both may contribute.
+                if (do_fork_retrieve) {
+                    if (auto fh = tools::fork_retrieve(fork_parent, fork_query, 3)) {
+                        if (!block.empty()) block += "\n\n";
+                        block += std::move(fh->block);
+                        conf = std::max(conf, fh->confidence);
+                    }
+                }
+                dispatch(Msg{ProactiveContextReady{std::move(block), conf}});
             });
     } else {
         launch = cmd::launch_stream(m);

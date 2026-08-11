@@ -31,6 +31,7 @@
 #include "agentty/runtime/view/helpers.hpp"
 #include "agentty/tool/skills.hpp"
 #include "agentty/tool/subagent.hpp"
+#include "agentty/tool/mcp_tools_backends.hpp"
 
 namespace agentty::app::detail {
 
@@ -592,6 +593,24 @@ Step thread_list_update(Model m, msg::ThreadListMsg tm) {
             m.ui.thread_list = pick::Closed{};
             return {std::move(m), std::move(cmd)};
         },
+        [&](ForkThread) -> Step {
+            // "New thread from this one." Load the SELECTED history row, but
+            // route it through ThreadLoaded with fork=true so it lands under
+            // a fresh id (see the fork transform there). The original file is
+            // never touched. Same guards as ThreadListSelect.
+            auto* p = pick::opened(m.ui.thread_list);
+            Cmd<Msg> cmd = Cmd<Msg>::none();
+            if (p && !m.d.threads.empty() && !m.s.thread_loading) {
+                const Thread& meta = m.d.threads[p->index];
+                // Save the thread we're leaving (a fork shouldn't lose an
+                // un-persisted tail of the current one).
+                if (!m.d.current.messages.empty()) deps().save_thread(m.d.current);
+                m.s.thread_loading = true;
+                cmd = cmd::load_thread_async(meta.id, /*fork=*/true);
+            }
+            m.ui.thread_list = pick::Closed{};
+            return {std::move(m), std::move(cmd)};
+        },
         [&](ThreadCycle& e) -> Step {
             // Alt+←/→ — jump to the adjacent thread without the picker.
             // Recency order (same as ^J): index 0 = newest; +1 = older,
@@ -724,6 +743,46 @@ Step thread_list_update(Model m, msg::ThreadListMsg tm) {
             // and leave the current thread in place.
             m.s.thread_loading = false;
             if (e.thread.id.value.empty()) return done(std::move(m));
+
+            // Fork: "new thread from this history" WITHOUT copying the parent
+            // transcript into the wire (that would start the fork near the
+            // context limit). Instead: start a FRESH empty thread that just
+            // remembers its parent's id (forked_from), kick a one-time async
+            // index of the parent's turns, and let each future turn retrieve
+            // only the few relevant parent passages on demand. Fork cost on
+            // this thread = mint id + async ingest kick → negligible.
+            if (e.fork) {
+                const std::string parent_id = e.thread.id.value;
+                std::string base = e.thread.title;
+                if (base.empty() && !e.thread.messages.empty())
+                    base = deps().title_from(e.thread.messages.front().text);
+                // Kick the parent-index build off the UI thread; retrieval
+                // lazily opens it, so a not-yet-finished ingest just yields
+                // no carry-context for the first turn (never blocks).
+                std::vector<Message> parent_msgs = std::move(e.thread.messages);
+                Cmd<Msg> ingest = Cmd<Msg>::task_isolated(
+                    [parent_id, parent_msgs = std::move(parent_msgs)]
+                    (std::function<void(Msg)>) {
+                        (void)tools::ingest_thread_turns(parent_id, parent_msgs);
+                    });
+
+                // Replace current with a fresh forked thread.
+                if (!m.d.current.messages.empty()) deps().save_thread(m.d.current);
+                m.d.current = Thread{};
+                m.d.current.id          = deps().new_thread_id();
+                m.d.current.forked_from = parent_id;
+                m.d.current.title = base.empty()
+                    ? std::string{"\xe2\x8c\xa5 fork"}          // ⌥ fork
+                    : "\xe2\x8c\xa5 " + base;
+                clear_frozen(m);
+                m.ui.view_cache.clear();
+                m.ui.composer = {};
+                auto toast = set_status_toast(m,
+                    "forked \xe2\x80\x94 this thread can recall the old one's context");
+                return {std::move(m), Cmd<Msg>::batch(std::move(ingest),
+                                                      std::move(toast))};
+            }
+
             // Old thread's skill activations leave context with it.
             tools::skills::reset_activations();
             // Optional timing probe. AGENTTY_LOAD_PROF=1 keeps surfacing

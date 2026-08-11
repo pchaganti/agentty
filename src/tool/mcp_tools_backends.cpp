@@ -1144,4 +1144,102 @@ proactive_retrieve_blocking(const std::string& query, int k) {
     return hit;
 }
 
+// ── Fork carry-context ───────────────────────────────────────
+namespace {
+// Flatten one message to a role-tagged text blob for indexing. Keeps the
+// visible prose + a compact note of any tool calls, so a retrieval over the
+// parent thread returns readable context, not JSON.
+std::string flatten_turn_(const Message& m) {
+    std::string s;
+    switch (m.role) {
+        case Role::User:      s += "User: ";      break;
+        case Role::Assistant: s += "Assistant: "; break;
+        case Role::System:    s += "System: ";    break;
+        default:              s += "";            break;
+    }
+    // Prefer settled text; fall back to streaming_text for an unfinished tail.
+    if (!m.text.empty())                 s += m.text;
+    else if (!m.streaming_text.empty())  s += m.streaming_text;
+    for (const auto& tc : m.tool_calls) {
+        s += "\n[tool " + tc.name.value;
+        if (!tc.args_streaming.empty()) {
+            std::string a = tc.args_streaming;
+            if (a.size() > 200) a.resize(200);
+            s += " " + a;
+        }
+        s += "]";
+        if (const std::string& out = tc.output(); !out.empty()) {
+            std::string o = out;
+            if (o.size() > 600) { o.resize(600); o += "\u2026"; }
+            s += "\n" + o;
+        }
+    }
+    return s;
+}
+} // namespace
+
+bool ingest_thread_turns(const std::string& thread_id,
+                         const std::vector<Message>& messages) {
+    try {
+        if (thread_id.empty() || messages.empty()) return false;
+        std::vector<std::string> turns;
+        turns.reserve(messages.size());
+        for (const auto& m : messages) {
+            std::string t = flatten_turn_(m);
+            if (!t.empty()) turns.push_back(std::move(t));
+        }
+        if (turns.empty()) return false;
+        return shared_retriever().ingest_thread(thread_id, turns);
+    } catch (...) {
+        return false;
+    }
+}
+
+std::optional<ProactiveHit>
+fork_retrieve(const std::string& parent_thread_id,
+              const std::string& query, int k) {
+  try {
+    if (parent_thread_id.empty() || query.empty()) return std::nullopt;
+    auto ret = shared_retriever().retrieve_thread(parent_thread_id, query,
+                                                  k > 0 ? k : 3);
+    if (ret.passages.empty()) return std::nullopt;
+
+    std::string block =
+        "<retrieved-context source=\"forked thread\">\n"
+        "The following passages were retrieved from the EARLIER thread this "
+        "conversation was forked from, because they look relevant to the "
+        "request. Treat them as prior context from the same user; ground your "
+        "answer in them where they apply and ignore any that don't.\n\n";
+    int n = 0;
+    for (const auto& p : ret.passages) {
+        block += "[" + (p.path.empty() ? std::string{"turn"} : p.path) + "]\n";
+        block += p.text;
+        if (!p.text.empty() && p.text.back() != '\n') block += '\n';
+        block += '\n';
+        ++n;
+    }
+    block += "</retrieved-context>";
+    if (n == 0) return std::nullopt;
+
+    // Same unprompted-spend ceiling as proactive (~6KiB default).
+    {
+        std::size_t cap = 6 * 1024;
+        if (const char* v = std::getenv("AGENTTY_RAG_PROACTIVE_BYTES"); v && v[0]) {
+            try { cap = std::clamp<std::size_t>(std::stoull(v), 1024, 32 * 1024); }
+            catch (...) {}
+        }
+        if (block.size() > cap) {
+            std::size_t cut = cap;
+            while (cut > 0 && (static_cast<unsigned char>(block[cut]) & 0xc0) == 0x80)
+                --cut;
+            block.resize(cut);
+            block += "\n\u2026\n</retrieved-context>";
+        }
+    }
+    return ProactiveHit{std::move(block), ret.confidence, n, {}};
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
 } // namespace agentty::tools

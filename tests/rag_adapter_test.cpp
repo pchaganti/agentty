@@ -274,6 +274,60 @@ int main() {
         check(code_before == code_after, "warm code open does not rewrite its index");
     }
 
+    // Fork carry-context: ingest a thread's turns, then a pointed query
+    // retrieves the exact relevant turn (verbatim, not a paraphrase). Uses an
+    // isolated $HOME so the per-thread .ragdb lands under tmp/.agentty.
+    {
+#if defined(_WIN32)
+        _putenv_s("USERPROFILE", tmp.string().c_str());
+#endif
+        ::setenv("HOME", tmp.string().c_str(), 1);
+        agentty::rag::Retriever r;
+        const std::string tid = "forktestthread01";
+        std::vector<std::string> turns = {
+            "User: how do I rotate the encryption key?",
+            "Assistant: run `agentty keys rotate` \xe2\x80\x94 it re-seals the keystore "
+            "with a fresh master key and re-encrypts every stored credential.",
+            "User: what about the sandbox boundary for writes?",
+            "Assistant: writes outside the workspace root are refused unless "
+            "explicitly allowlisted via the permission profile.",
+            "User: unrelated \xe2\x80\x94 what's the capital of France?",
+            "Assistant: Paris.",
+        };
+        bool ok = r.ingest_thread(tid, turns);
+        check(ok, "ingest_thread builds a per-thread index");
+
+        auto hit = r.retrieve_thread(tid, "how to rotate the encryption master key", 3);
+        check(hit.error.empty(), "retrieve_thread succeeds");
+        check(!hit.passages.empty(), "retrieve_thread returns passages");
+        if (!hit.passages.empty()) {
+            bool found = false;
+            for (const auto& p : hit.passages)
+                if (p.text.find("keys rotate") != std::string::npos
+                    || p.text.find("re-seals the keystore") != std::string::npos)
+                    found = true;
+            check(found, "retrieve_thread returns the VERBATIM relevant turn");
+        }
+
+        // Idempotent: a re-ingest of the same size is a warm no-op (returns ok).
+        check(r.ingest_thread(tid, turns), "re-ingest of the same turns is a no-op success");
+
+        // A fresh Retriever opens the persisted per-thread index lazily.
+        {
+            agentty::rag::Retriever warm;
+            auto h2 = warm.retrieve_thread(tid, "encryption key rotation", 2);
+            check(h2.error.empty() && !h2.passages.empty(),
+                  "fresh retriever lazily opens the persisted thread index");
+        }
+
+        // Unknown thread id → empty, no error (silent, not a hard dependency).
+        {
+            auto miss = r.retrieve_thread("nosuchthread", "anything", 3);
+            check(miss.passages.empty(), "retrieve_thread on an unknown id is empty");
+            check(miss.error.empty(), "retrieve_thread on an unknown id is silent (no error)");
+        }
+    }
+
     // (3): empty knowledge ⇒ graceful "no knowledge" error, not a crash.
     {
         fs::path empty_dir = tmp / "empty";

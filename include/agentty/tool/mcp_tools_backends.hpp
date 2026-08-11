@@ -14,6 +14,9 @@
 
 #include <optional>
 #include <string>
+#include <vector>
+
+#include "agentty/domain/conversation.hpp"
 
 namespace agentty::tools {
 
@@ -45,5 +48,24 @@ proactive_retrieve(const std::string& query, int k = 3);
 // the caller always injects/stages this result. Never throws.
 [[nodiscard]] std::optional<ProactiveHit>
 proactive_retrieve_blocking(const std::string& query, int k = 3);
+
+// ── Fork carry-context (thread-history retrieval) ────────────────────
+// A forked thread indexes its PARENT's transcript once, then each turn
+// retrieves only the few relevant parent passages — so a fork costs ~zero
+// wire tokens until needed. These wrap the process-wide Retriever's
+// ingest_thread / retrieve_thread on the shared singleton.
+//
+// ingest_thread_turns: flatten `messages` to one text blob per turn and
+// build/persist the parent index. Idempotent; safe on a worker; never throws.
+bool ingest_thread_turns(const std::string& thread_id,
+                         const std::vector<Message>& messages);
+
+// fork_retrieve: a <retrieved-context> block from the parent index for
+// `query`, or nullopt when the fork has nothing relevant (or no index).
+// Same ProactiveHit shape the normal proactive path uses, so the caller
+// injects it identically. Never throws.
+[[nodiscard]] std::optional<ProactiveHit>
+fork_retrieve(const std::string& parent_thread_id,
+              const std::string& query, int k = 3);
 
 } // namespace agentty::tools

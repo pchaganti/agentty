@@ -158,6 +158,6 @@ struct LoopBreak {
 // vanished, parse error) dispatches a `ThreadLoaded` with an empty
 // Thread so the reducer can no-op gracefully without leaving the
 // `thread_loading` flag stuck.
-[[nodiscard]] maya::Cmd<Msg> load_thread_async(ThreadId id);
+[[nodiscard]] maya::Cmd<Msg> load_thread_async(ThreadId id, bool fork = false);
 
 } // namespace agentty::app::cmd

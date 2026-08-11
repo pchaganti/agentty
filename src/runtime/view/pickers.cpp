@@ -503,9 +503,9 @@ Element thread_list(const Model& m) {
     }
     cfg.footer.push_back(key_hints({
         {"\xe2\x86\x91\xe2\x86\x93", "move", 5},        // ↑↓
-        {"PgUp/PgDn", "page", 2},
         {"Enter", "open", 5},
         {"N", "new", 3},
+        {"F", "fork", 2},
         {"^/Alt+\xe2\x86\x90\xe2\x86\x92", "cycle", 1},   // ^←→ / Alt+←→
         {"Esc", "close", 4},
     }));

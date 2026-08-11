@@ -461,6 +461,13 @@ struct Thread {
     ThreadId    id;
     std::string title;
     std::vector<Message> messages;
+    // When this thread was FORKED from another ("new thread from history"),
+    // the parent thread's id. Its transcript is not copied into `messages`
+    // (that would start the fork near the context limit); instead the parent
+    // is indexed once and each turn retrieves only the few relevant parent
+    // passages on demand — so a fork costs ~zero wire tokens until needed.
+    // Empty for a normal thread.
+    std::string forked_from;
     std::chrono::system_clock::time_point created_at = std::chrono::system_clock::now();
     std::chrono::system_clock::time_point updated_at = std::chrono::system_clock::now();
 

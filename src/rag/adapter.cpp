@@ -45,6 +45,7 @@
 #include <rag/rag.hpp>
 
 #include "agentty/io/http.hpp"
+#include "agentty/io/persistence.hpp"
 #include "agentty/mcp/client.hpp"
 #include "agentty/tool/skills.hpp"
 #include "agentty/tool/memory_store.hpp"
@@ -644,6 +645,15 @@ struct Retriever::Impl {
     bool          code_initialized = false;
     std::string code_root;
     std::unordered_map<std::string, std::uint64_t> code_files;
+
+    // Per-thread history indexes (backs the "fork thread" feature). Keyed by
+    // thread id; each is an independent ::rag::Engine persisted to
+    // <thread_id>.thread.ragdb. Lazily opened on first retrieve, built on
+    // ingest. Kept resident (small — one thread's turns) so repeated
+    // per-turn retrieval is warm. `thread_turns` records how many turns each
+    // resident index covers so a re-ingest of the same size is a no-op.
+    std::unordered_map<std::string, ::rag::Engine> thread_engines;
+    std::unordered_map<std::string, std::size_t>   thread_turns;
 
     Impl() : engine(make_engine_config()) {
         probe_ollama();
@@ -1749,6 +1759,109 @@ Retrieval Retriever::retrieve_code(const std::string& query, int k) {
     return out;
 }
 
+// ── Thread-history index (backs the "fork thread" feature) ──────────────
+// Persist location mirrors the thread JSON: <threads_dir>/<id>.thread.ragdb.
+// One document per turn; the caller has already flattened each turn to text.
+namespace {
+fs::path thread_index_path(const std::string& thread_id) {
+    // Sanitise the id defensively (it's a hex thread id, but never trust it
+    // into a path): keep [0-9a-zA-Z_-] only.
+    std::string safe;
+    safe.reserve(thread_id.size());
+    for (char c : thread_id)
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_')
+            safe.push_back(c);
+    if (safe.empty()) safe = "thread";
+    return persistence::threads_dir() / (safe + ".thread.ragdb");
+}
+} // namespace
+
+bool Retriever::ingest_thread(const std::string& thread_id,
+                              const std::vector<std::string>& turns) {
+    if (thread_id.empty() || turns.empty()) return false;
+    try {
+        std::lock_guard<std::mutex> lock(impl_->mu);
+        // Idempotent: a resident index already covering this many turns is a
+        // no-op (the fork's parent transcript is immutable, so turn count is
+        // a sufficient version key).
+        if (auto it = impl_->thread_turns.find(thread_id);
+            it != impl_->thread_turns.end() && it->second >= turns.size())
+            return true;
+
+        ::rag::Engine eng(impl_->make_engine_config());
+        // Dense embedder only when the probe found one reachable (same guard
+        // as the docs/warm path) — attaching an UNREACHABLE embedder makes
+        // build() fail; BM25-only is the correct fallback.
+        impl_->probe_ollama();
+        if (impl_->ollama_ready)
+            (void)eng.with_embedder_spec(impl_->ollama_spec());
+        for (std::size_t i = 0; i < turns.size(); ++i) {
+            if (turns[i].empty()) continue;
+            std::string uri = "thread://" + thread_id + "/turn/" + std::to_string(i);
+            std::string title = "turn " + std::to_string(i + 1);
+            (void)eng.add(uri, std::string{turns[i]}, {}, std::move(title));
+        }
+        if (!eng.build()) return false;
+        impl_->apply_pipeline(eng);   // same full retrieval funnel as docs/code
+        // Persist so a re-open (next session, or after eviction) is warm and
+        // the one-time cost is never paid twice.
+        (void)eng.save(thread_index_path(thread_id).string());
+        impl_->thread_turns[thread_id]   = turns.size();
+        impl_->thread_engines.insert_or_assign(thread_id, std::move(eng));
+        return true;
+    } catch (...) {
+        return false;   // best-effort; a failed ingest just means no carry-context
+    }
+}
+
+Retrieval Retriever::retrieve_thread(const std::string& thread_id,
+                                     const std::string& query, int k) {
+    Retrieval out;
+    if (thread_id.empty() || query.empty() || k <= 0) return out;
+    try {
+        std::lock_guard<std::mutex> lock(impl_->mu);
+        // Resident? else lazily open the persisted index.
+        auto it = impl_->thread_engines.find(thread_id);
+        if (it == impl_->thread_engines.end()) {
+            fs::path db = thread_index_path(thread_id);
+            std::error_code ec;
+            if (!fs::exists(db, ec)) return out;   // no fork index — silent
+            auto opened = ::rag::Engine::open(db.string());
+            if (!opened) return out;
+            impl_->apply_pipeline(*opened);   // opened engines carry no pipeline
+            it = impl_->thread_engines.emplace(thread_id, std::move(*opened)).first;
+        }
+        ::rag::Engine& eng = it->second;
+        if (eng.corpus().chunk_count() == 0) return out;
+
+        const auto want = static_cast<std::size_t>(std::min(k, 12));
+        auto res = eng.search(query, want, {}, nullptr);
+        if (!res) return out;
+
+        std::size_t budget = retrieval_output_budget();
+        double top = 0.0;
+        for (const auto& r : *res) {
+            if (out.passages.size() >= want) break;
+            Passage p;
+            auto [uri, _line] = split_uri(r.uri);
+            p.path  = uri;
+            p.score = static_cast<double>(r.score.value);
+            std::size_t allowance = std::min<std::size_t>(768, budget);
+            if (allowance < 256) break;
+            p.text  = compress_passage(query, r.text, allowance);
+            budget -= std::min(budget, p.text.size());
+            top = std::max(top, p.score);
+            out.passages.push_back(std::move(p));
+        }
+        out.confidence = top;
+        out.mode = "thread:" + std::to_string(eng.corpus().chunk_count()) + " chunks";
+    } catch (...) {
+        // best-effort; leave `out` empty (no error surfaced — carry-context is
+        // an enhancement, never a hard dependency of the turn).
+    }
+    return out;
+}
+
 bool Retriever::warm() const {
     std::lock_guard<std::mutex> lock(impl_->mu);
     auto root = resolve_docs_root(impl_->cfg.docs_root);
@@ -2094,6 +2207,16 @@ Retrieval Retriever::retrieve(const std::string& /*query*/, int /*k*/,
 }
 
 Retrieval Retriever::retrieve_code(const std::string& /*query*/, int /*k*/) {
+    return unavailable_();
+}
+
+bool Retriever::ingest_thread(const std::string& /*thread_id*/,
+                              const std::vector<std::string>& /*turns*/) {
+    return false;   // no RAG engine → fork carry-context unavailable
+}
+
+Retrieval Retriever::retrieve_thread(const std::string& /*thread_id*/,
+                                     const std::string& /*query*/, int /*k*/) {
     return unavailable_();
 }
 

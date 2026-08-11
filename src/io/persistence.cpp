@@ -425,6 +425,7 @@ parse_thread_meta_only(const json& j) {
             "thread JSON has no `id` field"});
     t.id = ThreadId{std::move(id_str)};
     t.title = j.value("title", "");
+    t.forked_from = j.value("forked_from", "");
     if (j.contains("created_at"))
         t.created_at = std::chrono::system_clock::time_point{
             std::chrono::seconds{j["created_at"].get<long long>()}};
@@ -859,6 +860,7 @@ static void save_thread_sync(const Thread& t) {
     json j;
     j["id"] = t.id;
     j["title"] = t.title;
+    if (!t.forked_from.empty()) j["forked_from"] = t.forked_from;
     j["created_at"] = std::chrono::duration_cast<std::chrono::seconds>(
         t.created_at.time_since_epoch()).count();
     j["updated_at"] = std::chrono::duration_cast<std::chrono::seconds>(

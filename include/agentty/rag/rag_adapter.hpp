@@ -130,6 +130,30 @@ public:
     // rebuilds on drift. Independent of the docs index. Never throws.
     [[nodiscard]] Retrieval retrieve_code(const std::string& query, int k);
 
+    // ── Thread-history retrieval (backs "fork thread" / negligible-cost
+    //    context carry) ─────────────────────────────────────────────────
+    // A forked thread doesn't COPY its parent's transcript into the wire
+    // (that would start the new thread near the context limit). Instead the
+    // parent's turns are ingested into a per-thread index ONCE, and each new
+    // turn retrieves only the few relevant parent passages on demand — so
+    // the fork costs a one-time async index build and ZERO wire tokens until
+    // something is actually needed.
+    //
+    // ingest_thread: build (and persist to <thread_id>.thread.ragdb) an index
+    // over `turns` — one document per turn, text already flattened by the
+    // caller (role-tagged prose + tool summaries). Idempotent per
+    // (thread_id, turn count): a re-ingest with the same size is a warm
+    // no-op. Safe to call off the UI thread. Returns false only on hard
+    // failure (never throws).
+    bool ingest_thread(const std::string& thread_id,
+                       const std::vector<std::string>& turns);
+
+    // retrieve_thread: up to k verbatim passages from a previously-ingested
+    // thread index, ranked for `query`. Opens the persisted index lazily if
+    // it isn't resident. Empty/no-index → empty Retrieval (no error spam).
+    [[nodiscard]] Retrieval retrieve_thread(const std::string& thread_id,
+                                            const std::string& query, int k);
+
     // OPTIONAL LLM seam for HyDE + multi-query / RAG-Fusion. Given a prompt,
     // return one or more completions. When set (and AGENTTY_RAG_HYDE /
     // AGENTTY_RAG_EXPAND are on), retrieval uses the LLM to close the

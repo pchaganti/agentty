@@ -303,8 +303,12 @@ std::optional<Msg> on_thread_list(const KeyEvent& ev) {
             default: break;
         }
     }
-    if (auto* ck = std::get_if<CharKey>(&ev.key))
+    if (auto* ck = std::get_if<CharKey>(&ev.key)) {
         if (ck->codepoint == 'n' || ck->codepoint == 'N') return NewThread{};
+        // Fork the SELECTED history row into a fresh thread that continues
+        // from its context. Distinct from 'n' (a blank new thread).
+        if (ck->codepoint == 'f' || ck->codepoint == 'F') return ForkThread{};
+    }
     return std::nullopt;
 }
 
