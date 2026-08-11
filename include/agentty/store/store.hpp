@@ -50,6 +50,16 @@ struct Settings {
     // clears the in-memory set for the session (tightening the profile
     // re-arms prompts), but the grants reload on next launch.
     std::vector<std::string> always_allow_tools;
+
+    // Smart Mode (role-based execution routing, docs/design/smart-mode.md).
+    // Off by default. The three slot fields are WIRE model ids the user
+    // pinned for each role; empty = auto-fill from the catalog. Effort
+    // strings mirror the `effort` field's grammar (""/"low"/"medium"/…).
+    // Reloaded into Model::Domain::smart at startup.
+    bool                 smart_enabled = false;
+    std::string          smart_strategic_model,      smart_strategic_effort;
+    std::string          smart_impl_model,           smart_impl_effort;
+    std::string          smart_utility_model,        smart_utility_effort;
 };
 
 template <class S>
