@@ -1146,34 +1146,25 @@ proactive_retrieve_blocking(const std::string& query, int k) {
 
 // ── Fork carry-context ───────────────────────────────────────
 namespace {
-// Flatten one message to a role-tagged text blob for indexing. Keeps the
-// visible prose + a compact note of any tool calls, so a retrieval over the
-// parent thread returns readable context, not JSON.
+// Flatten one message to a role-tagged text blob for indexing. Only the
+// visible MARKDOWN PROSE is indexed — tool calls (args + output) are
+// deliberately skipped: the index is for recalling what was DISCUSSED, and
+// tool logs (build output, file dumps, diffs) are bulky noise that dilutes
+// the semantic signal and bloats the index. A tool-only turn (no prose)
+// contributes nothing and is dropped by the caller.
 std::string flatten_turn_(const Message& m) {
+    std::string_view body = !m.text.empty()
+                                ? std::string_view{m.text}
+                                : std::string_view{m.streaming_text};
+    if (body.empty()) return {};   // tool-only / empty turn → nothing to index
     std::string s;
     switch (m.role) {
-        case Role::User:      s += "User: ";      break;
-        case Role::Assistant: s += "Assistant: "; break;
-        case Role::System:    s += "System: ";    break;
-        default:              s += "";            break;
+        case Role::User:      s = "User: ";      break;
+        case Role::Assistant: s = "Assistant: "; break;
+        case Role::System:    s = "System: ";    break;
+        default:              break;
     }
-    // Prefer settled text; fall back to streaming_text for an unfinished tail.
-    if (!m.text.empty())                 s += m.text;
-    else if (!m.streaming_text.empty())  s += m.streaming_text;
-    for (const auto& tc : m.tool_calls) {
-        s += "\n[tool " + tc.name.value;
-        if (!tc.args_streaming.empty()) {
-            std::string a = tc.args_streaming;
-            if (a.size() > 200) a.resize(200);
-            s += " " + a;
-        }
-        s += "]";
-        if (const std::string& out = tc.output(); !out.empty()) {
-            std::string o = out;
-            if (o.size() > 600) { o.resize(600); o += "\u2026"; }
-            s += "\n" + o;
-        }
-    }
+    s += body;
     return s;
 }
 } // namespace
